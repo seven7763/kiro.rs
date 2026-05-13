@@ -3,9 +3,9 @@
 //! 提供文本 token 数量计算功能。
 //!
 //! # 计算规则
-//! - 非西文字符：每个计 4.5 个字符单位
+//! - 非西文字符：每个计 4.0 个字符单位
 //! - 西文字符：每个计 1 个字符单位
-//! - 4 个字符单位 = 1 token（四舍五入）
+//! - 4 个字符单位 = 1 token（四舍五入），再按 token 数量分档放大系数补偿
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
@@ -72,10 +72,10 @@ fn is_non_western_char(c: char) -> bool {
 /// 计算文本的 token 数量
 ///
 /// # 计算规则
-/// - 非西文字符：每个计 4.5 个字符单位
+/// - 非西文字符：每个计 4.0 个字符单位
 /// - 西文字符：每个计 1 个字符单位
-/// - 4 个字符单位 = 1 token（四舍五入）
-/// ```
+/// - 4 个字符单位 = 1 token，再按 token 数量分档乘以补偿系数
+///   （<100→×1.5, <200→×1.3, <300→×1.25, <800→×1.2, ≥800→×1.0）
 pub fn count_tokens(text: &str) -> u64 {
     // println!("text: {}", text);
 
