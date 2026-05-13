@@ -67,12 +67,14 @@ fn map_provider_error(err: Error) -> Response {
         )
             .into_response();
     }
+    // 详细错误只记 log（含上游 URL/IP/凭据 ID 等内部细节）
+    // 对外只返通用文案，防内部信息通过错误响应泄露
     tracing::error!("Kiro API 调用失败: {}", err);
     (
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
             "api_error",
-            format!("上游 API 调用失败: {}", err),
+            "Upstream API call failed",
         )),
     )
         .into_response()
@@ -486,12 +488,14 @@ async fn handle_non_stream_request(
     let body_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
+            // 详细错误（含上游 URL/IP/超时细节）只记 log，对外只返通用文案
+            // 防内部地址/代理信息通过错误响应泄露给客户端
             tracing::error!("读取响应体失败: {}", e);
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
-                    format!("读取响应失败: {}", e),
+                    "Failed to read upstream response body",
                 )),
             )
                 .into_response();
