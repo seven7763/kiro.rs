@@ -1106,6 +1106,35 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
+        // 兜底：thinking 开启但全流程未产生任何 thinking 块
+        // （Opus 4.7 adaptive 在简单任务可能完全不吐 <thinking> 标签）
+        // 注入一对空 thinking start/stop，保证客户端 SSE 结构含 thinking content_block，
+        // 避免 UI 卡在"思考中..."。
+        if self.thinking_enabled
+            && !self.thinking_extracted
+            && self.thinking_block_index.is_none()
+        {
+            let thinking_index = self.state_manager.next_block_index();
+            self.thinking_block_index = Some(thinking_index);
+            let start_events = self.state_manager.handle_content_block_start(
+                thinking_index,
+                "thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": thinking_index,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                }),
+            );
+            events.extend(start_events);
+            if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+                events.push(stop_event);
+            }
+            self.thinking_extracted = true;
+            tracing::debug!(
+                "thinking 兜底：流结束未见 <thinking> 标签，注入空 thinking block"
+            );
+        }
+
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
@@ -1985,5 +2014,123 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
         );
+    }
+
+    // === 任务 A: Opus 4.7 thinking 兜底注入 ===
+
+    /// 辅助：从事件列表中找 thinking 类型 content_block_start 的数量
+    fn count_thinking_block_starts(events: &[SseEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "thinking"
+            })
+            .count()
+    }
+
+    #[test]
+    fn thinking_enabled_no_block_injects_empty() {
+        // thinking 开启 + 全流程无 <thinking> 标签 → generate_final_events 应注入空 thinking 块
+        // 模拟 Opus 4.7 adaptive 在简单任务上完全跳过 thinking 的情况
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-7", 1, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        // 不发送任何文本内容，直接结束流
+        let final_events = ctx.generate_final_events();
+
+        assert_eq!(
+            count_thinking_block_starts(&final_events),
+            1,
+            "应注入一个空 thinking content_block_start"
+        );
+
+        // 验证 thinking 块结构完整（start + stop 配对）
+        let thinking_start = final_events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "thinking"
+            })
+            .expect("应有 thinking content_block_start");
+        let thinking_idx = thinking_start.data["index"]
+            .as_i64()
+            .expect("应有 index");
+
+        let has_matching_stop = final_events.iter().any(|e| {
+            e.event == "content_block_stop" && e.data["index"].as_i64() == Some(thinking_idx)
+        });
+        assert!(has_matching_stop, "应有对应的 content_block_stop");
+    }
+
+    #[test]
+    fn thinking_enabled_with_real_block_not_injected() {
+        // thinking 开启 + 真实 <thinking>x</thinking> 已被处理 → 不应再注入第二个空块
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-7", 1, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response(
+            "<thinking>\nreal reasoning</thinking>\n\nfinal answer",
+        ));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            count_thinking_block_starts(&all_events),
+            1,
+            "已有真实 thinking 块时不应再注入空 thinking 块"
+        );
+    }
+
+    #[test]
+    fn thinking_disabled_no_injection() {
+        // thinking 关闭 + 无 thinking 块 → 不应注入任何 thinking 结构
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-4-5", 1, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("hello world"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            count_thinking_block_starts(&all_events),
+            0,
+            "thinking 关闭时不应注入任何 thinking 块"
+        );
+    }
+
+    #[test]
+    fn thinking_enabled_only_text_response() {
+        // thinking 开启 + 纯文本响应（模型完全没吐 <thinking> 标签）
+        // → 兜底应注入空 thinking 块，且 text block 正常存在
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-7", 1, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        // 注意：thinking 开启时短文本可能被 buffer 拦截等待 <thinking>，
+        // 用足够长的文本确保被 flush 成 text_delta
+        all_events.extend(ctx.process_assistant_response(
+            "Hi! This is a direct answer without any thinking tag whatsoever.",
+        ));
+        all_events.extend(ctx.generate_final_events());
+
+        // 兜底注入的 thinking 块存在
+        assert_eq!(
+            count_thinking_block_starts(&all_events),
+            1,
+            "纯文本响应应触发 thinking 兜底注入"
+        );
+
+        // text block 也应存在
+        let has_text_block = all_events.iter().any(|e| {
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+        });
+        assert!(has_text_block, "text block 应正常存在");
+
+        // 验证 SSE 结构完整：message_stop 在最后
+        let last_message_stop_idx = all_events
+            .iter()
+            .rposition(|e| e.event == "message_stop");
+        assert!(last_message_stop_idx.is_some(), "应有 message_stop 收尾");
     }
 }
