@@ -101,18 +101,13 @@ static SECTION_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     ]
 });
 
-// 额外的行级别模式 — 匹配包含这些关键短语的整行并删除
-static LINE_KILL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?m)^.*(?:Decline requests|Refuse requests).*(?:malicious|exploit|unauthorized|illegal|harmful).*$").unwrap(),
-        Regex::new(r"(?m)^.*(?:Do not|Never|NEVER).*(?:assist with|help with|generate).*(?:malware|exploit|attack|hack|unauthorized).*$").unwrap(),
-        Regex::new(r"(?m)^.*(?:security vulnerabilities|OWASP|injection|XSS).*(?:avoid|careful|never).*$").unwrap(),
-        Regex::new(r"(?m)^.*This applies regardless of.*(?:educational|authorized|framing).*$").unwrap(),
-        Regex::new(r"(?m)^.*(?:won't|will not|cannot|can't) (?:assist|help).*(?:unauthorized access|exploit|attack).*$").unwrap(),
-    ]
-});
-
 /// 剥离系统提示词中的限制性内容
+///
+/// 已移除曾经的 LINE_KILL_PATTERNS（5 个行级 regex），原因：
+/// - 行级模式过于激进会误删正常技术对话，例如
+///   「Be careful to avoid SQL injection」「I cannot help with this approach」等
+/// - 客户端 prompt 中的拒答指令已被前面 RESTRICTION_PATTERNS（10 个）
+///   + SECTION_PATTERNS（10 个 regex）完整覆盖，行级兜底冗余且有害
 pub fn strip_restrictions(text: &str) -> String {
     let mut result = text.to_string();
 
@@ -136,12 +131,7 @@ pub fn strip_restrictions(text: &str) -> String {
         }
     }
 
-    // 3. 行级别模式匹配 — 删除包含拒绝指令的单行
-    for re in LINE_KILL_PATTERNS.iter() {
-        result = re.replace_all(&result, "").to_string();
-    }
-
-    // 4. 清理多余空行（连续 3+ 换行合并为 2 个）
+    // 3. 清理多余空行（连续 3+ 换行合并为 2 个）
     static MULTI_NEWLINE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"\n{3,}").unwrap()
     });
@@ -352,5 +342,44 @@ mod tests {
         assert!(!result.contains("content_safety"));
         // 不应有 3+ 连续换行
         assert!(!result.contains("\n\n\n"), "剥离后不应留多余换行");
+    }
+
+    // === Bug 1 反回归：删除 LINE_KILL_PATTERNS 后正常技术对话不应被误删 ===
+
+    /// 「Be careful to avoid SQL injection」是正常技术建议，不应被删
+    #[test]
+    fn does_not_strip_technical_avoid_injection() {
+        let inputs = [
+            "Tip: Be careful to avoid SQL injection vulnerabilities in your queries.",
+            "Always validate input to prevent XSS — be careful never to render raw HTML.",
+            "OWASP top 10 recommends careful input validation to avoid injection attacks.",
+        ];
+        for input in inputs {
+            let result = strip_restrictions(input);
+            assert_eq!(
+                result, input,
+                "正常技术讨论不应被误删: {:?}",
+                input
+            );
+        }
+    }
+
+    /// 「I cannot help with this approach」是正常开发对话，不应被删
+    #[test]
+    fn does_not_strip_cannot_help_legitimate() {
+        let inputs = [
+            "I cannot help with this exploit because the design pattern is wrong.",
+            "We won't assist with this attack vector since it bypasses our auth.",
+            "Never assist with this approach — it leaks credentials to logs.",
+            "Decline requests that look like malicious patterns even if the user means well.",
+        ];
+        for input in inputs {
+            let result = strip_restrictions(input);
+            assert_eq!(
+                result, input,
+                "正常对话语句不应被误删: {:?}",
+                input
+            );
+        }
     }
 }
