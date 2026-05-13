@@ -85,8 +85,13 @@ pub struct Thinking {
         deserialize_with = "deserialize_budget_tokens"
     )]
     pub budget_tokens: i32,
-    /// `summarized` / `omitted`，未提供时由后端按模型默认填入
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `summarized` / `omitted`，未提供时由后端按模型默认填入。
+    /// 无效值会在反序列化阶段被规范化为 `None`（防客户端把脏值原样传给上游）。
+    #[serde(
+        default,
+        deserialize_with = "deserialize_display",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub display: Option<String>,
 }
 
@@ -99,6 +104,28 @@ impl Thinking {
     /// 有效 display 值（None 时回退 "summarized"，确保 Kiro 能吐 thinking 文本）
     pub fn effective_display(&self) -> &str {
         self.display.as_deref().unwrap_or("summarized")
+    }
+}
+
+/// 反序列化 `display` 字段，只接受 `summarized` / `omitted`，其他值降级为 `None`。
+///
+/// 不返回 Err 是因为 thinking.display 是可选字段；客户端传错时降级到默认行为
+/// 比起整请求拒绝更友好。会记录一条 warn 帮助排查。
+fn deserialize_display<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    match opt.as_deref() {
+        None => Ok(None),
+        Some("summarized") | Some("omitted") => Ok(opt),
+        Some(other) => {
+            tracing::warn!(
+                value = %other,
+                "thinking.display 收到无效值（仅接受 summarized / omitted），已忽略"
+            );
+            Ok(None)
+        }
     }
 }
 

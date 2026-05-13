@@ -1052,3 +1052,150 @@ fn create_buffered_sse_stream(
     )
     .flatten()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造最小可用的 MessagesRequest，便于 thinking 覆写逻辑测试
+    fn make_req(model: &str, thinking: Option<Thinking>) -> MessagesRequest {
+        // 借 serde_json 绕过 MessagesRequest 字段非 Default 的限制
+        let mut payload: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": model,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("构造 MessagesRequest 应成功");
+        payload.thinking = thinking;
+        payload
+    }
+
+    fn thinking(thinking_type: &str, display: Option<&str>) -> Thinking {
+        Thinking {
+            thinking_type: thinking_type.to_string(),
+            budget_tokens: 5000,
+            display: display.map(String::from),
+        }
+    }
+
+    // === Case 1: Opus 4.7 强制 adaptive ===
+
+    #[test]
+    fn opus_4_7_enabled_downgrades_to_adaptive() {
+        let mut req = make_req("claude-opus-4-7", Some(thinking("enabled", None)));
+        override_thinking_from_model_name(&mut req);
+
+        let t = req.thinking.as_ref().expect("应保留 thinking");
+        assert_eq!(t.thinking_type, "adaptive", "enabled 应被降级");
+        assert_eq!(t.display.as_deref(), Some("summarized"), "应补 display");
+        let oc = req.output_config.as_ref().expect("应补 output_config");
+        assert_eq!(oc.effort, "high");
+    }
+
+    #[test]
+    fn opus_4_7_dot_form_also_downgrades() {
+        // claude-opus-4.7（点形式）也应触发
+        let mut req = make_req("claude-opus-4.7", Some(thinking("enabled", None)));
+        override_thinking_from_model_name(&mut req);
+        assert_eq!(req.thinking.as_ref().unwrap().thinking_type, "adaptive");
+    }
+
+    #[test]
+    fn opus_4_7_adaptive_keeps_existing_display() {
+        let mut req = make_req(
+            "claude-opus-4-7",
+            Some(thinking("adaptive", Some("omitted"))),
+        );
+        override_thinking_from_model_name(&mut req);
+
+        let t = req.thinking.as_ref().unwrap();
+        assert_eq!(t.thinking_type, "adaptive");
+        assert_eq!(t.display.as_deref(), Some("omitted"), "已有 display 不应被覆盖");
+    }
+
+    #[test]
+    fn opus_4_7_without_thinking_field_is_noop() {
+        let mut req = make_req("claude-opus-4-7", None);
+        override_thinking_from_model_name(&mut req);
+        assert!(req.thinking.is_none(), "无 thinking 字段应保持无");
+        assert!(req.output_config.is_none(), "也不应主动注入 output_config");
+    }
+
+    // === Case 2: 模型名带 -thinking 后缀 ===
+
+    #[test]
+    fn opus_4_7_thinking_suffix_sets_adaptive() {
+        let mut req = make_req("claude-opus-4-7-thinking", None);
+        override_thinking_from_model_name(&mut req);
+
+        let t = req.thinking.as_ref().expect("后缀应注入 thinking");
+        assert_eq!(t.thinking_type, "adaptive");
+        assert_eq!(t.display.as_deref(), Some("summarized"));
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn opus_4_6_thinking_suffix_sets_adaptive() {
+        let mut req = make_req("claude-opus-4-6-thinking", None);
+        override_thinking_from_model_name(&mut req);
+
+        let t = req.thinking.as_ref().unwrap();
+        assert_eq!(t.thinking_type, "adaptive", "4.6 也走 adaptive");
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn sonnet_thinking_suffix_sets_enabled() {
+        let mut req = make_req("claude-sonnet-4-5-thinking", None);
+        override_thinking_from_model_name(&mut req);
+
+        let t = req.thinking.as_ref().unwrap();
+        assert_eq!(t.thinking_type, "enabled", "非 opus 4.6+ 应保留 enabled");
+        assert_eq!(t.budget_tokens, 20000);
+        assert!(req.output_config.is_none(), "enabled 不需要 output_config");
+    }
+
+    // === Anti-regression: 普通模型不应被改写 ===
+
+    #[test]
+    fn plain_model_without_suffix_is_noop() {
+        let mut req = make_req("claude-sonnet-4-5", Some(thinking("enabled", None)));
+        override_thinking_from_model_name(&mut req);
+
+        let t = req.thinking.as_ref().unwrap();
+        assert_eq!(t.thinking_type, "enabled", "普通模型 enabled 不应被改");
+        assert_eq!(t.display, None);
+    }
+
+    // === Thinking.display 反序列化校验 ===
+
+    #[test]
+    fn display_accepts_valid_values() {
+        for v in ["summarized", "omitted"] {
+            let t: Thinking = serde_json::from_value(serde_json::json!({
+                "type": "adaptive",
+                "display": v,
+            }))
+            .expect("有效值应解析成功");
+            assert_eq!(t.display.as_deref(), Some(v));
+        }
+    }
+
+    #[test]
+    fn display_rejects_invalid_value_silently() {
+        let t: Thinking = serde_json::from_value(serde_json::json!({
+            "type": "adaptive",
+            "display": "raw",
+        }))
+        .expect("无效值不应导致解析失败");
+        assert_eq!(t.display, None, "脏值应被降级为 None");
+    }
+
+    #[test]
+    fn effective_display_fallback() {
+        let t = thinking("adaptive", None);
+        assert_eq!(t.effective_display(), "summarized");
+        let t = thinking("adaptive", Some("omitted"));
+        assert_eq!(t.effective_display(), "omitted");
+    }
+}
