@@ -98,6 +98,17 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// 自定义系统提示词（可选）
+    /// 配置后会注入到每个请求的 system prompt 最前面
+    /// 可用于覆盖上游默认行为
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+
+    /// 是否剥离客户端发来的限制性系统提示词（默认 false）
+    /// 启用后会移除 Claude Code 内置的安全限制、沙箱策略、git 安全等指令
+    #[serde(default)]
+    pub strip_system_restrictions: bool,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -182,6 +193,8 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
+            system_prompt: None,
+            strip_system_restrictions: false,
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,

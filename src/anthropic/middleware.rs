@@ -25,6 +25,10 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 自定义系统提示词注入
+    pub system_prompt: Option<String>,
+    /// 是否剥离客户端限制性系统提示词
+    pub strip_system_restrictions: bool,
 }
 
 impl AppState {
@@ -34,12 +38,26 @@ impl AppState {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            system_prompt: None,
+            strip_system_restrictions: false,
         }
     }
 
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
+        self
+    }
+
+    /// 设置自定义系统提示词
+    pub fn with_system_prompt(mut self, prompt: Option<String>) -> Self {
+        self.system_prompt = prompt;
+        self
+    }
+
+    /// 设置是否剥离限制
+    pub fn with_strip_restrictions(mut self, strip: bool) -> Self {
+        self.strip_system_restrictions = strip;
         self
     }
 }

@@ -24,7 +24,7 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, SystemMessage, Thinking};
 use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -74,6 +74,24 @@ pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
     let models = vec![
+        Model {
+            id: "claude-opus-4-7".to_string(),
+            object: "model".to_string(),
+            created: 1778400000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-7-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1778400000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
         Model {
             id: "claude-opus-4-6".to_string(),
             object: "model".to_string(),
@@ -186,6 +204,9 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+    // 注入自定义系统提示词
+    inject_system_prompt(&mut payload, &state.system_prompt, state.strip_system_restrictions);
+
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -620,9 +641,53 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
+/// 注入自定义系统提示词 & 剥离限制
+///
+/// 1. 如果 strip_restrictions 为 true，移除已知的限制性内容
+/// 2. 将配置中的 systemPrompt 内容注入到请求的 system 字段最前面
+fn inject_system_prompt(payload: &mut MessagesRequest, system_prompt: &Option<String>, strip_restrictions: bool) {
+    // 先剥离限制
+    if strip_restrictions {
+        if let Some(ref mut system) = payload.system {
+            for msg in system.iter_mut() {
+                let stripped = super::prompt_filter::strip_restrictions(&msg.text);
+                if stripped.len() != msg.text.len() {
+                    tracing::info!(
+                        "剥离系统提示词限制: {} → {} bytes",
+                        msg.text.len(),
+                        stripped.len()
+                    );
+                    msg.text = stripped;
+                }
+            }
+        }
+    }
+
+    // 再注入自定义 prompt
+    let Some(prompt) = system_prompt else {
+        return;
+    };
+    if prompt.is_empty() {
+        return;
+    }
+
+    let injected = SystemMessage {
+        text: prompt.clone(),
+    };
+
+    match &mut payload.system {
+        Some(existing) => {
+            existing.insert(0, injected);
+        }
+        None => {
+            payload.system = Some(vec![injected]);
+        }
+    }
+}
+
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
+/// - Opus 4.6/4.7：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -631,10 +696,10 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6_or_newer =
+        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6") || model_lower.contains("4-7") || model_lower.contains("4.7"));
 
-    let thinking_type = if is_opus_4_6 {
+    let thinking_type = if is_opus_4_6_or_newer {
         "adaptive"
     } else {
         "enabled"
@@ -650,8 +715,8 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
-    if is_opus_4_6 {
+
+    if is_opus_4_6_or_newer {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
@@ -698,6 +763,9 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+
+    // 注入自定义系统提示词
+    inject_system_prompt(&mut payload, &state.system_prompt, state.strip_system_restrictions);
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {

@@ -162,6 +162,8 @@ async fn main() {
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        config.system_prompt.clone(),
+        config.strip_system_restrictions,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -199,6 +201,12 @@ async fn main() {
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
     tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    if config.strip_system_restrictions {
+        tracing::info!("系统提示词限制剥离: 已启用");
+    }
+    if config.system_prompt.is_some() {
+        tracing::info!("自定义系统提示词注入: 已启用");
+    }
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
