@@ -474,6 +474,9 @@ impl AdminService {
         id: &str,
         req: UpdateUserPresetRequest,
     ) -> Result<SystemPromptConfigResponse, AdminServiceError> {
+        // 校验 id（防控制字符 / 路径穿越字符进入日志）
+        validate_user_preset_id(id)?;
+
         if let Some(ref name) = req.name {
             if name.trim().is_empty() {
                 return Err(AdminServiceError::InvalidCredential("name 不能为空".into()));
@@ -520,6 +523,9 @@ impl AdminService {
         &self,
         id: &str,
     ) -> Result<SystemPromptConfigResponse, AdminServiceError> {
+        // 校验 id（防控制字符 / 路径穿越字符进入日志）
+        validate_user_preset_id(id)?;
+
         let snapshot = {
             let mut cfg = self.prompt_config.write();
             let before = cfg.user_presets.len();
@@ -607,7 +613,7 @@ impl AdminService {
 
         match serde_json::to_string_pretty(&map) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                if let Err(e) = crate::common::io::atomic_write_string(path, &json) {
                     tracing::warn!("保存余额缓存失败: {}", e);
                 }
             }
@@ -744,4 +750,84 @@ fn validate_user_preset_id(id: &str) -> Result<(), AdminServiceError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 合法 id 应通过
+    #[test]
+    fn validate_id_accepts_valid() {
+        for id in [
+            "a", "abc", "my_preset", "v2-config", "123", "a_1-b_2",
+            "x".repeat(32).as_str(),
+        ] {
+            assert!(
+                validate_user_preset_id(id).is_ok(),
+                "应接受合法 id: {:?}",
+                id
+            );
+        }
+    }
+
+    /// 大写字母拒绝
+    #[test]
+    fn validate_id_rejects_uppercase() {
+        for id in ["Foo", "BAR", "myPreset", "MY_CONFIG"] {
+            assert!(
+                validate_user_preset_id(id).is_err(),
+                "应拒绝大写: {:?}",
+                id
+            );
+        }
+    }
+
+    /// 长度边界
+    #[test]
+    fn validate_id_rejects_length_violations() {
+        // 空
+        assert!(validate_user_preset_id("").is_err());
+        // 33 字符（>32）
+        let too_long = "a".repeat(33);
+        assert!(validate_user_preset_id(&too_long).is_err());
+        // 1024 字符
+        let huge = "a".repeat(1024);
+        assert!(validate_user_preset_id(&huge).is_err());
+    }
+
+    /// 连字符锚点
+    #[test]
+    fn validate_id_rejects_dash_anchor() {
+        for id in ["-foo", "foo-", "-", "--", "-abc-"] {
+            assert!(
+                validate_user_preset_id(id).is_err(),
+                "应拒绝以连字符开头/结尾: {:?}",
+                id
+            );
+        }
+    }
+
+    /// 路径穿越/控制字符（被 [a-z0-9_-] 白名单自动拦截）
+    #[test]
+    fn validate_id_rejects_path_traversal_and_control_chars() {
+        for id in [
+            "../config",
+            "../../etc/passwd",
+            "foo/bar",
+            "foo\\bar",
+            "foo bar",  // 空格
+            "foo.bar",  // 点
+            "foo:bar",  // 冒号
+            "foo\0bar", // null byte
+            "foo\nbar", // 换行
+            "中文preset", // 非 ASCII
+        ] {
+            assert!(
+                validate_user_preset_id(id).is_err(),
+                "应拒绝特殊字符: {:?}",
+                id
+            );
+        }
+    }
 }

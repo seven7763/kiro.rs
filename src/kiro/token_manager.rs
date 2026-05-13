@@ -178,6 +178,8 @@ async fn refresh_social_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        // 脱敏上游响应，防 token reflection 泄入日志/错误响应
+        let redacted_body = crate::common::redact::redact_secret_text(&body_text);
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -185,7 +187,7 @@ async fn refresh_social_token(
             && body_text.contains("Invalid refresh token provided")
         {
             return Err(RefreshTokenInvalidError {
-                message: format!("Social refreshToken 已失效 (invalid_grant): {}", body_text),
+                message: format!("Social refreshToken 已失效 (invalid_grant): {}", redacted_body),
             }
             .into());
         }
@@ -197,7 +199,7 @@ async fn refresh_social_token(
             500..=599 => "服务器错误，AWS OAuth 服务暂时不可用",
             _ => "Token 刷新失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        bail!("{}: {} {}", error_msg, status, redacted_body);
     }
 
     let data: RefreshResponse = response.json().await?;
@@ -275,6 +277,8 @@ async fn refresh_idc_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        // 脱敏上游响应，防 token reflection 泄入日志/错误响应
+        let redacted_body = crate::common::redact::redact_secret_text(&body_text);
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -282,7 +286,7 @@ async fn refresh_idc_token(
             && body_text.contains("Invalid refresh token provided")
         {
             return Err(RefreshTokenInvalidError {
-                message: format!("IdC refreshToken 已失效 (invalid_grant): {}", body_text),
+                message: format!("IdC refreshToken 已失效 (invalid_grant): {}", redacted_body),
             }
             .into());
         }
@@ -294,7 +298,7 @@ async fn refresh_idc_token(
             500..=599 => "服务器错误，AWS OIDC 服务暂时不可用",
             _ => "IdC Token 刷新失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        bail!("{}: {} {}", error_msg, status, redacted_body);
     }
 
     let data: IdcRefreshResponse = response.json().await?;
@@ -378,6 +382,8 @@ pub(crate) async fn get_usage_limits(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        // 脱敏上游响应，防 token reflection 泄入日志/错误响应
+        let redacted_body = crate::common::redact::redact_secret_text(&body_text);
         let error_msg = match status.as_u16() {
             401 => "认证失败，Token 无效或已过期",
             403 => "权限不足，无法获取使用额度",
@@ -385,7 +391,7 @@ pub(crate) async fn get_usage_limits(
             500..=599 => "服务器错误，AWS 服务暂时不可用",
             _ => "获取使用额度失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        bail!("{}: {} {}", error_msg, status, redacted_body);
     }
 
     let data: UsageLimitsResponse = response.json().await?;
@@ -1009,12 +1015,14 @@ impl MultiTokenManager {
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
-        // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
+        // 原子写入（tmp + rename），防进程中段被 kill 时 credentials.json 半写损坏
+        // 在 Tokio runtime 内使用 block_in_place 避免阻塞 worker
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
+            tokio::task::block_in_place(|| crate::common::io::atomic_write_string(path, &json))
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            crate::common::io::atomic_write_string(path, &json)
+                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         }
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
@@ -1090,7 +1098,7 @@ impl MultiTokenManager {
 
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = crate::common::io::atomic_write_string(&path, &json) {
                     tracing::warn!("保存统计缓存失败: {}", e);
                 } else {
                     *self.last_stats_save_at.lock() = Some(Instant::now());
