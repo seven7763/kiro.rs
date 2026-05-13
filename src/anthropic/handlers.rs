@@ -29,6 +29,15 @@ use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, SystemMessage, Thinking};
 use super::websearch;
 
+/// 安全将 `u64` token 计数转换为 `i32`，超出范围时饱和到 `i32::MAX`
+///
+/// `count_all_tokens` 返回 `u64`，但下游 SSE 协议、context window 计算和
+/// `CountTokensResponse` 都用 `i32`。直接 `as i32` 在极端大请求下会 wrap 成负数
+/// 或被截断。此函数保证结果始终在 `[0, i32::MAX]` 范围内。
+fn saturating_to_i32(n: u64) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
@@ -233,12 +242,12 @@ pub async fn post_messages(
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
+        let input_tokens = saturating_to_i32(token::count_all_tokens(
             payload.model.clone(),
             payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
-        ) as i32;
+        ));
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
@@ -288,12 +297,12 @@ pub async fn post_messages(
     tracing::debug!("Kiro request body: {}", request_body);
 
     // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
+    let input_tokens = saturating_to_i32(token::count_all_tokens(
         payload.model.clone(),
         payload.system,
         payload.messages,
         payload.tools,
-    ) as i32;
+    ));
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -553,18 +562,22 @@ async fn handle_non_stream_request(
                         }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
+                            // clamp 防上游异常返回 NaN/负/>100，避免 input_tokens 错乱
+                            let pct = super::stream::clamp_context_percentage(
+                                context_usage.context_usage_percentage,
+                            );
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                (pct * (window_size as f64) / 100.0)
+                                    .clamp(0.0, i32::MAX as f64) as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                            if context_usage.context_usage_percentage >= 100.0 {
+                            if pct >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                                "收到 contextUsageEvent: {}% (clamped from {}), 计算 input_tokens: {}",
+                                pct,
                                 context_usage.context_usage_percentage,
                                 actual_input_tokens
                             );
@@ -788,10 +801,10 @@ pub async fn count_tokens(
         payload.system,
         payload.messages,
         payload.tools,
-    ) as i32;
+    );
 
     Json(CountTokensResponse {
-        input_tokens: total_tokens.max(1) as i32,
+        input_tokens: saturating_to_i32(total_tokens.max(1)),
     })
 }
 
@@ -839,12 +852,12 @@ pub async fn post_messages_cc(
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
+        let input_tokens = saturating_to_i32(token::count_all_tokens(
             payload.model.clone(),
             payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
-        ) as i32;
+        ));
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
@@ -894,12 +907,12 @@ pub async fn post_messages_cc(
     tracing::debug!("Kiro request body: {}", request_body);
 
     // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
+    let input_tokens = saturating_to_i32(token::count_all_tokens(
         payload.model.clone(),
         payload.system,
         payload.messages,
         payload.tools,
-    ) as i32;
+    ));
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -1197,5 +1210,31 @@ mod tests {
         assert_eq!(t.effective_display(), "summarized");
         let t = thinking("adaptive", Some("omitted"));
         assert_eq!(t.effective_display(), "omitted");
+    }
+
+    // === Bug 3: saturating_to_i32 防 u64 → i32 wrap ===
+
+    #[test]
+    fn saturating_to_i32_normal() {
+        assert_eq!(saturating_to_i32(0), 0);
+        assert_eq!(saturating_to_i32(100), 100);
+        assert_eq!(saturating_to_i32(1_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn saturating_to_i32_max_boundary() {
+        assert_eq!(saturating_to_i32(i32::MAX as u64), i32::MAX);
+        // 边界 +1 应饱和
+        assert_eq!(saturating_to_i32(i32::MAX as u64 + 1), i32::MAX);
+    }
+
+    #[test]
+    fn saturating_to_i32_overflow_saturates() {
+        // 之前的 `as i32` 会把 u64::MAX wrap 成 -1（i32 视图）
+        // saturating 版本应饱和到 i32::MAX，永不为负
+        assert_eq!(saturating_to_i32(u64::MAX), i32::MAX);
+        assert!(saturating_to_i32(u64::MAX) >= 0, "结果不应为负");
+        // 模拟大请求场景
+        assert_eq!(saturating_to_i32(5_000_000_000), i32::MAX);
     }
 }
