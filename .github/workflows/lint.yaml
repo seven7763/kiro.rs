@@ -1,0 +1,85 @@
+name: Lint & Test
+
+# 防回归 workflow：每次 push / PR 跑测试
+# 与 build.yaml (release artifact) 互补；本 workflow 只做 lint，不出包
+#
+# 策略：
+# - test：强制（任何回归立刻可见）
+# - clippy / fmt：continue-on-error，仅作健康度信号
+#   原因：fork 当前有 107 个 clippy warning + 多文件不符 rustfmt（历史欠债），
+#   一次性清理是单独的大工程。本 workflow 第一版先建立 test 防回归底线，
+#   clippy/fmt 信号化便于后续逐步清理而不阻塞日常 commit。
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: cargo test (required)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lint-test"
+          cache-on-failure: true
+
+      # 与 musl Dockerfile 一致使用 --no-default-features，避免 native-tls 平台依赖
+      - name: cargo test
+        run: cargo test --no-default-features --bins
+
+  clippy:
+    name: cargo clippy (informational)
+    runs-on: ubuntu-22.04
+    # 当前 107 warning 历史欠债，逐步清理；不阻塞 push
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lint-clippy"
+          cache-on-failure: true
+
+      - name: cargo clippy
+        run: cargo clippy --no-default-features --all-targets
+
+  fmt:
+    name: cargo fmt (informational)
+    runs-on: ubuntu-22.04
+    # 多文件不符 rustfmt 历史欠债，逐步清理；不阻塞 push
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
