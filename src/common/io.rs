@@ -1,9 +1,14 @@
 //! 文件 I/O 工具
 //!
 //! 主要提供原子写入实现，避免进程中段被 kill 时配置/凭据文件半写损坏。
+//! 对凭据等敏感文件还提供 `_secure` 变体，自动 chmod 0o600 防同主机权限泄露。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// 敏感文件 Unix 权限：仅 owner 可读写
+#[cfg(unix)]
+const SECURE_FILE_MODE: u32 = 0o600;
 
 /// 原子地把字符串写入文件
 ///
@@ -43,6 +48,60 @@ pub fn atomic_write_string<P: AsRef<Path>>(path: P, content: &str) -> std::io::R
         Ok(()) => Ok(()),
         Err(e) => {
             // rename 失败：清理孤立临时文件，避免堆积
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
+/// 原子地把字符串写入文件，并设置敏感文件权限
+///
+/// 与 [`atomic_write_string`] 行为一致，额外在 rename **前**对临时文件
+/// `chmod 0o600`（Unix 平台），让目标文件落盘后立即只对 owner 可读写。
+///
+/// 用于 `credentials.json` 等含有 refresh_token / access_token 的敏感文件，
+/// 防止同主机其他用户/服务/容器直接读取。
+///
+/// # 平台说明
+/// - Unix（macOS / Linux）：`set_permissions(0o600)`
+/// - Windows / 非 Unix：跳过权限设置（ACL 模型不同），写入仍是原子的
+///
+/// # 错误处理
+/// `set_permissions` 失败仅 warn 不阻塞写入：某些 NFS / CIFS / overlayfs
+/// 不支持 chmod，但数据完整性必须优先保证。
+pub fn atomic_write_string_secure<P: AsRef<Path>>(
+    path: P,
+    content: &str,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let tmp_path = make_tmp_path(path);
+
+    // 写入临时文件
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+    }
+
+    // 设置权限：rename 前完成，避免目标文件出现"已替换但权限尚未收紧"的窗口
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(SECURE_FILE_MODE);
+        if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
+            tracing::warn!(
+                "为 {} 设置 0o600 权限失败（继续写入）: {}",
+                tmp_path.display(),
+                e
+            );
+        }
+    }
+
+    // 原子替换
+    match std::fs::rename(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
             let _ = std::fs::remove_file(&tmp_path);
             Err(e)
         }
@@ -134,6 +193,78 @@ mod tests {
         let target = tmp_target();
         atomic_write_string(&target, "").expect("empty write");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
+        std::fs::remove_file(&target).ok();
+    }
+
+    /// secure 写入：内容正确 + 文件存在
+    ///
+    /// 该测试不依赖 unix（用于 Windows CI 也能跑），权限校验单独走 unix 分支
+    #[test]
+    fn secure_write_creates_file_with_content() {
+        let target = tmp_target();
+        atomic_write_string_secure(&target, "secret-data").expect("secure write");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "secret-data",
+            "内容应正确写入"
+        );
+        std::fs::remove_file(&target).ok();
+    }
+
+    /// secure 写入后 Unix 权限末 9 位 = 0o600
+    #[cfg(unix)]
+    #[test]
+    fn secure_write_sets_0600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let target = tmp_target();
+        atomic_write_string_secure(&target, "credential-token-here").expect("secure write");
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        // mode 高位含文件类型 (S_IFREG=0o100000)，只比较低 9 位（rwx）
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "secure 写入应设权限为 0o600，实际 {:o}",
+            mode & 0o777
+        );
+
+        std::fs::remove_file(&target).ok();
+    }
+
+    /// 已存在的 0o644 文件被 secure 覆盖时应降权到 0o600
+    ///
+    /// 这个 case 验证了我们对 token_manager.rs 升级的关键场景：
+    /// 老版本写出的 credentials.json (0o644) 在升级到含 secure 写入的版本后，
+    /// 第一次 token refresh 应自动收紧权限
+    #[cfg(unix)]
+    #[test]
+    fn secure_write_downgrades_existing_644() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let target = tmp_target();
+
+        // 模拟老版本：先用普通 atomic_write 写入（默认 0o644 in temp_dir）
+        atomic_write_string(&target, "old-content").expect("first write");
+        let old_perms = std::fs::Permissions::from_mode(0o644);
+        std::fs::set_permissions(&target, old_perms).expect("force 644");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "前置条件：文件应为 0o644"
+        );
+
+        // secure 覆盖
+        atomic_write_string_secure(&target, "new-secret").expect("secure overwrite");
+
+        // 验证：内容已更新 + 权限收紧
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new-secret");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "secure 覆盖应把 0o644 降为 0o600"
+        );
+
         std::fs::remove_file(&target).ok();
     }
 }

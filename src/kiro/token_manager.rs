@@ -1015,13 +1015,17 @@ impl MultiTokenManager {
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
-        // 原子写入（tmp + rename），防进程中段被 kill 时 credentials.json 半写损坏
-        // 在 Tokio runtime 内使用 block_in_place 避免阻塞 worker
+        // 原子写入（tmp + rename），防进程中段被 kill 时 credentials.json 半写损坏。
+        // 用 _secure 变体：Unix 上自动 chmod 0o600，防同主机其他用户/服务读到
+        // refresh_token / access_token / api_key 等敏感字段。
+        // 在 Tokio runtime 内使用 block_in_place 避免阻塞 worker。
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| crate::common::io::atomic_write_string(path, &json))
-                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            tokio::task::block_in_place(|| {
+                crate::common::io::atomic_write_string_secure(path, &json)
+            })
+            .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         } else {
-            crate::common::io::atomic_write_string(path, &json)
+            crate::common::io::atomic_write_string_secure(path, &json)
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         }
 
