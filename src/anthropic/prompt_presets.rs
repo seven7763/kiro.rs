@@ -65,3 +65,76 @@ pub fn find(id: &str) -> Option<&'static PromptPreset> {
 pub fn is_builtin(id: &str) -> bool {
     find(id).is_some()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// 所有内置预设 id 必须唯一（防 include_str! 路径写错或复制粘贴漏改）
+    #[test]
+    fn all_preset_ids_unique() {
+        let ids: HashSet<&str> = PRESETS.iter().map(|p| p.id).collect();
+        assert_eq!(
+            ids.len(),
+            PRESETS.len(),
+            "内置预设 id 存在重复：{:?}",
+            PRESETS.iter().map(|p| p.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// 每个预设的 content 必须非空（include_str! 路径正确且文件非空）
+    #[test]
+    fn all_preset_contents_non_empty() {
+        for p in PRESETS {
+            assert!(
+                !p.content.trim().is_empty(),
+                "预设 '{}' 的 content 为空（检查 presets/{}.md）",
+                p.id,
+                p.id
+            );
+        }
+    }
+
+    /// 每个预设必须有 name 和 description（前端展示需要）
+    #[test]
+    fn all_presets_have_metadata() {
+        for p in PRESETS {
+            assert!(!p.name.is_empty(), "预设 '{}' 缺少 name", p.id);
+            assert!(
+                !p.description.is_empty(),
+                "预设 '{}' 缺少 description",
+                p.id
+            );
+        }
+    }
+
+    /// `find` 对所有内置 id 返回 Some
+    #[test]
+    fn find_returns_some_for_all_builtins() {
+        for p in PRESETS {
+            let found = find(p.id);
+            assert!(found.is_some(), "find('{}') 应返回 Some", p.id);
+            assert_eq!(found.unwrap().id, p.id, "find 返回的 id 应匹配");
+        }
+    }
+
+    /// `find` 对未知 id 返回 None
+    #[test]
+    fn find_unknown_returns_none() {
+        assert!(find("nonexistent").is_none());
+        assert!(find("").is_none(), "空字符串应返回 None");
+        assert!(find("OVERRIDE").is_none(), "id 大小写敏感");
+    }
+
+    /// `is_builtin` 与 `find` 行为一致
+    #[test]
+    fn is_builtin_matches_find() {
+        for p in PRESETS {
+            assert!(is_builtin(p.id), "is_builtin('{}') 应为 true", p.id);
+        }
+        assert!(!is_builtin("my_user_preset"));
+        assert!(!is_builtin(""));
+        assert!(!is_builtin("nonexistent"));
+    }
+}
