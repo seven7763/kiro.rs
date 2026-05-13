@@ -9,8 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, CreateUserPresetRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
+        UpdateSystemPromptRequest, UpdateUserPresetRequest,
     },
 };
 
@@ -136,6 +137,79 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/system-prompt
+/// 读取当前生效的系统提示词配置
+pub async fn get_system_prompt(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_system_prompt())
+}
+
+/// PUT /api/admin/config/system-prompt
+/// 更新系统提示词配置（运行时即时生效 + 写回 config.json）
+pub async fn update_system_prompt(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpdateSystemPromptRequest>,
+) -> impl IntoResponse {
+    match state.service.update_system_prompt(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/system-prompt/presets
+/// 返回内置 preset 元数据清单（不含完整 content）
+pub async fn list_presets(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.list_presets())
+}
+
+/// GET /api/admin/config/system-prompt/presets/:id
+/// 返回单个 preset 的完整内容（用于前端"预览"按钮）
+pub async fn get_preset_content(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.get_preset_content(&id) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/config/system-prompt/user-presets
+/// 添加用户自定义预设
+pub async fn add_user_preset(
+    State(state): State<AdminState>,
+    Json(payload): Json<CreateUserPresetRequest>,
+) -> impl IntoResponse {
+    match state.service.add_user_preset(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/config/system-prompt/user-presets/:id
+/// 编辑用户自定义预设
+pub async fn update_user_preset(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateUserPresetRequest>,
+) -> impl IntoResponse {
+    match state.service.update_user_preset(&id, payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/config/system-prompt/user-presets/:id
+/// 删除用户自定义预设
+pub async fn delete_user_preset(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.delete_user_preset(&id) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

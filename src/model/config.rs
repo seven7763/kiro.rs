@@ -17,6 +17,36 @@ impl Default for TlsBackend {
     }
 }
 
+/// 自定义系统提示词注入位置
+///
+/// - `Prepend`：插入到 system 数组最前（旧默认行为）
+/// - `Append`：追加到 system 数组末尾（recency bias 权重最高，推荐用于 override）
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SystemPromptPosition {
+    Prepend,
+    Append,
+}
+
+impl Default for SystemPromptPosition {
+    fn default() -> Self {
+        Self::Append
+    }
+}
+
+/// 用户自定义预设（与内置 `PRESETS` 并列，可在 Admin UI 中增删改）
+///
+/// id 必须全局唯一（含内置 id），仅允许 `[a-z0-9_-]`，长度 1-32。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserPreset {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub content: String,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,9 +128,10 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
-    /// 自定义系统提示词（可选）
-    /// 配置后会注入到每个请求的 system prompt 最前面
-    /// 可用于覆盖上游默认行为
+    /// 自定义系统提示词补充内容（可选）
+    ///
+    /// 注入时：先拼接所有 `enabled_presets` 的内容，再追加这段自定义文本，
+    /// 最后整体按 `system_prompt_position` 插入到 system role。
     #[serde(default)]
     pub system_prompt: Option<String>,
 
@@ -108,6 +139,30 @@ pub struct Config {
     /// 启用后会移除 Claude Code 内置的安全限制、沙箱策略、git 安全等指令
     #[serde(default)]
     pub strip_system_restrictions: bool,
+
+    /// 系统提示词注入总开关（默认 false）
+    ///
+    /// 关闭时：完全不注入任何 preset 或自定义文本（但 `strip_system_restrictions`
+    /// 仍独立生效）。打开后才会按 `enabled_presets` + `system_prompt` 拼接注入。
+    #[serde(default)]
+    pub system_prompt_enabled: bool,
+
+    /// 启用的预设 id 列表（可以混合内置 + 用户自定义）
+    ///
+    /// 顺序无关 —— 实际拼接顺序：先内置（按 `PRESETS` 顺序）后用户（按 `user_presets` 顺序）。
+    #[serde(default)]
+    pub enabled_presets: Vec<String>,
+
+    /// 用户自定义预设清单
+    #[serde(default)]
+    pub user_presets: Vec<UserPreset>,
+
+    /// 自定义系统提示词注入位置（默认 `append`）
+    ///
+    /// - `prepend`：放到 system 数组最前
+    /// - `append`：放到 system 数组末尾（recency bias，权重最高）
+    #[serde(default)]
+    pub system_prompt_position: SystemPromptPosition,
 
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
@@ -195,6 +250,10 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             system_prompt: None,
             strip_system_restrictions: false,
+            system_prompt_enabled: false,
+            enabled_presets: Vec::new(),
+            user_presets: Vec::new(),
+            system_prompt_position: SystemPromptPosition::default(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,

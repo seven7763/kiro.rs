@@ -7,9 +7,10 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        add_credential, add_user_preset, delete_credential, delete_user_preset, force_refresh_token,
+        get_all_credentials, get_credential_balance, get_load_balancing_mode, get_preset_content,
+        get_system_prompt, list_presets, reset_failure_count, set_credential_disabled,
+        set_credential_priority, set_load_balancing_mode, update_system_prompt, update_user_preset,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -47,6 +48,23 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
+        )
+        .route(
+            "/config/system-prompt",
+            get(get_system_prompt).put(update_system_prompt),
+        )
+        .route("/config/system-prompt/presets", get(list_presets))
+        .route(
+            "/config/system-prompt/presets/{id}",
+            get(get_preset_content),
+        )
+        .route(
+            "/config/system-prompt/user-presets",
+            post(add_user_preset),
+        )
+        .route(
+            "/config/system-prompt/user-presets/{id}",
+            axum::routing::put(update_user_preset).delete(delete_user_preset),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

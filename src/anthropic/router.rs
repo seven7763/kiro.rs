@@ -8,6 +8,7 @@ use axum::{
 };
 
 use crate::kiro::provider::KiroProvider;
+use crate::model::runtime::SharedPromptConfig;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
@@ -38,15 +39,12 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
-    system_prompt: Option<String>,
-    strip_system_restrictions: bool,
+    prompt_config: SharedPromptConfig,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking);
+    let mut state = AppState::new(api_key, extract_thinking, prompt_config);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
-    state = state.with_system_prompt(system_prompt);
-    state = state.with_strip_restrictions(strip_system_restrictions);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

@@ -17,6 +17,8 @@ use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
+use model::runtime::shared_from_config;
+use parking_lot::Mutex;
 
 #[tokio::main]
 async fn main() {
@@ -157,13 +159,17 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 构建共享运行时 Prompt 配置（Anthropic handler 与 Admin 共享，热更新无需重启）
+    let prompt_config = shared_from_config(&config);
+    // 可写 Config 句柄（Admin 写入 system prompt 等字段时回写 config.json）
+    let config_writer: Arc<Mutex<Config>> = Arc::new(Mutex::new(config.clone()));
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
-        config.system_prompt.clone(),
-        config.strip_system_restrictions,
+        prompt_config.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -179,8 +185,12 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+            let admin_service = admin::AdminService::new(
+                token_manager.clone(),
+                endpoint_names.clone(),
+                prompt_config.clone(),
+                config_writer.clone(),
+            );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 
@@ -204,8 +214,12 @@ async fn main() {
     if config.strip_system_restrictions {
         tracing::info!("系统提示词限制剥离: 已启用");
     }
-    if config.system_prompt.is_some() {
-        tracing::info!("自定义系统提示词注入: 已启用");
+    if config.system_prompt_enabled {
+        tracing::info!(
+            "自定义系统提示词注入: 已启用 (presets={:?}, custom={})",
+            config.enabled_presets,
+            config.system_prompt.is_some()
+        );
     }
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");

@@ -1,8 +1,10 @@
 FROM node:22-alpine AS frontend-builder
 
 WORKDIR /app/admin-ui
-COPY admin-ui/package.json ./
-RUN npm install -g pnpm && pnpm install
+# 固定 pnpm@9（pnpm 10+ 严格拒绝 native build scripts，会卡 @swc/core 和 esbuild）
+COPY admin-ui/package.json admin-ui/pnpm-lock.yaml* ./
+RUN npm install -g pnpm@9 \
+    && pnpm install --no-frozen-lockfile
 COPY admin-ui ./
 RUN pnpm build
 

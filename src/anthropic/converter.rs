@@ -616,27 +616,51 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
         .collect()
 }
 
-/// 生成thinking标签前缀
+/// 生成 thinking 标签前缀
+///
+/// Kiro 上游没有原生 `thinking_delta` event，全靠**文本协议**：在用户消息开头
+/// 注入 `<thinking_mode>` 等指令，让模型在响应里吐 `<thinking>...</thinking>`
+/// 包裹的内容，后端再从文本流中截取并转译为 Anthropic SSE thinking_delta。
+///
+/// Opus 4.7 特殊性：
+/// - 不支持 `type: "enabled"` —— 必须 `adaptive`（已在 handlers 自动降级）
+/// - 默认 `display: "omitted"` —— 不主动吐 thinking 文本，需显式声明 `summarized`
+/// - instruction-following 更严 —— 加额外明确指令兜底，确保始终使用 `<thinking>` 标签
 fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
-    if let Some(t) = &req.thinking {
-        if t.thinking_type == "enabled" {
-            return Some(format!(
-                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-                t.budget_tokens
-            ));
-        } else if t.thinking_type == "adaptive" {
+    let t = req.thinking.as_ref()?;
+    let model_lower = req.model.to_lowercase();
+    let is_opus_4_7 = model_lower.contains("opus")
+        && (model_lower.contains("4-7") || model_lower.contains("4.7"));
+
+    match t.thinking_type.as_str() {
+        "enabled" => Some(format!(
+            "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
+            t.budget_tokens
+        )),
+        "adaptive" => {
             let effort = req
                 .output_config
                 .as_ref()
                 .map(|c| c.effort.as_str())
                 .unwrap_or("high");
-            return Some(format!(
-                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
-                effort
-            ));
+            // 显式声明 display 让 Kiro 知道客户端要 thinking 文本
+            let display = t.effective_display();
+            let base = format!(
+                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort><thinking_display>{}</thinking_display>",
+                effort, display
+            );
+            // 4.7 上游对指令字面更敏感，加一条人话引导，强制用 <thinking> 包裹
+            if is_opus_4_7 && display == "summarized" {
+                Some(format!(
+                    "{}\nIMPORTANT: Wrap your full reasoning inside <thinking>...</thinking> tags BEFORE the final answer. This wrapping is required even when adaptive thinking decides the task is simple — always emit at least a brief <thinking>...</thinking> block.",
+                    base
+                ))
+            } else {
+                Some(base)
+            }
         }
+        _ => None,
     }
-    None
 }
 
 /// 检查内容是否已包含thinking标签

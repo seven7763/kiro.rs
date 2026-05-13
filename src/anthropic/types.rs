@@ -64,6 +64,18 @@ pub struct ModelsResponse {
 const MAX_BUDGET_TOKENS: i32 = 24576;
 
 /// Thinking 配置
+///
+/// Anthropic 三种类型：
+/// - `enabled`：手动指定 `budget_tokens`（Opus 4.6 / Sonnet 4.6 / 老模型）
+/// - `adaptive`：模型自适应分配（Opus 4.7 / 4.6 / Sonnet 4.6；Opus 4.7 只支持此模式）
+/// - `disabled`：关闭 thinking
+///
+/// `display` 控制 thinking 块内容是否对客户端可见：
+/// - `summarized`（默认 4.6）：返回模型 thinking 文本摘要
+/// - `omitted`（默认 4.7）：thinking 字段为空，仅保留 signature
+///
+/// 对 Kiro 上游：4.7 默认 omitted → Kiro 可能不输出 `<thinking>` 文本块，
+/// 我们在 prefix 中显式声明 `<thinking_display>summarized</thinking_display>` 强制可见。
 #[derive(Debug, Deserialize, Clone)]
 pub struct Thinking {
     #[serde(rename = "type")]
@@ -73,12 +85,20 @@ pub struct Thinking {
         deserialize_with = "deserialize_budget_tokens"
     )]
     pub budget_tokens: i32,
+    /// `summarized` / `omitted`，未提供时由后端按模型默认填入
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
 impl Thinking {
     /// 是否启用了 thinking（enabled 或 adaptive）
     pub fn is_enabled(&self) -> bool {
         self.thinking_type == "enabled" || self.thinking_type == "adaptive"
+    }
+
+    /// 有效 display 值（None 时回退 "summarized"，确保 Kiro 能吐 thinking 文本）
+    pub fn effective_display(&self) -> &str {
+        self.display.as_deref().unwrap_or("summarized")
     }
 }
 

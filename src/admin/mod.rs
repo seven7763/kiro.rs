@@ -11,7 +11,12 @@
 //!
 //! # 使用
 //! ```ignore
-//! let admin_service = AdminService::new(token_manager.clone(), endpoint_names);
+//! let admin_service = AdminService::new(
+//!     token_manager.clone(),
+//!     endpoint_names,
+//!     prompt_config.clone(),
+//!     config_writer.clone(),
+//! );
 //! let admin_state = AdminState::new(admin_api_key, admin_service);
 //! let admin_router = create_admin_router(admin_state);
 //! ```

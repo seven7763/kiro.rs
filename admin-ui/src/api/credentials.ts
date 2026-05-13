@@ -8,6 +8,12 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  SystemPromptConfig,
+  UpdateSystemPromptRequest,
+  PresetCatalog,
+  PresetContent,
+  CreateUserPresetRequest,
+  UpdateUserPresetRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -102,5 +108,66 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+  return data
+}
+
+// ============ 系统提示词配置 ============
+
+// 获取当前系统提示词配置
+export async function getSystemPrompt(): Promise<SystemPromptConfig> {
+  const { data } = await api.get<SystemPromptConfig>('/config/system-prompt')
+  return data
+}
+
+// 更新系统提示词配置（增量更新）
+export async function updateSystemPrompt(
+  req: UpdateSystemPromptRequest
+): Promise<SystemPromptConfig> {
+  const { data } = await api.put<SystemPromptConfig>('/config/system-prompt', req)
+  return data
+}
+
+// 列出所有内置 preset（元数据，不含 content）
+export async function listPresets(): Promise<PresetCatalog> {
+  const { data } = await api.get<PresetCatalog>('/config/system-prompt/presets')
+  return data
+}
+
+// 获取单个 preset 的完整内容（"预览"按钮）
+export async function getPresetContent(id: string): Promise<PresetContent> {
+  const { data } = await api.get<PresetContent>(
+    `/config/system-prompt/presets/${encodeURIComponent(id)}`
+  )
+  return data
+}
+
+// 添加用户自定义预设（返回更新后的 SystemPromptConfig）
+export async function addUserPreset(
+  req: CreateUserPresetRequest
+): Promise<SystemPromptConfig> {
+  const { data } = await api.post<SystemPromptConfig>(
+    '/config/system-prompt/user-presets',
+    req
+  )
+  return data
+}
+
+// 编辑用户自定义预设
+export async function updateUserPreset(
+  id: string,
+  req: UpdateUserPresetRequest
+): Promise<SystemPromptConfig> {
+  const { data } = await api.put<SystemPromptConfig>(
+    `/config/system-prompt/user-presets/${encodeURIComponent(id)}`,
+    req
+  )
+  return data
+}
+
+// 删除用户自定义预设
+export async function deleteUserPreset(id: string): Promise<SystemPromptConfig> {
+  const { data } = await api.delete<SystemPromptConfig>(
+    `/config/system-prompt/user-presets/${encodeURIComponent(id)}`
+  )
   return data
 }

@@ -12,6 +12,7 @@ use axum::{
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::model::runtime::SharedPromptConfig;
 
 use super::types::ErrorResponse;
 
@@ -25,39 +26,28 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
-    /// 自定义系统提示词注入
-    pub system_prompt: Option<String>,
-    /// 是否剥离客户端限制性系统提示词
-    pub strip_system_restrictions: bool,
+    /// 共享 Prompt 注入配置（可由 Admin API 热更新）
+    pub prompt_config: SharedPromptConfig,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        extract_thinking: bool,
+        prompt_config: SharedPromptConfig,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
-            system_prompt: None,
-            strip_system_restrictions: false,
+            prompt_config,
         }
     }
 
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
-        self
-    }
-
-    /// 设置自定义系统提示词
-    pub fn with_system_prompt(mut self, prompt: Option<String>) -> Self {
-        self.system_prompt = prompt;
-        self
-    }
-
-    /// 设置是否剥离限制
-    pub fn with_strip_restrictions(mut self, strip: bool) -> Self {
-        self.strip_system_restrictions = strip;
         self
     }
 }

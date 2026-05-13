@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::config::{SystemPromptPosition, UserPreset};
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -194,6 +196,97 @@ pub struct LoadBalancingModeResponse {
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority" 或 "balanced"）
     pub mode: String,
+}
+
+// ============ 系统提示词配置 ============
+
+/// 系统提示词配置响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemPromptConfigResponse {
+    /// 注入总开关（关闭时所有 preset + 自定义文本都不注入）
+    pub enabled: bool,
+    /// 启用的 preset id 列表（混合内置 + 用户自定义）
+    pub enabled_presets: Vec<String>,
+    /// 用户自定义预设清单
+    pub user_presets: Vec<UserPreset>,
+    /// 自定义补充文本（None 表示未配置）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// 注入位置：`prepend` / `append`
+    pub position: SystemPromptPosition,
+    /// 是否同时剥离客户端发来的安全限制指令（独立开关）
+    pub strip_restrictions: bool,
+}
+
+/// 设置系统提示词配置请求
+///
+/// 所有字段都是可选的，未提供的字段保持现状。
+/// - `content == Some("")` 视为清空自定义文本
+/// - `enabled_presets == Some([])` 视为禁用全部 preset
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSystemPromptRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub enabled_presets: Option<Vec<String>>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub position: Option<SystemPromptPosition>,
+    #[serde(default)]
+    pub strip_restrictions: Option<bool>,
+}
+
+/// 单个内置 preset 的元数据 + 完整内容（前端用来本地拼接预览）
+///
+/// 由于内置只有 5 条、总大小约 5KB，直接返回 content 不会显著增加流量。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresetMetaResponse {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    /// 字符数（前端展示用）
+    pub length: usize,
+    /// 完整 prompt 内容
+    pub content: &'static str,
+}
+
+/// 预设清单响应
+#[derive(Debug, Serialize)]
+pub struct PresetCatalogResponse {
+    pub presets: Vec<PresetMetaResponse>,
+}
+
+/// 单个 preset 的完整内容响应（保留作为按 id 单独读取的能力）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresetContentResponse {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub content: &'static str,
+}
+
+/// 创建用户自定义预设请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateUserPresetRequest {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub content: String,
+}
+
+/// 更新用户自定义预设请求（id 由 URL path 指定，所有字段可选）
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateUserPresetRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub content: Option<String>,
 }
 
 // ============ 通用响应 ============

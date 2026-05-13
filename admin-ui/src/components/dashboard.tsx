@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Sparkles } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -12,7 +12,9 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { SystemPromptDialog } from '@/components/system-prompt-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { useSystemPrompt } from '@/hooks/use-system-prompt'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -38,6 +40,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
+  const [systemPromptDialogOpen, setSystemPromptDialogOpen] = useState(false)
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -54,6 +57,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const { data: systemPromptData } = useSystemPrompt()
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -543,6 +547,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <div className="flex items-center gap-2">
             <Server className="h-5 w-5" />
             <span className="font-semibold">Kiro Admin</span>
+            <a
+              href="https://github.com/seven7763/kiro.rs"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="ml-1 inline-flex items-center rounded border border-primary/30 bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary hover:bg-primary/20"
+              title="Enhanced Fork · 含 Opus 4.7 + 系统提示词预设系统"
+            >
+              Enhanced
+            </a>
           </div>
           <div className="flex items-center gap-2">
             <Button
@@ -554,6 +567,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
             >
               {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
             </Button>
+            <SystemPromptButton
+              data={systemPromptData}
+              onClick={() => setSystemPromptDialogOpen(true)}
+            />
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
@@ -781,6 +798,65 @@ export function Dashboard({ onLogout }: DashboardProps) {
         results={verifyResults}
         onCancel={handleCancelVerify}
       />
+
+      {/* 系统提示词管理对话框 */}
+      <SystemPromptDialog
+        open={systemPromptDialogOpen}
+        onOpenChange={setSystemPromptDialogOpen}
+      />
+    </div>
+  )
+}
+
+interface SystemPromptButtonProps {
+  data: import('@/types/api').SystemPromptConfig | undefined
+  onClick: () => void
+}
+
+/** 顶部"系统提示词"按钮：根据当前配置动态展示状态徽章 */
+function SystemPromptButton({ data, onClick }: SystemPromptButtonProps) {
+  // 计算"生效项数" = 启用预设数 + (自定义文本非空 ? 1 : 0)
+  const activeCount = data
+    ? data.enabledPresets.length + (data.content && data.content.trim().length > 0 ? 1 : 0)
+    : 0
+  const hasInjection = !!data?.enabled && activeCount > 0
+  const isEmptyButOn = !!data?.enabled && activeCount === 0
+  const stripActive = !!data?.stripRestrictions
+
+  let label = '系统提示词'
+  let className = ''
+  if (hasInjection) {
+    label = `✨ 系统提示词 · ${activeCount} 项生效`
+    className =
+      'border-primary bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary'
+  } else if (isEmptyButOn) {
+    label = '系统提示词 · 已开但空'
+    className =
+      'border-yellow-500/50 bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 hover:bg-yellow-500/15'
+  }
+
+  return (
+    <div className="flex items-center gap-1">
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={onClick}
+        title="系统提示词管理"
+        className={className}
+      >
+        <Sparkles className="h-4 w-4 mr-1" />
+        {label}
+      </Button>
+      {stripActive && (
+        <Badge
+          variant="secondary"
+          className="text-[10px] px-1.5 py-0 cursor-pointer"
+          title="客户端安全限制剥离已启用"
+          onClick={onClick}
+        >
+          +strip
+        </Badge>
+      )}
     </div>
   )
 }

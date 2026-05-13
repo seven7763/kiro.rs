@@ -1,6 +1,36 @@
-# kiro-rs
+# kiro-rs (Enhanced Fork)
 
 一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
+
+> **关于本 Fork**：本仓库 fork 自上游 [`hank9999/kiro.rs`](https://github.com/hank9999/kiro.rs)，
+> 在保持完全兼容的基础上，针对 **Opus 4.7 支持、系统提示词治理、安全研究场景使用体验** 做了增强。
+> 详见下方 [#与上游差异](#与上游差异)。
+
+---
+
+## 与上游差异
+
+| 能力 | 上游 `hank9999/kiro.rs` | 本 Fork |
+|---|---|---|
+| **Claude Opus 4.7** | 仅模型名映射 | ✅ 完整支持：`adaptive` thinking、自动降级 `enabled→adaptive`、强化文本协议 prefix 保证 `<thinking>` 标签稳定输出 |
+| **Thinking 兼容** | 仅支持 `enabled`、`adaptive` 透传 | ✅ 新增 `display` 字段端到端转发；客户端硬传 `enabled` 在 Opus 4.7 上自动降级；模型名 `*-thinking` 后缀按模型版本智能选择 `enabled`/`adaptive` |
+| **客户端系统提示词** | 原样转发 | ✅ 长度自动剥离（避免上游拒绝过长 system）、自定义 prefix/append 注入 |
+| **预设系统** | 无 | ✅ 5 个内置预设（`override` 解禁 / `pentest` 渗透 / `nsfw` / `code_complete` / `concise`）+ 用户自定义预设；可任意组合启用，Admin UI 一键管理 |
+| **Admin UI** | 凭据管理 | ✅ 凭据管理 + 系统提示词治理面板 + 实时预览注入效果 |
+| **Admin API** | `/api/admin/credentials*` | ✅ 新增 `/api/admin/config/system-prompt`、`/api/admin/config/system-prompt/presets`（含 enable/disable/CRUD） |
+| **模型识别正则** | `claude-opus-4-6/4.6` | ✅ 扩展到 `4-7/4.7` + 多种变体（`claude-opus-4.7`、`claude-4.7-opus`、`claude-opus-4-7-20260101`） |
+| **运行时配置热更新** | 静态配置 | ✅ 系统提示词配置支持 Admin API 热更新，无需重启 |
+
+### 新增 / 修改的关键文件
+
+- `src/anthropic/handlers.rs` — Opus 4.7 thinking 自动降级、系统提示词剥离
+- `src/anthropic/converter.rs` — `generate_thinking_prefix` 针对 4.7 强化文本协议引导
+- `src/anthropic/types.rs` — `Thinking.display` 字段
+- `src/anthropic/prompt_filter.rs` — 系统提示词长度/前缀剥离
+- `src/anthropic/prompt_presets.rs` + `src/anthropic/presets/*.md` — 预设系统
+- `src/admin/{router,handlers,service,types}.rs` — 系统提示词 Admin API
+- `admin-ui/src/components/system-prompt-dialog.tsx` + `hooks/use-system-prompt.ts` — 前端管理 UI
+- `src/model/{config,mod,runtime}.rs` — 运行时配置热更新支撑
 
 ---
 

@@ -6,6 +6,8 @@ use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::model::config::SystemPromptPosition;
+use crate::model::runtime::SharedPromptConfig;
 use crate::token;
 use axum::{
     Json as JsonExtractor,
@@ -205,7 +207,7 @@ pub async fn post_messages(
         "Received POST /v1/messages request"
     );
     // 注入自定义系统提示词
-    inject_system_prompt(&mut payload, &state.system_prompt, state.strip_system_restrictions);
+    inject_system_prompt(&mut payload, &state.prompt_config);
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -643,10 +645,21 @@ async fn handle_non_stream_request(
 
 /// 注入自定义系统提示词 & 剥离限制
 ///
-/// 1. 如果 strip_restrictions 为 true，移除已知的限制性内容
-/// 2. 将配置中的 systemPrompt 内容注入到请求的 system 字段最前面
-fn inject_system_prompt(payload: &mut MessagesRequest, system_prompt: &Option<String>, strip_restrictions: bool) {
-    // 先剥离限制
+/// 两个独立动作：
+/// 1. 若 `strip_system_restrictions` 为 true，先剥离客户端 system prompt 中的限制片段
+/// 2. 若总开关 `enabled`，调 `build_injection_text` 拼接 preset + custom，按 `position` 插入
+fn inject_system_prompt(payload: &mut MessagesRequest, shared: &SharedPromptConfig) {
+    // 取一次快照，立即释放读锁
+    let (injection, position, strip_restrictions) = {
+        let cfg = shared.read();
+        (
+            cfg.build_injection_text(),
+            cfg.position,
+            cfg.strip_system_restrictions,
+        )
+    };
+
+    // 1. 剥离限制
     if strip_restrictions {
         if let Some(ref mut system) = payload.system {
             for msg in system.iter_mut() {
@@ -663,41 +676,70 @@ fn inject_system_prompt(payload: &mut MessagesRequest, system_prompt: &Option<St
         }
     }
 
-    // 再注入自定义 prompt
-    let Some(prompt) = system_prompt else {
+    // 2. 注入
+    let Some(text) = injection else {
         return;
     };
-    if prompt.is_empty() {
-        return;
-    }
-
-    let injected = SystemMessage {
-        text: prompt.clone(),
-    };
+    let injected = SystemMessage { text };
 
     match &mut payload.system {
-        Some(existing) => {
-            existing.insert(0, injected);
-        }
+        Some(existing) => match position {
+            SystemPromptPosition::Prepend => existing.insert(0, injected),
+            SystemPromptPosition::Append => existing.push(injected),
+        },
         None => {
             payload.system = Some(vec![injected]);
         }
     }
 }
 
-/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+/// 模型名 / Thinking 配置规范化
 ///
-/// - Opus 4.6/4.7：覆写为 adaptive 类型
-/// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
+/// 处理两类情况：
+///
+/// 1. **Opus 4.7 thinking 兼容性修正**（无论 model 名是否带 "thinking" 后缀）：
+///    Opus 4.7 在 Kiro/Bedrock 上**不支持** `thinking.type = "enabled"`，
+///    必须使用 `"adaptive"`（参考: AWS Bedrock Opus 4.7 文档）。
+///    如果客户端传了 `enabled`，自动降级为 `adaptive` 并补一个默认 `effort`。
+///
+/// 2. **`*-thinking` 后缀 → 强制启用 thinking**（原行为）：
+///    - Opus 4.6/4.7 → `adaptive`（带 `effort: high`）
+///    - 其他模型 → `enabled`，budget_tokens=20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
-    if !model_lower.contains("thinking") {
-        return;
+    let is_opus = model_lower.contains("opus");
+    let is_opus_4_7 = is_opus && (model_lower.contains("4-7") || model_lower.contains("4.7"));
+    let is_opus_4_6 = is_opus && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6_or_newer = is_opus_4_6 || is_opus_4_7;
+    let has_thinking_suffix = model_lower.contains("thinking");
+
+    // Case 1: Opus 4.7 强制 adaptive — 不论是否带 thinking 后缀
+    if is_opus_4_7 {
+        if let Some(ref mut t) = payload.thinking {
+            if t.thinking_type == "enabled" {
+                tracing::info!(
+                    model = %payload.model,
+                    "Opus 4.7 不支持 thinking.type=\"enabled\"，自动降级为 \"adaptive\""
+                );
+                t.thinking_type = "adaptive".to_string();
+            }
+            // 4.7 上游默认 display=omitted，强制设 summarized 让 Kiro 吐 thinking 文本
+            if t.display.is_none() {
+                t.display = Some("summarized".to_string());
+            }
+            // adaptive 需要 output_config.effort，缺省补 "high"
+            if payload.output_config.is_none() {
+                payload.output_config = Some(OutputConfig {
+                    effort: "high".to_string(),
+                });
+            }
+        }
     }
 
-    let is_opus_4_6_or_newer =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6") || model_lower.contains("4-7") || model_lower.contains("4.7"));
+    // Case 2: model 名带 "*-thinking" 后缀 → 强制开启 thinking
+    if !has_thinking_suffix {
+        return;
+    }
 
     let thinking_type = if is_opus_4_6_or_newer {
         "adaptive"
@@ -714,6 +756,12 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
+        // adaptive 模式（4.6/4.7）默认 summarized 让 Kiro 吐 thinking 文本
+        display: if thinking_type == "adaptive" {
+            Some("summarized".to_string())
+        } else {
+            None
+        },
     });
 
     if is_opus_4_6_or_newer {
@@ -765,7 +813,7 @@ pub async fn post_messages_cc(
     );
 
     // 注入自定义系统提示词
-    inject_system_prompt(&mut payload, &state.system_prompt, state.strip_system_restrictions);
+    inject_system_prompt(&mut payload, &state.prompt_config);
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
