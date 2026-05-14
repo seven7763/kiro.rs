@@ -33,6 +33,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # admin-ui dist 是 #[derive(RustEmbed)] 必须存在的目录，
+      # 否则 Rust 编译期就会报 "folder 'admin-ui/dist' does not exist"
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install admin-ui dependencies
+        working-directory: admin-ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build admin-ui
+        working-directory: admin-ui
+        run: pnpm build
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -54,6 +74,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # admin-ui dist 必须先 build（#[derive(RustEmbed)] 编译期需要）
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install admin-ui dependencies
+        working-directory: admin-ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build admin-ui
+        working-directory: admin-ui
+        run: pnpm build
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -72,6 +111,7 @@ jobs:
     name: cargo fmt (informational)
     runs-on: ubuntu-22.04
     # 多文件不符 rustfmt 历史欠债，逐步清理；不阻塞 push
+    # 注意：cargo fmt --check 不需要 admin-ui dist（仅检查 .rs 源码格式）
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
