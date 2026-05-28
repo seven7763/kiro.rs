@@ -12,6 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
+import { Settings2, Snowflake, Timer } from 'lucide-react'
 import { useRetryConfig, useUpdateRetryConfig } from '@/hooks/use-metrics'
 import { extractErrorMessage } from '@/lib/utils'
 
@@ -128,105 +129,94 @@ export function RuntimeConfigDialog({ open, onOpenChange }: RuntimeConfigDialogP
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-lg max-h-[88vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>运行时 Retry / Cooldown 配置</DialogTitle>
+          <DialogTitle className="flex items-center gap-2">
+            <Settings2 className="h-5 w-5 text-primary" />
+            运行时 Retry / Cooldown 配置
+          </DialogTitle>
           <DialogDescription>
-            修改即时生效，无需重启。空白值表示沿用代码内置默认（429: 60s, 5xx: 10s, OVERAGE: 600s）。
+            修改即时生效，无需重启，并写回 config.json。留空表示沿用内置默认。
           </DialogDescription>
         </DialogHeader>
 
         {isLoading ? (
-          <div className="py-8 text-center text-muted-foreground">加载中…</div>
+          <div className="py-12 text-center text-sm text-muted-foreground">加载中…</div>
         ) : (
-          <div className="space-y-4 py-2">
-            <div className="space-y-2">
-              <Label htmlFor="rl-sec">429 限流 cooldown（秒）</Label>
-              <Input
-                id="rl-sec"
-                type="number"
+          <div className="space-y-4 py-1">
+            {/* 冷却时长分区 */}
+            <section className="rounded-xl border bg-muted/30 p-4 space-y-4">
+              <div className="flex items-center gap-2 text-sm font-medium">
+                <Snowflake className="h-4 w-4 text-blue-500" />
+                各类错误冷却时长
+              </div>
+
+              <Field
+                label="429 限流 cooldown"
+                hint="被 429 后该号短期不再被选中，±20% jitter 自动错峰恢复"
+                defaultLabel="默认 120s"
+                unit="秒"
                 min={1}
                 max={600}
-                placeholder="60（默认）"
                 value={rateLimitSec}
-                onChange={(e) => setRateLimitSec(e.target.value)}
+                onChange={setRateLimitSec}
               />
-              <p className="text-xs text-muted-foreground">
-                被 429 后该号短期不再被选中。±20% jitter 自动错峰恢复。
-              </p>
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="ue-sec">408/5xx cooldown（秒）</Label>
-              <Input
-                id="ue-sec"
-                type="number"
+              <Field
+                label="408 / 5xx cooldown"
+                hint="上游服务端错误的冷却时长，通常远短于 429"
+                defaultLabel="默认 30s"
+                unit="秒"
                 min={1}
                 max={600}
-                placeholder="10（默认）"
                 value={upstreamErrorSec}
-                onChange={(e) => setUpstreamErrorSec(e.target.value)}
+                onChange={setUpstreamErrorSec}
               />
-              <p className="text-xs text-muted-foreground">
-                上游 408/5xx 错误的冷却时长，通常远短于 429。
-              </p>
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="ov-sec">402 OVERAGE cooldown（秒）</Label>
-              <Input
-                id="ov-sec"
-                type="number"
+              <Field
+                label="402 OVERAGE cooldown"
+                hint="开启 overage 付费后的短窗口速率上限。受限号进冷却但不被禁用，等待窗口刷新"
+                defaultLabel="默认 600s（10 分钟）"
+                unit="秒"
                 min={1}
                 max={7200}
-                placeholder="600（默认 10 分钟）"
                 value={overageSec}
-                onChange={(e) => setOverageSec(e.target.value)}
+                onChange={setOverageSec}
               />
-              <p className="text-xs text-muted-foreground">
-                开启 overage 付费后的短窗口（小时/天）速率上限。范围 [1, 7200]。受限号进冷却不被禁用，等待窗口刷新。
-              </p>
-            </div>
+            </section>
 
-            <div className="rounded-lg border p-3 space-y-3">
-              <div className="text-sm font-medium">全员 cooldown 智能等待</div>
+            {/* 智能等待分区 */}
+            <section className="rounded-xl border bg-muted/30 p-4 space-y-4">
+              <div className="flex items-center gap-2 text-sm font-medium">
+                <Timer className="h-4 w-4 text-amber-500" />
+                全员 cooldown 智能等待
+              </div>
               <p className="text-xs text-muted-foreground -mt-2">
-                上游全部限流时让请求等到号恢复再返回，号池对客户端透明（不主动 502）。
+                上游全部限流时让请求等到号恢复再返回，对客户端透明（不主动 502）。
               </p>
-              <div className="space-y-2">
-                <Label htmlFor="mw-sec">单轮等待上限（秒）</Label>
-                <Input
-                  id="mw-sec"
-                  type="number"
-                  min={3}
-                  max={120}
-                  placeholder="30（默认）"
-                  value={maxWaitSec}
-                  onChange={(e) => setMaxWaitSec(e.target.value)}
-                />
-                <p className="text-xs text-muted-foreground">
-                  范围 [3, 120]。单次等待最多这么长；超过则走 fallback 借号。
-                </p>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="mw-attempts">最大等待轮数</Label>
-                <Input
-                  id="mw-attempts"
-                  type="number"
-                  min={1}
-                  max={10}
-                  placeholder="3（默认）"
-                  value={maxWaitAttempts}
-                  onChange={(e) => setMaxWaitAttempts(e.target.value)}
-                />
-                <p className="text-xs text-muted-foreground">
-                  范围 [1, 10]。同一次请求最多等这么多轮（每轮最长"单轮上限"）。
-                </p>
-              </div>
-            </div>
+              <Field
+                label="单轮等待上限"
+                hint="单次等待最多这么长；超过则走 fallback 借号"
+                defaultLabel="默认 30s · 范围 [3,120]"
+                unit="秒"
+                min={3}
+                max={120}
+                value={maxWaitSec}
+                onChange={setMaxWaitSec}
+              />
+              <Field
+                label="最大等待轮数"
+                hint="同一次请求最多等这么多轮（每轮最长「单轮上限」）"
+                defaultLabel="默认 3 · 范围 [1,10]"
+                unit="轮"
+                min={1}
+                max={10}
+                value={maxWaitAttempts}
+                onChange={setMaxWaitAttempts}
+              />
+            </section>
 
-            <div className="flex items-center justify-between rounded-lg border p-3">
-              <div className="space-y-0.5">
+            {/* 总开关 */}
+            <div className="flex items-center justify-between rounded-xl border p-4">
+              <div className="space-y-0.5 pr-4">
                 <Label htmlFor="cd-enabled" className="text-sm font-medium">
                   启用瞬态 Cooldown 机制
                 </Label>
@@ -244,10 +234,50 @@ export function RuntimeConfigDialog({ open, onOpenChange }: RuntimeConfigDialogP
             取消
           </Button>
           <Button onClick={handleSave} disabled={isPending || isLoading}>
-            {isPending ? '保存中…' : '保存'}
+            {isPending ? '保存中…' : '保存并生效'}
           </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+interface FieldProps {
+  label: string
+  hint: string
+  defaultLabel: string
+  unit: string
+  min: number
+  max: number
+  value: string
+  onChange: (v: string) => void
+}
+
+/** 统一的数值配置行：标签 + 默认值徽章 + 输入框 + 说明 */
+function Field({ label, hint, defaultLabel, unit, min, max, value, onChange }: FieldProps) {
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between">
+        <Label className="text-sm">{label}</Label>
+        <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
+          {defaultLabel}
+        </span>
+      </div>
+      <div className="relative">
+        <Input
+          type="number"
+          min={min}
+          max={max}
+          placeholder="留空 = 默认"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="pr-10"
+        />
+        <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">
+          {unit}
+        </span>
+      </div>
+      <p className="text-xs text-muted-foreground leading-relaxed">{hint}</p>
+    </div>
   )
 }

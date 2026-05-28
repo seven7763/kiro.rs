@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Sparkles, Settings2, Database } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Sparkles, Settings2, Database, Scale } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -20,6 +20,14 @@ import { MetricsDetail } from '@/components/metrics-detail'
 import { PromptCacheDialog } from '@/components/prompt-cache-dialog'
 import { RuntimeConfigDialog } from '@/components/runtime-config-dialog'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+} from '@/components/ui/dropdown-menu'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { useSystemPrompt } from '@/hooks/use-system-prompt'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
@@ -567,42 +575,63 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </a>
           </div>
           <div className="flex items-center gap-2">
+            {/* 负载均衡模式切换 */}
             <Button
               variant="outline"
               size="sm"
               onClick={handleToggleLoadBalancing}
               disabled={isLoadingMode || isSettingMode}
               title="切换负载均衡模式"
+              className="gap-1.5"
             >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
+              <Scale className="h-3.5 w-3.5" />
+              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级' : '均衡负载')}
             </Button>
+
+            {/* 系统提示词状态按钮 */}
             <SystemPromptButton
               data={systemPromptData}
               onClick={() => setSystemPromptDialogOpen(true)}
             />
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => setPromptCacheDialogOpen(true)}
-              title="Prompt Cache 配置 + 命中率监控"
-            >
-              <Database className="h-5 w-5" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => setRuntimeConfigDialogOpen(true)}
-              title="运行时 Retry / Cooldown 配置"
-            >
-              <Settings2 className="h-5 w-5" />
-            </Button>
-            <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
+
+            {/* 设置下拉菜单：聚合运行时配置入口 */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon" title="设置">
+                  <Settings2 className="h-5 w-5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuLabel>运行时配置</DropdownMenuLabel>
+                <DropdownMenuItem onSelect={() => setPromptCacheDialogOpen(true)}>
+                  <Database className="h-4 w-4" />
+                  Prompt Cache
+                  <span className="ml-auto text-xs text-muted-foreground">命中率监控</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => setRuntimeConfigDialogOpen(true)}>
+                  <Settings2 className="h-4 w-4" />
+                  Retry / Cooldown
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => setSystemPromptDialogOpen(true)}>
+                  <Sparkles className="h-4 w-4" />
+                  系统提示词
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onSelect={handleRefresh}>
+                  <RefreshCw className="h-4 w-4" />
+                  刷新数据
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            {/* 常用：主题 / 刷新 / 登出 */}
+            <Button variant="ghost" size="icon" onClick={toggleDarkMode} title={darkMode ? '浅色' : '深色'}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleRefresh}>
+            <Button variant="ghost" size="icon" onClick={handleRefresh} title="刷新">
               <RefreshCw className="h-5 w-5" />
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleLogout}>
+            <Button variant="ghost" size="icon" onClick={handleLogout} title="退出登录">
               <LogOut className="h-5 w-5" />
             </Button>
           </div>
