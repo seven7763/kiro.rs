@@ -7,10 +7,12 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, add_user_preset, delete_credential, delete_user_preset, force_refresh_token,
-        get_all_credentials, get_credential_balance, get_load_balancing_mode, get_preset_content,
-        get_system_prompt, list_presets, reset_failure_count, set_credential_disabled,
-        set_credential_priority, set_load_balancing_mode, update_system_prompt, update_user_preset,
+        add_credential, add_user_preset, clear_prompt_cache, delete_credential, delete_user_preset,
+        force_refresh_token, get_all_credentials, get_credential_balance, get_load_balancing_mode,
+        get_metrics, get_metrics_prometheus, get_preset_content, get_prompt_cache_config,
+        get_retry_config, get_system_prompt, list_presets, reset_failure_count,
+        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        update_prompt_cache_config, update_retry_config, update_system_prompt, update_user_preset,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -35,6 +37,20 @@ use super::{
 /// - `Authorization: Bearer <token>` header
 pub fn create_admin_router(state: AdminState) -> Router {
     Router::new()
+        .route("/metrics", get(get_metrics))
+        .route("/metrics/prometheus", get(get_metrics_prometheus))
+        .route(
+            "/runtime/retry-config",
+            get(get_retry_config).put(update_retry_config),
+        )
+        .route(
+            "/runtime/prompt-cache-config",
+            get(get_prompt_cache_config).put(update_prompt_cache_config),
+        )
+        .route(
+            "/runtime/prompt-cache-config/clear",
+            post(clear_prompt_cache),
+        )
         .route(
             "/credentials",
             get(get_all_credentials).post(add_credential),
@@ -58,10 +74,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/system-prompt/presets/{id}",
             get(get_preset_content),
         )
-        .route(
-            "/config/system-prompt/user-presets",
-            post(add_user_preset),
-        )
+        .route("/config/system-prompt/user-presets", post(add_user_preset))
         .route(
             "/config/system-prompt/user-presets/{id}",
             axum::routing::put(update_user_preset).delete(delete_user_preset),

@@ -8,17 +8,21 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::anthropic::prompt_cache::PromptCache;
+use crate::kiro::metrics::MetricsRecorder;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::{Config, UserPreset};
-use crate::model::runtime::SharedPromptConfig;
+use crate::model::runtime::{SharedPromptConfig, SharedRetryConfig};
 
 use super::error::AdminServiceError;
+use super::metrics::{AdminMetricsResponse, PromptCacheStats, compute_admin_metrics};
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CreateUserPresetRequest,
     CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
-    PresetCatalogResponse, PresetContentResponse, PresetMetaResponse, SetLoadBalancingModeRequest,
-    SystemPromptConfigResponse, UpdateSystemPromptRequest, UpdateUserPresetRequest,
+    PresetCatalogResponse, PresetContentResponse, PresetMetaResponse, PromptCacheConfigPayload,
+    RetryConfigPayload, SetLoadBalancingModeRequest, SystemPromptConfigResponse,
+    UpdateSystemPromptRequest, UpdateUserPresetRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -46,6 +50,12 @@ pub struct AdminService {
     prompt_config: SharedPromptConfig,
     /// 可写 Config 句柄（用于把 prompt 等运行时变更持久化回 config.json）
     config_writer: Arc<Mutex<Config>>,
+    /// 进程级请求指标记录器（与 KiroProvider 共享同一实例）
+    metrics: Arc<MetricsRecorder>,
+    /// 运行时 retry 配置（与 token_manager 共享同一实例）
+    retry_config: SharedRetryConfig,
+    /// Prompt prefix 缓存（与 Anthropic handler 共享同一实例）
+    prompt_cache: PromptCache,
 }
 
 impl AdminService {
@@ -54,6 +64,9 @@ impl AdminService {
         known_endpoints: impl IntoIterator<Item = String>,
         prompt_config: SharedPromptConfig,
         config_writer: Arc<Mutex<Config>>,
+        metrics: Arc<MetricsRecorder>,
+        retry_config: SharedRetryConfig,
+        prompt_cache: PromptCache,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -68,7 +81,204 @@ impl AdminService {
             known_endpoints: known_endpoints.into_iter().collect(),
             prompt_config,
             config_writer,
+            metrics,
+            retry_config,
+            prompt_cache,
         }
+    }
+
+    /// 取 prompt cache 当前配置（含运行时统计）
+    pub fn get_prompt_cache_config(&self) -> PromptCacheConfigPayload {
+        let snap = self.prompt_cache.snapshot();
+        PromptCacheConfigPayload {
+            enabled: self.prompt_cache.is_enabled(),
+            capacity: snap.capacity,
+            ttl_secs: snap.ttl_secs,
+            entries: Some(snap.entries),
+            hit_total: Some(snap.hit_total),
+            miss_total: Some(snap.miss_total),
+            eviction_total: Some(snap.eviction_total),
+            hit_rate_1m: Some(snap.last1m.hit_rate()),
+            hit_rate_5m: Some(snap.last5m.hit_rate()),
+            saved_input_tokens_5m: Some(snap.last5m.saved_input_tokens),
+        }
+    }
+
+    /// 更新 prompt cache 配置（运行时即时生效 + 持久化回 config.json）
+    pub fn update_prompt_cache_config(
+        &self,
+        req: PromptCacheConfigPayload,
+    ) -> Result<PromptCacheConfigPayload, AdminServiceError> {
+        if !(1..=65536).contains(&req.capacity) {
+            return Err(AdminServiceError::InvalidCredential(
+                "promptCacheCapacity 必须在 [1, 65536] 范围内".to_string(),
+            ));
+        }
+        if !(10..=86400).contains(&req.ttl_secs) {
+            return Err(AdminServiceError::InvalidCredential(
+                "promptCacheTtlSecs 必须在 [10, 86400] 秒范围内".to_string(),
+            ));
+        }
+
+        // 1. 即时生效
+        self.prompt_cache.set_enabled(req.enabled);
+        self.prompt_cache.set_capacity(req.capacity);
+        self.prompt_cache
+            .set_ttl(std::time::Duration::from_secs(req.ttl_secs));
+
+        // 2. 持久化
+        {
+            let mut writer = self.config_writer.lock();
+            writer.prompt_cache_enabled = Some(req.enabled);
+            writer.prompt_cache_capacity = Some(req.capacity);
+            writer.prompt_cache_ttl_secs = Some(req.ttl_secs);
+            if writer.config_path().is_some() {
+                if let Err(e) = writer.save() {
+                    tracing::warn!("prompt cache 配置已生效但写回 config.json 失败: {}", e);
+                    return Err(AdminServiceError::InternalError(format!(
+                        "运行时已更新，但持久化失败: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        Ok(self.get_prompt_cache_config())
+    }
+
+    /// 清空 prompt cache（admin 调试用）
+    pub fn clear_prompt_cache(&self) {
+        self.prompt_cache.clear();
+    }
+
+    /// 计算并返回当前 Admin metrics 聚合视图
+    pub fn get_metrics(&self) -> AdminMetricsResponse {
+        let mut resp = compute_admin_metrics(&self.metrics, &self.token_manager);
+        let snap = self.prompt_cache.snapshot();
+        resp.prompt_cache = Some(PromptCacheStats {
+            enabled: self.prompt_cache.is_enabled(),
+            entries: snap.entries as u64,
+            capacity: snap.capacity as u64,
+            ttl_secs: snap.ttl_secs,
+            hit_total: snap.hit_total,
+            miss_total: snap.miss_total,
+            eviction_total: snap.eviction_total,
+            hit_rate_1m: snap.last1m.hit_rate(),
+            hit_rate_5m: snap.last5m.hit_rate(),
+            saved_input_tokens_5m: snap.last5m.saved_input_tokens,
+        });
+        resp
+    }
+
+    /// 返回 Prometheus / OpenMetrics 文本格式的指标快照
+    ///
+    /// 输出已转义并按 alphabetical 顺序，便于 Prometheus parser 一次性 ingest。
+    /// 关键 family：
+    /// - `kiro_uptime_seconds`
+    /// - `kiro_credentials_*`（active / cooling / disabled / total / cumulative counters）
+    /// - `kiro_requests_total{window="1m|5m|1h", outcome="success|transient|error"}`
+    /// - `kiro_latency_milliseconds{window=...,quantile="0.5|0.95|0.99"}`
+    /// - `kiro_cooldown_*{window=...}`
+    /// - `kiro_prompt_cache_*`
+    /// - `kiro_requests_by_model_total{model="..."}` (1h 窗口)
+    /// - `kiro_requests_by_credential_total{credential_id="..."}` (1h 窗口)
+    pub fn get_metrics_prometheus(&self) -> String {
+        let resp = self.get_metrics();
+        crate::admin::metrics::render_prometheus(&resp)
+    }
+
+    /// 读取当前生效的 retry 配置
+    pub fn get_retry_config(&self) -> RetryConfigPayload {
+        let cfg = self.retry_config.read();
+        RetryConfigPayload {
+            rate_limit_cooldown_sec: cfg.rate_limit_cooldown_sec,
+            upstream_error_cooldown_sec: cfg.upstream_error_cooldown_sec,
+            overage_request_cooldown_sec: cfg.overage_request_cooldown_sec,
+            transient_cooldown_enabled: cfg.transient_cooldown_enabled,
+            max_fallback_wait_secs: cfg.max_fallback_wait_secs,
+            max_fallback_wait_attempts: cfg.max_fallback_wait_attempts,
+        }
+    }
+
+    /// 更新 retry 配置（运行时即时生效 + 写回 config.json）
+    ///
+    /// 校验：
+    /// - `rateLimitCooldownSec` / `upstreamErrorCooldownSec` ∈ [1, 600] 秒
+    /// - `overageRequestCooldownSec` ∈ [1, 7200] 秒（OVERAGE 窗口最长 2 小时）
+    /// - `maxFallbackWaitSecs` ∈ [3, 120] 秒
+    /// - `maxFallbackWaitAttempts` ∈ [1, 10]
+    pub fn update_retry_config(
+        &self,
+        req: RetryConfigPayload,
+    ) -> Result<RetryConfigPayload, AdminServiceError> {
+        if let Some(secs) = req.rate_limit_cooldown_sec {
+            if secs == 0 || secs > 600 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "rateLimitCooldownSec 必须在 [1, 600] 秒范围内".to_string(),
+                ));
+            }
+        }
+        if let Some(secs) = req.upstream_error_cooldown_sec {
+            if secs == 0 || secs > 600 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "upstreamErrorCooldownSec 必须在 [1, 600] 秒范围内".to_string(),
+                ));
+            }
+        }
+        if let Some(secs) = req.overage_request_cooldown_sec {
+            if secs == 0 || secs > 7200 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "overageRequestCooldownSec 必须在 [1, 7200] 秒范围内".to_string(),
+                ));
+            }
+        }
+        if let Some(secs) = req.max_fallback_wait_secs {
+            if !(3..=120).contains(&secs) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "maxFallbackWaitSecs 必须在 [3, 120] 秒范围内".to_string(),
+                ));
+            }
+        }
+        if let Some(n) = req.max_fallback_wait_attempts {
+            if !(1..=10).contains(&n) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "maxFallbackWaitAttempts 必须在 [1, 10] 范围内".to_string(),
+                ));
+            }
+        }
+
+        // 1. 即时生效：写共享 RwLock
+        {
+            let mut w = self.retry_config.write();
+            w.rate_limit_cooldown_sec = req.rate_limit_cooldown_sec;
+            w.upstream_error_cooldown_sec = req.upstream_error_cooldown_sec;
+            w.overage_request_cooldown_sec = req.overage_request_cooldown_sec;
+            w.transient_cooldown_enabled = req.transient_cooldown_enabled;
+            w.max_fallback_wait_secs = req.max_fallback_wait_secs;
+            w.max_fallback_wait_attempts = req.max_fallback_wait_attempts;
+        }
+
+        // 2. 持久化回 config.json
+        {
+            let mut writer = self.config_writer.lock();
+            writer.rate_limit_cooldown_sec = req.rate_limit_cooldown_sec;
+            writer.upstream_error_cooldown_sec = req.upstream_error_cooldown_sec;
+            writer.overage_request_cooldown_sec = req.overage_request_cooldown_sec;
+            writer.transient_cooldown_enabled = req.transient_cooldown_enabled;
+            writer.max_fallback_wait_secs = req.max_fallback_wait_secs;
+            writer.max_fallback_wait_attempts = req.max_fallback_wait_attempts;
+            if writer.config_path().is_some() {
+                if let Err(e) = writer.save() {
+                    tracing::warn!("retry 配置已生效但写回 config.json 失败: {}", e);
+                    return Err(AdminServiceError::InternalError(format!(
+                        "运行时已更新，但持久化失败: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        Ok(self.get_retry_config())
     }
 
     /// 获取所有凭据状态
@@ -99,6 +309,10 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                transient_failure_count: entry.transient_failure_count,
+                last_transient_failure_at: entry.last_transient_failure_at,
+                cooldown_remaining_seconds: entry.cooldown_remaining_seconds,
+                cooldown_reason: entry.cooldown_reason,
             })
             .collect();
 
@@ -362,7 +576,11 @@ impl AdminService {
                 cfg.enabled_presets = presets;
             }
             if let Some(content) = req.content {
-                cfg.custom_content = if content.is_empty() { None } else { Some(content) };
+                cfg.custom_content = if content.is_empty() {
+                    None
+                } else {
+                    Some(content)
+                };
             }
             if let Some(position) = req.position {
                 cfg.position = position;
@@ -436,7 +654,9 @@ impl AdminService {
             return Err(AdminServiceError::InvalidCredential("name 不能为空".into()));
         }
         if req.content.trim().is_empty() {
-            return Err(AdminServiceError::InvalidCredential("content 不能为空".into()));
+            return Err(AdminServiceError::InvalidCredential(
+                "content 不能为空".into(),
+            ));
         }
 
         // 不能与内置或现有 user preset id 冲突
@@ -705,7 +925,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
@@ -760,7 +981,12 @@ mod tests {
     #[test]
     fn validate_id_accepts_valid() {
         for id in [
-            "a", "abc", "my_preset", "v2-config", "123", "a_1-b_2",
+            "a",
+            "abc",
+            "my_preset",
+            "v2-config",
+            "123",
+            "a_1-b_2",
             "x".repeat(32).as_str(),
         ] {
             assert!(
@@ -775,11 +1001,7 @@ mod tests {
     #[test]
     fn validate_id_rejects_uppercase() {
         for id in ["Foo", "BAR", "myPreset", "MY_CONFIG"] {
-            assert!(
-                validate_user_preset_id(id).is_err(),
-                "应拒绝大写: {:?}",
-                id
-            );
+            assert!(validate_user_preset_id(id).is_err(), "应拒绝大写: {:?}", id);
         }
     }
 
@@ -816,11 +1038,11 @@ mod tests {
             "../../etc/passwd",
             "foo/bar",
             "foo\\bar",
-            "foo bar",  // 空格
-            "foo.bar",  // 点
-            "foo:bar",  // 冒号
-            "foo\0bar", // null byte
-            "foo\nbar", // 换行
+            "foo bar",    // 空格
+            "foo.bar",    // 点
+            "foo:bar",    // 冒号
+            "foo\0bar",   // null byte
+            "foo\nbar",   // 换行
             "中文preset", // 非 ASCII
         ] {
             assert!(

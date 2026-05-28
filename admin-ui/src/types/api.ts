@@ -1,3 +1,160 @@
+// ===== Admin Metrics =====
+
+export interface WindowRequestCounts {
+  total: number
+  success: number
+  transientFail: number
+  error: number
+  /** 成功率百分比 0~100；total=0 时为 null */
+  successRate: number | null
+  /** 客户端最终看到错误的请求数（新增于 v2026.3.x） */
+  clientVisibleErrors?: number
+  /** 流式中断次数（新增于 v2026.3.x） */
+  streamAborts?: number
+  /** 流式中断后救活次数（新增于 v2026.3.x） */
+  streamRecovers?: number
+  inputTokensTotal?: number
+  outputTokensTotal?: number
+  cacheReadTokensTotal?: number
+}
+
+export interface WindowLatency {
+  samples: number
+  p50Ms: number
+  p95Ms: number
+  p99Ms: number
+  /** 流式首字节延迟分位（新增于 v2026.3.x） */
+  ttfbP50Ms?: number
+  ttfbP95Ms?: number
+  ttfbP99Ms?: number
+  ttfbSamples?: number
+}
+
+/** 时间序列单点（1 分钟桶），新增于 v2026.3.x */
+export interface TimeSeriesPoint {
+  /** 桶相对 now 的秒偏移（负值，越小越旧） */
+  tsOffsetSecs: number
+  requestCount: number
+  successCount: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  p50Ms: number
+  ttfbP50Ms: number
+  fallbackProxyCount: number
+}
+
+/** 按 model / credential 维度切片的窗口统计 */
+export interface DimensionBreakdown {
+  /** 维度 key（model 名 / credential id 字符串） */
+  key: string
+  count: number
+  success: number
+  transientFail: number
+  error: number
+  successRate: number | null
+  p50Ms: number
+  p95Ms: number
+  p99Ms: number
+}
+
+export interface AdminMetricsResponse {
+  uptimeSeconds: number
+  credentials: {
+    total: number
+    active: number
+    cooling: number
+    disabled: number
+    successCountTotal: number
+    transientFailureCountTotal: number
+    failureCountTotal: number
+  }
+  requests: {
+    last1m: WindowRequestCounts
+    last5m: WindowRequestCounts
+    /** 1 小时窗口（新增于 v2026.3.x） */
+    last1h?: WindowRequestCounts
+    allBuffer: WindowRequestCounts
+  }
+  latency: {
+    last1m: WindowLatency
+    last5m: WindowLatency
+    /** 1 小时窗口（新增于 v2026.3.x） */
+    last1h?: WindowLatency
+    allBuffer: WindowLatency
+  }
+  cooldown: {
+    currentlyCooling: number
+    fallbackUsed1m: number
+    waitedForCooldown1m: number
+    fallbackUsed5m: number
+    waitedForCooldown5m: number
+    /** 1 小时窗口 fallback 触发数（新增于 v2026.3.x） */
+    fallbackUsed1h?: number
+    waitedForCooldown1h?: number
+    /** tier 化代理 fallback 触发数（新增于 v2026.3.x） */
+    fallbackProxyUsed1m?: number
+    fallbackProxyUsed5m?: number
+    fallbackProxyUsed1h?: number
+  }
+  bufferSize: number
+  /** 中转层 prompt prefix cache 行为统计（旧版本可能缺失） */
+  promptCache?: {
+    enabled: boolean
+    entries: number
+    capacity: number
+    ttlSecs: number
+    hitTotal: number
+    missTotal: number
+    evictionTotal: number
+    hitRate1m: number
+    hitRate5m: number
+    savedInputTokens5m: number
+  }
+  /** 1 小时窗口按 model 切片（新增于 v2026.3.x，旧版本可能缺失） */
+  byModel1h?: DimensionBreakdown[]
+  /** 1 小时窗口按 credential id 切片（新增于 v2026.3.x，旧版本可能缺失） */
+  byCredential1h?: DimensionBreakdown[]
+  /** 过去 60 分钟时间序列（固定 60 点，新增于 v2026.3.x，旧版本可能缺失） */
+  timeSeries60m?: TimeSeriesPoint[]
+}
+
+// ===== Prompt Cache 运行时配置 =====
+
+export interface PromptCacheConfigPayload {
+  enabled: boolean
+  /** LRU 容量（条目数上限），范围 [1, 65536] */
+  capacity: number
+  /** 单条 entry TTL（秒），范围 [10, 86400]，默认 300（5min） */
+  ttlSecs: number
+  /** 当前 cache 中条目数（只读） */
+  entries?: number
+  hitTotal?: number
+  missTotal?: number
+  evictionTotal?: number
+  /** 1 分钟窗口命中率（百分比，0~100） */
+  hitRate1m?: number
+  hitRate5m?: number
+  savedInputTokens5m?: number
+}
+
+// ===== Retry 运行时配置 =====
+
+export interface RetryConfigPayload {
+  rateLimitCooldownSec?: number | null
+  upstreamErrorCooldownSec?: number | null
+  /**
+   * 402 OVERAGE_REQUEST_LIMIT_EXCEEDED 的 cooldown 秒数（开启 overage 付费后的短窗口速率上限）。
+   * 范围 [1, 7200]，默认 600（10 分钟）。**不**会禁用凭据，仅冷却等待 hour/day 窗口刷新。
+   */
+  overageRequestCooldownSec?: number | null
+  transientCooldownEnabled: boolean
+  /** 全员 cooldown 时智能等待的单轮上限（秒），范围 [3, 120]，默认 30 */
+  maxFallbackWaitSecs?: number | null
+  /** 单次 acquire 内"等待+重选"的最大轮数，范围 [1, 10]，默认 3 */
+  maxFallbackWaitAttempts?: number | null
+}
+
 // 凭据状态响应
 export interface CredentialsStatusResponse {
   total: number
@@ -27,6 +184,14 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  /** 上游瞬态错误（429/408/5xx）累计次数（不参与禁用判定，仅供观测） */
+  transientFailureCount?: number
+  /** 最近一次瞬态错误时间（RFC3339） */
+  lastTransientFailureAt?: string | null
+  /** 当前冷却剩余秒数（0 或缺失表示不在冷却中） */
+  cooldownRemainingSeconds?: number
+  /** 当前冷却原因（"rate_limit" / "timeout" / "upstream_error"，不在冷却时为 undefined） */
+  cooldownReason?: string
 }
 
 // 余额响应

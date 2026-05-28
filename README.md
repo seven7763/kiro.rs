@@ -195,6 +195,20 @@ docker-compose up
 
 需要将 `config.json` 和 `credentials.json` 挂载到容器中，具体参见 `docker-compose.yml`。
 
+### 服务器侧重启（含 sub2api 网络 attach）
+
+如果 `kiro-rs` 容器需要被另一个 `sub2api` 容器通过容器名直连，重启时**必须**用脚本 `tools/redeploy.sh`，否则 docker bridge 网络隔离会导致 `connection refused`：
+
+```bash
+# 仅重启（用现有镜像）
+bash tools/redeploy.sh
+
+# 先 build 再重启
+bash tools/redeploy.sh --build /opt/kiro-rs-src
+```
+
+脚本会自动 `docker network connect sub2api-deploy_sub2api-network kiro-rs`。也可以通过环境变量 `SUB2API_NETWORK` 自定义网络名。
+
 ## 配置详解
 
 ### config.json

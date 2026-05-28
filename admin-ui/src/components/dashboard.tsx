@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Sparkles } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Sparkles, Settings2, Database } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
@@ -13,6 +13,13 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { SystemPromptDialog } from '@/components/system-prompt-dialog'
+import { HealthBanner } from '@/components/health-banner'
+import { MetricsBreakdown } from '@/components/metrics-breakdown'
+import { MetricsTrends } from '@/components/metrics-trends'
+import { MetricsDetail } from '@/components/metrics-detail'
+import { PromptCacheDialog } from '@/components/prompt-cache-dialog'
+import { RuntimeConfigDialog } from '@/components/runtime-config-dialog'
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { useSystemPrompt } from '@/hooks/use-system-prompt'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
@@ -41,6 +48,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const [systemPromptDialogOpen, setSystemPromptDialogOpen] = useState(false)
+  const [runtimeConfigDialogOpen, setRuntimeConfigDialogOpen] = useState(false)
+  const [promptCacheDialogOpen, setPromptCacheDialogOpen] = useState(false)
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -571,6 +580,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
               data={systemPromptData}
               onClick={() => setSystemPromptDialogOpen(true)}
             />
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setPromptCacheDialogOpen(true)}
+              title="Prompt Cache 配置 + 命中率监控"
+            >
+              <Database className="h-5 w-5" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setRuntimeConfigDialogOpen(true)}
+              title="运行时 Retry / Cooldown 配置"
+            >
+              <Settings2 className="h-5 w-5" />
+            </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
@@ -586,45 +611,48 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
-        {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                凭据总数
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{data?.total || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                可用凭据
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                当前活跃
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
-                <Badge variant="success">活跃</Badge>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
+        <Tabs defaultValue="overview">
+          <TabsList>
+            <TabsTrigger value="overview">概览</TabsTrigger>
+            <TabsTrigger value="credentials">
+              凭据管理
+              {data?.credentials.length ? (
+                <Badge variant="secondary" className="ml-2 text-[10px] px-1.5 py-0">
+                  {data.credentials.length}
+                </Badge>
+              ) : null}
+            </TabsTrigger>
+            <TabsTrigger value="metrics">指标明细</TabsTrigger>
+          </TabsList>
 
-        {/* 凭据列表 */}
-        <div className="space-y-4">
+          {/* ===== 概览 Tab：健康面板 + 60min 趋势图 ===== */}
+          <TabsContent value="overview">
+            <HealthBanner />
+            <MetricsTrends />
+          </TabsContent>
+
+          {/* ===== 指标明细 Tab：维度切片 + 扩展字段 ===== */}
+          <TabsContent value="metrics">
+            <MetricsBreakdown />
+            <MetricsDetail />
+          </TabsContent>
+
+          {/* ===== 凭据管理 Tab ===== */}
+          <TabsContent value="credentials">
+            {/* 当前活跃凭据信息 */}
+            <div className="grid gap-4 mb-6">
+              <Card>
+                <CardContent className="pt-4 pb-4 flex items-center justify-between">
+                  <div className="text-sm text-muted-foreground">
+                    当前活跃 #{data?.currentId || '-'}
+                    <Badge variant="success">活跃</Badge>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+
+            {/* 凭据列表 */}
+            <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
               <h2 className="text-xl font-semibold">凭据管理</h2>
@@ -761,7 +789,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
             </>
           )}
-        </div>
+            </div>
+          </TabsContent>
+        </Tabs>
       </main>
 
       {/* 余额对话框 */}
@@ -803,6 +833,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <SystemPromptDialog
         open={systemPromptDialogOpen}
         onOpenChange={setSystemPromptDialogOpen}
+      />
+
+      {/* 运行时 Retry / Cooldown 配置对话框 */}
+      <RuntimeConfigDialog
+        open={runtimeConfigDialogOpen}
+        onOpenChange={setRuntimeConfigDialogOpen}
+      />
+
+      {/* Prompt Cache 配置 + 命中率监控对话框 */}
+      <PromptCacheDialog
+        open={promptCacheDialogOpen}
+        onOpenChange={setPromptCacheDialogOpen}
       />
     </div>
   )

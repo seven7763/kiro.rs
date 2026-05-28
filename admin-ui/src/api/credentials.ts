@@ -1,8 +1,11 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
+  AdminMetricsResponse,
   CredentialsStatusResponse,
   BalanceResponse,
+  PromptCacheConfigPayload,
+  RetryConfigPayload,
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
@@ -168,6 +171,59 @@ export async function updateUserPreset(
 export async function deleteUserPreset(id: string): Promise<SystemPromptConfig> {
   const { data } = await api.delete<SystemPromptConfig>(
     `/config/system-prompt/user-presets/${encodeURIComponent(id)}`
+  )
+  return data
+}
+
+// ============ Admin Metrics ============
+
+// 获取聚合运行时指标
+export async function getMetrics(): Promise<AdminMetricsResponse> {
+  const { data } = await api.get<AdminMetricsResponse>('/metrics')
+  return data
+}
+
+// ============ Retry 运行时配置 ============
+
+// 读取当前 retry 配置
+export async function getRetryConfig(): Promise<RetryConfigPayload> {
+  const { data } = await api.get<RetryConfigPayload>('/runtime/retry-config')
+  return data
+}
+
+// 更新 retry 配置
+export async function updateRetryConfig(
+  req: RetryConfigPayload
+): Promise<RetryConfigPayload> {
+  const { data } = await api.put<RetryConfigPayload>('/runtime/retry-config', req)
+  return data
+}
+
+// ============ Prompt Cache 运行时配置 ============
+
+// 读取当前 prompt cache 配置（含运行时统计）
+export async function getPromptCacheConfig(): Promise<PromptCacheConfigPayload> {
+  const { data } = await api.get<PromptCacheConfigPayload>(
+    '/runtime/prompt-cache-config'
+  )
+  return data
+}
+
+// 更新 prompt cache 配置（即时生效 + 持久化）
+export async function updatePromptCacheConfig(
+  req: PromptCacheConfigPayload
+): Promise<PromptCacheConfigPayload> {
+  const { data } = await api.put<PromptCacheConfigPayload>(
+    '/runtime/prompt-cache-config',
+    req
+  )
+  return data
+}
+
+// 清空 prompt cache 全部条目
+export async function clearPromptCache(): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    '/runtime/prompt-cache-config/clear'
   )
   return data
 }

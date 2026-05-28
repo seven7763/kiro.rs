@@ -2,6 +2,7 @@
 
 pub mod endpoint;
 pub mod machine_id;
+pub mod metrics;
 pub mod model;
 pub mod parser;
 pub mod provider;

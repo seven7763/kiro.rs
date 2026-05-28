@@ -64,6 +64,18 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 上游瞬态错误（429/408/5xx）累计次数（不参与禁用判定，仅供观测）
+    #[serde(default)]
+    pub transient_failure_count: u64,
+    /// 最近一次瞬态错误时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_transient_failure_at: Option<String>,
+    /// 当前冷却剩余秒数（0 表示不在冷却中）
+    #[serde(default)]
+    pub cooldown_remaining_seconds: u64,
+    /// 当前冷却原因（"rate_limit" / "timeout" / "upstream_error"，不在冷却时为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_reason: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -139,6 +151,64 @@ pub struct AddCredentialRequest {
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+}
+
+/// GET/PUT /api/admin/runtime/prompt-cache-config 的请求/响应
+///
+/// 中转层 prompt prefix 缓存的运行时配置 + 监控统计。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptCacheConfigPayload {
+    /// 是否启用
+    pub enabled: bool,
+    /// LRU 容量（条目数上限），范围 [1, 65536]
+    pub capacity: usize,
+    /// 单条 entry TTL（秒），范围 [10, 86400]，默认 300（5min）
+    pub ttl_secs: u64,
+    /// 当前 cache 中条目数（只读，PUT 时忽略）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<usize>,
+    /// 自启动累计命中次数（只读）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hit_total: Option<u64>,
+    /// 自启动累计未命中次数（只读）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub miss_total: Option<u64>,
+    /// 累计淘汰条目数（只读）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eviction_total: Option<u64>,
+    /// 1 分钟窗口命中率（百分比，只读）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hit_rate_1m: Option<f64>,
+    /// 5 分钟窗口命中率（只读）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hit_rate_5m: Option<f64>,
+    /// 5 分钟内累计节省 input tokens（只读）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_input_tokens_5m: Option<i64>,
+}
+
+/// GET/PUT /api/admin/runtime/retry-config 的请求/响应
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryConfigPayload {
+    /// 429 限流默认 cooldown 时长（秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_cooldown_sec: Option<u64>,
+    /// 408/5xx 默认 cooldown 时长（秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_error_cooldown_sec: Option<u64>,
+    /// 402 OVERAGE_REQUEST_LIMIT_EXCEEDED 默认 cooldown 时长（秒），范围 [1, 7200]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overage_request_cooldown_sec: Option<u64>,
+    /// 是否启用瞬态 cooldown 机制
+    pub transient_cooldown_enabled: bool,
+    /// 全员 cooldown 时智能等待的单轮上限（秒），范围 [3, 120]，默认 30
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fallback_wait_secs: Option<u64>,
+    /// 单次 acquire 内"等待+重选"的最大轮数，范围 [1, 10]，默认 3
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fallback_wait_attempts: Option<u32>,
 }
 
 fn default_auth_method() -> String {

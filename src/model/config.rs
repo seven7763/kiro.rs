@@ -4,34 +4,24 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
+    #[default]
     Rustls,
     NativeTls,
-}
-
-impl Default for TlsBackend {
-    fn default() -> Self {
-        Self::Rustls
-    }
 }
 
 /// 自定义系统提示词注入位置
 ///
 /// - `Prepend`：插入到 system 数组最前（旧默认行为）
 /// - `Append`：追加到 system 数组末尾（recency bias 权重最高，推荐用于 override）
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SystemPromptPosition {
     Prepend,
+    #[default]
     Append,
-}
-
-impl Default for SystemPromptPosition {
-    fn default() -> Self {
-        Self::Append
-    }
 }
 
 /// 用户自定义预设（与内置 `PRESETS` 并列，可在 Admin UI 中增删改）
@@ -120,6 +110,100 @@ pub struct Config {
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
+
+    /// 是否启用瞬态错误（429/408/5xx）的 per-credential 短期冷却（默认 true）
+    ///
+    /// 启用后：单个凭据收到 429/5xx 时进入 cooldown，后续 acquire 自动绕过该凭据，
+    /// 避免单请求 9 次 retry 全打到同一个被限号上。设 false 退回旧行为（仅
+    /// release_inflight，不影响选号）。
+    #[serde(default = "default_transient_cooldown_enabled")]
+    pub transient_cooldown_enabled: bool,
+
+    /// 429 限流后的 cooldown 秒数（默认 60，HTTP Retry-After 头优先）
+    #[serde(default)]
+    pub rate_limit_cooldown_sec: Option<u64>,
+
+    /// 408/5xx 上游错误的 cooldown 秒数（默认 10）
+    #[serde(default)]
+    pub upstream_error_cooldown_sec: Option<u64>,
+
+    /// 402 OVERAGE_REQUEST_LIMIT_EXCEEDED 的 cooldown 秒数（默认 600 = 10 分钟）
+    ///
+    /// 已开启 overage 付费但当前 hour/day 速率窗口已满时使用。
+    /// 不**等同**于 MONTHLY_REQUEST_COUNT（后者会永久禁用凭据）。
+    #[serde(default)]
+    pub overage_request_cooldown_sec: Option<u64>,
+
+    /// "suspicious activity" directory 级别封禁的 cooldown 秒数（默认 300 = 5 分钟）
+    ///
+    /// Kiro 返回 "Due to suspicious activity, we are imposing temporary limits"
+    /// 时使用。表示 directory 维度的风控触发（所有共享 directory_id 的凭据同时受限）。
+    #[serde(default)]
+    pub suspicious_activity_cooldown_sec: Option<u64>,
+
+    /// 全员 cooldown 时，acquire_context 等待最早过期号的最大秒数（默认 30）
+    ///
+    /// 让"上游全部限流"期间通过等待恢复给客户端 200，而不是 502。范围 [3, 120]。
+    /// 单位秒，None 沿用代码内置默认（30s）。
+    #[serde(default)]
+    pub max_fallback_wait_secs: Option<u64>,
+
+    /// 同一次 acquire 内允许"等待 cooldown 过期再重选"的最大轮数（默认 3）
+    ///
+    /// 范围 [1, 10]。等够这么多轮还选不到非 fallback 号才走 fallback 借号。
+    #[serde(default)]
+    pub max_fallback_wait_attempts: Option<u32>,
+
+    /// 同时打到 Kiro 上游的最大并发请求数（默认无限制 = None）
+    ///
+    /// 用于避免"复试风暴"加重 Kiro 对账号的 suspicious activity 风控。
+    /// 触发时新请求会在 `acquire_context` **之前**排队等待 slot，
+    /// 一个客户端请求只占一个 slot（不管它内部重试多少次）。
+    ///
+    /// 建议值：号池大小 × 2~3。默认不限制，沿用旧行为。
+    #[serde(default)]
+    pub max_inflight_kiro_requests: Option<u32>,
+
+    /// 每个凭据的最大并发请求数（默认 2）
+    ///
+    /// 非阻塞模式：选号时 `try_acquire` per-credential semaphore，满了就跳过该号。
+    /// 防止单个凭据同时承受过多请求被 Kiro 风控。设 0 或 None 视为不限制（向后兼容）。
+    /// 建议值：2-3（取决于凭据数量和上游限制）。
+    #[serde(default)]
+    pub max_inflight_per_credential: Option<u32>,
+
+    /// Tier 化 retry 的 fallback 代理 URL（默认 None = 不启用）
+    ///
+    /// 当直连重试达到 `fallback_proxy_after_attempts` 次仍失败时，
+    /// 后续重试自动切换到该代理出口（如 mihomo `http://172.17.0.1:17890`），
+    /// 让 source IP 多样化绕过"IP × directory"维度的风控。
+    ///
+    /// 设计目标：99% 请求走直连保持低延迟，<1% 被 IP 风控的请求通过代理救活。
+    /// 支持 http://host:port / socks5://host:port 格式（由 reqwest 解析）。
+    #[serde(default)]
+    pub fallback_proxy_url: Option<String>,
+
+    /// 触发 fallback proxy 的 attempt 阈值（0-indexed，默认 None = 代码内置 10）
+    ///
+    /// 例如设 10：attempt 0-9 走直连，attempt >= 10 走 fallback proxy。
+    /// 范围 [0, 30]。设 0 = 所有重试都走代理（不推荐，失去直连优势）。
+    #[serde(default)]
+    pub fallback_proxy_after_attempts: Option<usize>,
+
+    /// Prompt prefix cache 是否启用（默认 true）
+    ///
+    /// 中转层自实现的 cache：相同 prefix（system + tools + history[..-1]）的多次请求
+    /// 复用 conversation_id 并把 cache_*_input_tokens 真实上报给客户端，让命中率不再永远为 0。
+    #[serde(default)]
+    pub prompt_cache_enabled: Option<bool>,
+
+    /// Prompt cache 容量（默认 1024）
+    #[serde(default)]
+    pub prompt_cache_capacity: Option<usize>,
+
+    /// Prompt cache TTL 秒数（默认 300=5min，对齐 Anthropic ephemeral 规范）
+    #[serde(default)]
+    pub prompt_cache_ttl_secs: Option<u64>,
 
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
@@ -217,6 +301,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_transient_cooldown_enabled() -> bool {
+    true
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -247,6 +335,20 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            transient_cooldown_enabled: default_transient_cooldown_enabled(),
+            rate_limit_cooldown_sec: None,
+            upstream_error_cooldown_sec: None,
+            overage_request_cooldown_sec: None,
+            suspicious_activity_cooldown_sec: None,
+            max_fallback_wait_secs: None,
+            max_fallback_wait_attempts: None,
+            max_inflight_kiro_requests: None,
+            max_inflight_per_credential: None,
+            fallback_proxy_url: None,
+            fallback_proxy_after_attempts: None,
+            prompt_cache_enabled: None,
+            prompt_cache_capacity: None,
+            prompt_cache_ttl_secs: None,
             extract_thinking: default_extract_thinking(),
             system_prompt: None,
             strip_system_restrictions: false,
@@ -284,9 +386,10 @@ impl Config {
         let path = path.as_ref();
         if !path.exists() {
             // 配置文件不存在，返回默认配置
-            let mut config = Self::default();
-            config.config_path = Some(path.to_path_buf());
-            return Ok(config);
+            return Ok(Self {
+                config_path: Some(path.to_path_buf()),
+                ..Self::default()
+            });
         }
 
         let content = fs::read_to_string(path)?;

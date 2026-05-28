@@ -132,9 +132,7 @@ pub fn strip_restrictions(text: &str) -> String {
     }
 
     // 3. 清理多余空行（连续 3+ 换行合并为 2 个）
-    static MULTI_NEWLINE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\n{3,}").unwrap()
-    });
+    static MULTI_NEWLINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
     result = MULTI_NEWLINE.replace_all(&result, "\n\n").to_string();
 
     result
@@ -189,7 +187,10 @@ mod tests {
             !result.contains("IMPORTANT: Assist with authorized security testing"),
             "pattern #1 应被剥离"
         );
-        assert!(!result.contains("malicious purposes"), "end marker 应一并删除");
+        assert!(
+            !result.contains("malicious purposes"),
+            "end marker 应一并删除"
+        );
         assert!(result.contains("Header text"), "前置内容应保留");
         assert!(result.contains("Footer text"), "后置内容应保留");
     }
@@ -316,11 +317,12 @@ mod tests {
     #[test]
     fn huge_input() {
         let filler = "lorem ipsum dolor sit amet. ".repeat(4000); // ~112KB
-        let input = format!(
-            "{filler}<content_safety>secret restriction</content_safety>{filler}",
-        );
+        let input = format!("{filler}<content_safety>secret restriction</content_safety>{filler}",);
         let result = strip_restrictions(&input);
-        assert!(!result.contains("content_safety"), "巨大输入中的 pattern 也应被剥离");
+        assert!(
+            !result.contains("content_safety"),
+            "巨大输入中的 pattern 也应被剥离"
+        );
         assert!(!result.contains("secret restriction"));
         assert!(result.contains("lorem ipsum"), "正常内容保留");
     }
@@ -330,7 +332,10 @@ mod tests {
     fn collapses_multiple_newlines() {
         let input = "para1\n\n\n\n\npara2\n\n\npara3";
         let result = strip_restrictions(input);
-        assert_eq!(result, "para1\n\npara2\n\npara3", "连续 3+ 换行应合并为 2 个");
+        assert_eq!(
+            result, "para1\n\npara2\n\npara3",
+            "连续 3+ 换行应合并为 2 个"
+        );
     }
 
     /// 剥离后立刻清理产生的多余空行
@@ -356,11 +361,7 @@ mod tests {
         ];
         for input in inputs {
             let result = strip_restrictions(input);
-            assert_eq!(
-                result, input,
-                "正常技术讨论不应被误删: {:?}",
-                input
-            );
+            assert_eq!(result, input, "正常技术讨论不应被误删: {:?}", input);
         }
     }
 
@@ -375,11 +376,7 @@ mod tests {
         ];
         for input in inputs {
             let result = strip_restrictions(input);
-            assert_eq!(
-                result, input,
-                "正常对话语句不应被误删: {:?}",
-                input
-            );
+            assert_eq!(result, input, "正常对话语句不应被误删: {:?}", input);
         }
     }
 }

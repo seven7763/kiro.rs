@@ -69,10 +69,7 @@ pub fn atomic_write_string<P: AsRef<Path>>(path: P, content: &str) -> std::io::R
 /// # 错误处理
 /// `set_permissions` 失败仅 warn 不阻塞写入：某些 NFS / CIFS / overlayfs
 /// 不支持 chmod，但数据完整性必须优先保证。
-pub fn atomic_write_string_secure<P: AsRef<Path>>(
-    path: P,
-    content: &str,
-) -> std::io::Result<()> {
+pub fn atomic_write_string_secure<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
     let path = path.as_ref();
     let tmp_path = make_tmp_path(path);
 

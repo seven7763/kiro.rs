@@ -11,3 +11,5 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
+/.windsurf/
+/admin-ui/package-lock.json

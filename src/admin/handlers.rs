@@ -9,9 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, CreateUserPresetRequest, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
-        UpdateSystemPromptRequest, UpdateUserPresetRequest,
+        AddCredentialRequest, CreateUserPresetRequest, PromptCacheConfigPayload,
+        RetryConfigPayload, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
+        SuccessResponse, UpdateSystemPromptRequest, UpdateUserPresetRequest,
     },
 };
 
@@ -20,6 +20,72 @@ use super::{
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_all_credentials();
     Json(response)
+}
+
+/// GET /api/admin/metrics
+/// 返回聚合的运行时指标（请求计数、延迟分位、cooldown/fallback 统计）
+pub async fn get_metrics(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_metrics())
+}
+
+/// GET /api/admin/metrics/prometheus
+/// 以 Prometheus / OpenMetrics 文本格式输出关键指标
+///
+/// 适合 Prometheus / Grafana / VictoriaMetrics scrape。返回 `text/plain;
+/// charset=utf-8; version=0.0.4`，逐行 `metric{labels} value` 格式。
+pub async fn get_metrics_prometheus(State(state): State<AdminState>) -> impl IntoResponse {
+    let body = state.service.get_metrics_prometheus();
+    (
+        axum::http::StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+}
+
+/// GET /api/admin/runtime/retry-config
+/// 读取当前运行时 retry 配置
+pub async fn get_retry_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_retry_config())
+}
+
+/// PUT /api/admin/runtime/retry-config
+/// 更新 retry 配置（运行时即时生效 + 写回 config.json）
+pub async fn update_retry_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<RetryConfigPayload>,
+) -> impl IntoResponse {
+    match state.service.update_retry_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/runtime/prompt-cache-config
+/// 读取当前 prompt cache 配置 + 运行时统计
+pub async fn get_prompt_cache_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_prompt_cache_config())
+}
+
+/// PUT /api/admin/runtime/prompt-cache-config
+/// 更新 prompt cache 配置（运行时即时生效 + 写回 config.json）
+pub async fn update_prompt_cache_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<PromptCacheConfigPayload>,
+) -> impl IntoResponse {
+    match state.service.update_prompt_cache_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/runtime/prompt-cache-config/clear
+/// 清空 prompt cache（保留配置，但移除全部条目）
+pub async fn clear_prompt_cache(State(state): State<AdminState>) -> impl IntoResponse {
+    state.service.clear_prompt_cache();
+    Json(SuccessResponse::new("prompt cache 已清空".to_string()))
 }
 
 /// POST /api/admin/credentials/:id/disabled

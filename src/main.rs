@@ -1,3 +1,8 @@
+// `if let Some(x) = ... { if cond { ... } }` 在很多 admin handler / stream parser 里
+// 嵌套两层比 if-let-chain (`if let Some(x) = ... && cond`) 更易读且 diff 更稳定，
+// 因此在 crate 级别允许 collapsible_if，避免被 clippy 强行合并降低可读性。
+#![allow(clippy::collapsible_if)]
+
 mod admin;
 mod admin_ui;
 mod anthropic;
@@ -12,12 +17,13 @@ use std::sync::Arc;
 
 use clap::Parser;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+use kiro::metrics::MetricsRecorder;
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
-use model::runtime::shared_from_config;
+use model::runtime::{shared_from_config, shared_retry_config_from};
 use parking_lot::Mutex;
 
 #[tokio::main]
@@ -113,10 +119,7 @@ async fn main() {
 
     // 校验所有凭据声明的端点都已注册
     for cred in &credentials_list {
-        let name = cred
-            .endpoint
-            .as_deref()
-            .unwrap_or(&config.default_endpoint);
+        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
         if !endpoints.contains_key(name) {
             tracing::error!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
@@ -143,11 +146,17 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    // 进程级 metrics 记录器：在 KiroProvider 与 AdminService 之间共享
+    let metrics_recorder = Arc::new(MetricsRecorder::new());
+    // 运行时 retry 配置：与 token_manager 和 admin service 共享，允许 Admin 热改
+    let retry_config = shared_retry_config_from(&config);
+    token_manager.attach_retry_config(retry_config.clone());
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
+        metrics_recorder.clone(),
     );
 
     // 初始化 count_tokens 配置
@@ -164,12 +173,26 @@ async fn main() {
     // 可写 Config 句柄（Admin 写入 system prompt 等字段时回写 config.json）
     let config_writer: Arc<Mutex<Config>> = Arc::new(Mutex::new(config.clone()));
 
+    // 构建中转层 Prompt cache（Anthropic handler 与 Admin 共享同一实例）
+    let prompt_cache = anthropic::prompt_cache::PromptCache::new(
+        config
+            .prompt_cache_capacity
+            .unwrap_or(anthropic::prompt_cache::DEFAULT_CAPACITY),
+        std::time::Duration::from_secs(
+            config
+                .prompt_cache_ttl_secs
+                .unwrap_or(anthropic::prompt_cache::DEFAULT_TTL.as_secs()),
+        ),
+        config.prompt_cache_enabled.unwrap_or(true),
+    );
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
         prompt_config.clone(),
+        prompt_cache.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -190,6 +213,9 @@ async fn main() {
                 endpoint_names.clone(),
                 prompt_config.clone(),
                 config_writer.clone(),
+                metrics_recorder.clone(),
+                retry_config.clone(),
+                prompt_cache.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);

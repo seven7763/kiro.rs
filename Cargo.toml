@@ -45,3 +45,5 @@ regex = "1"           # 正则表达式
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
+base64 = "0.22"       # PDF/document 块的 base64 解码
+lopdf = "0.32"        # PDF 文本提取（document 块上行兼容）

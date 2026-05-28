@@ -118,6 +118,8 @@ fn sha256_hex(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::field_reassign_with_default)] // mock 数据构造保持可读性
+
     use super::*;
 
     #[test]

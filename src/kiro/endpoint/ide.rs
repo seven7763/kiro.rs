@@ -70,6 +70,13 @@ impl KiroEndpoint for IdeEndpoint {
         format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
     }
 
+    fn models_url(&self, ctx: &RequestContext<'_>) -> String {
+        format!(
+            "https://q.{}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR",
+            self.api_region(ctx)
+        )
+    }
+
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
             .header("x-amzn-codewhisperer-optout", "true")

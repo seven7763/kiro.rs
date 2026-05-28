@@ -136,8 +136,8 @@ pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
 
     // 去除前缀 "Perform a web search for the query: "
     const PREFIX: &str = "Perform a web search for the query: ";
-    let query = if text.starts_with(PREFIX) {
-        text[PREFIX.len()..].to_string()
+    let query = if let Some(stripped) = text.strip_prefix(PREFIX) {
+        stripped.to_string()
     } else {
         text
     };
@@ -183,7 +183,7 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
     // tool_use_id 使用相同格式
     let tool_use_id = format!(
         "srvtoolu_{}",
-        Uuid::new_v4().to_string().replace('-', "")[..32].to_string()
+        &Uuid::new_v4().to_string().replace('-', "")[..32]
     );
 
     let request = McpRequest {
@@ -240,10 +240,7 @@ fn generate_websearch_events(
     input_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
-    let message_id = format!(
-        "msg_{}",
-        Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
-    );
+    let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
 
     // 1. message_start
     events.push(SseEvent::new(
@@ -569,6 +566,7 @@ mod tests {
                 description: String::new(),
                 input_schema: Default::default(),
                 max_uses: Some(8),
+                cache_control: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -599,6 +597,7 @@ mod tests {
                     description: String::new(),
                     input_schema: Default::default(),
                     max_uses: Some(8),
+                    cache_control: None,
                 },
                 Tool {
                     tool_type: None,
@@ -606,6 +605,7 @@ mod tests {
                     description: "Other tool".to_string(),
                     input_schema: Default::default(),
                     max_uses: None,
+                    cache_control: None,
                 },
             ]),
             tool_choice: None,

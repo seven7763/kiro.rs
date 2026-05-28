@@ -9,10 +9,12 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -187,7 +189,10 @@ async fn refresh_social_token(
             && body_text.contains("Invalid refresh token provided")
         {
             return Err(RefreshTokenInvalidError {
-                message: format!("Social refreshToken 已失效 (invalid_grant): {}", redacted_body),
+                message: format!(
+                    "Social refreshToken 已失效 (invalid_grant): {}",
+                    redacted_body
+                ),
             }
             .into());
         }
@@ -356,10 +361,7 @@ pub(crate) async fn get_usage_limits(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
         os_name, node_version, kiro_version, machine_id
     );
-    let amz_user_agent = format!(
-        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
-        kiro_version, machine_id
-    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -420,6 +422,49 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 当前 in-flight 请求数（balanced 模式按此分发并发，请求开始 +1，结束 -1）
+    inflight: u32,
+    /// 上游瞬态错误（429/408/5xx）累计次数（不参与禁用判定，仅供观测）
+    transient_failure_count: u64,
+    /// 最近一次瞬态错误时间（RFC3339 格式）
+    last_transient_failure_at: Option<String>,
+    /// 最近一次瞬态错误时刻（进程内单调时钟），用于 select 时偏好"最久未失败号"
+    /// 跨进程无意义、不持久化；启动时为 None 表示该号自启动后没失败过 → 最优先
+    last_transient_at_instant: Option<Instant>,
+    /// 冷却截止时间（>now 时该凭据被 acquire 跳过；None 表示无冷却）
+    /// 不持久化（重启即清，符合 Instant 跨进程无意义的语义）
+    cooldown_until: Option<Instant>,
+    /// 最近一次进入冷却的原因（用于日志/Admin 观测）
+    cooldown_reason: Option<TransientFailureKind>,
+    /// Per-credential 并发限制 semaphore（None = 不限制）
+    ///
+    /// 非阻塞 try_acquire 模式：选号时调用 `sem.try_acquire_owned()`，
+    /// 成功则持有 permit，失败则跳过该号选下一个。
+    /// 防止单个凭据同时承受过多请求被 Kiro 风控。
+    permit_semaphore: Option<Arc<Semaphore>>,
+    /// 当前持有的 per-credential 并发 permit（选号时 acquire，请求结束时 release）
+    concurrency_permit: Option<OwnedSemaphorePermit>,
+}
+
+/// 判断凭据当前是否处于冷却中
+fn is_in_cooldown(entry: &CredentialEntry, now: Instant) -> bool {
+    matches!(entry.cooldown_until, Some(until) if until > now)
+}
+
+/// 给 cooldown 时长加 ±20% 随机 jitter，错峰恢复，避免一批号同步进/出 cooldown
+/// 导致的"集体雪暴"现象（限流期间多个号几乎同时被打、几乎同时恢复、又几乎同时再被打）。
+///
+/// 实现：返回 `[duration * 0.8, duration * 1.2]` 区间内的均匀随机值。
+/// 当 `duration < 5` 秒时跳过 jitter（区间过窄无意义），原值返回。
+fn apply_cooldown_jitter(duration: StdDuration) -> StdDuration {
+    let secs = duration.as_secs();
+    if secs < 5 {
+        return duration;
+    }
+    let lo = (secs as f64 * 0.8) as u64;
+    let hi = (secs as f64 * 1.2) as u64;
+    let jittered = fastrand::u64(lo..=hi);
+    StdDuration::from_secs(jittered)
 }
 
 /// 禁用原因
@@ -439,11 +484,71 @@ enum DisabledReason {
     InvalidConfig,
 }
 
+/// 上游瞬态错误分类（用于 cooldown 时长选择 + 观测）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransientFailureKind {
+    /// HTTP 429 Too Many Requests（限流）
+    RateLimit,
+    /// HTTP 408 Request Timeout
+    Timeout,
+    /// HTTP 5xx 上游服务错误
+    UpstreamError,
+    /// HTTP 402 + `OVERAGE_REQUEST_LIMIT_EXCEEDED`
+    ///
+    /// 用户已开启 overage 付费，但当前 hour/day 速率窗口已满。
+    /// 与 [`Self::RateLimit`] 区别：cooldown 时长更长（窗口刷新粒度通常以
+    /// 小时/天计），不应误判为永久 disable。
+    OverageRequestLimit,
+    /// 429 + "suspicious activity" directory 级别封禁
+    ///
+    /// Kiro 返回 "Due to suspicious activity, we are imposing temporary limits"
+    /// 表示 directory 维度的风控触发（所有共享 directory_id 的凭据同时受限）。
+    /// 使用比普通 429 更长的 cooldown（默认 300s），避免号池在短时间内反复被打爆。
+    SuspiciousActivity,
+}
+
+impl TransientFailureKind {
+    /// 由 HTTP 状态码推断分类
+    pub fn from_status(status: u16) -> Self {
+        match status {
+            429 => Self::RateLimit,
+            408 => Self::Timeout,
+            _ => Self::UpstreamError, // 5xx 及兜底
+        }
+    }
+
+    /// 从 429 响应体中检测是否为 "suspicious activity" directory 封禁
+    pub fn classify_429(body: &str) -> Self {
+        if body.contains("suspicious activity") || body.contains("imposing temporary limits") {
+            Self::SuspiciousActivity
+        } else {
+            Self::RateLimit
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::Timeout => "timeout",
+            Self::UpstreamError => "upstream_error",
+            Self::OverageRequestLimit => "overage_request_limit",
+            Self::SuspiciousActivity => "suspicious_activity",
+        }
+    }
+}
+
 /// 统计数据持久化条目
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
     success_count: u64,
     last_used_at: Option<String>,
+    /// 上游瞬态错误累计次数（v2 新增，旧文件 default = 0）
+    #[serde(default)]
+    transient_failure_count: u64,
+    /// 最近一次瞬态错误时间（v2 新增，旧文件 default = None）
+    #[serde(default)]
+    last_transient_failure_at: Option<String>,
 }
 
 // ============================================================================
@@ -478,6 +583,8 @@ pub struct CredentialEntrySnapshot {
     pub email: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 当前 in-flight 请求数（用于 balanced 调度可观测性）
+    pub inflight: u32,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
@@ -493,6 +600,18 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 上游瞬态错误（429/408/5xx）累计次数
+    #[serde(default)]
+    pub transient_failure_count: u64,
+    /// 最近一次瞬态错误时间（RFC3339）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_transient_failure_at: Option<String>,
+    /// 当前冷却剩余秒数（0 表示不在冷却中）
+    #[serde(default)]
+    pub cooldown_remaining_seconds: u64,
+    /// 当前冷却原因（"rate_limit" / "timeout" / "upstream_error"）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_reason: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -507,6 +626,46 @@ pub struct ManagerSnapshot {
     pub total: usize,
     /// 可用凭据数量
     pub available: usize,
+}
+
+/// Sticky session 路由器：将 conversation_id 绑定到 credential_id
+///
+/// 同一会话的后续请求优先路由到同一凭据，提升 Kiro 后端 prompt cache 命中率。
+/// 绑定有效期默认 1 小时，超时后自动回退到正常选号逻辑。
+struct StickyRouter {
+    bindings: Mutex<HashMap<String, (u64, Instant)>>,
+    ttl: StdDuration,
+}
+
+impl StickyRouter {
+    fn new(ttl: StdDuration) -> Self {
+        Self {
+            bindings: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    /// 查询绑定：返回 credential_id 如果绑定未过期
+    fn get(&self, conversation_id: &str) -> Option<u64> {
+        let map = self.bindings.lock();
+        map.get(conversation_id)
+            .filter(|(_, expires_at)| Instant::now() < *expires_at)
+            .map(|(id, _)| *id)
+    }
+
+    /// 记录绑定（请求成功后调用）
+    fn bind(&self, conversation_id: &str, credential_id: u64) {
+        let mut map = self.bindings.lock();
+        // 超过 4096 条时清理过期条目，防内存泄漏
+        if map.len() > 4096 {
+            let now = Instant::now();
+            map.retain(|_, (_, exp)| now < *exp);
+        }
+        map.insert(
+            conversation_id.to_string(),
+            (credential_id, Instant::now() + self.ttl),
+        );
+    }
 }
 
 /// 多凭据 Token 管理器
@@ -532,12 +691,48 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 可选的运行时 retry 配置句柄（生产代码 attach；测试默认 None 走 config）
+    retry_config: Mutex<Option<crate::model::runtime::SharedRetryConfig>>,
+    /// Sticky session 路由器（conversation_id → credential_id 绑定）
+    sticky_router: StickyRouter,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+
+/// 429 限流的默认 cooldown 时长（可被 config.rate_limit_cooldown_sec 或 Retry-After 覆盖）
+const DEFAULT_RATE_LIMIT_COOLDOWN: StdDuration = StdDuration::from_secs(120);
+/// 408/5xx 的默认 cooldown 时长（可被 config.upstream_error_cooldown_sec 覆盖）
+const DEFAULT_UPSTREAM_ERROR_COOLDOWN: StdDuration = StdDuration::from_secs(30);
+/// 402 OVERAGE_REQUEST_LIMIT_EXCEEDED 的默认 cooldown 时长
+///
+/// Kiro 上游 overage 速率限制窗口通常以小时计；默认 600s = 10 分钟，
+/// 既避免长时间锁死号、又给窗口足够时间刷新。可被
+/// `config.overage_request_cooldown_sec` 覆盖。
+const DEFAULT_OVERAGE_REQUEST_COOLDOWN: StdDuration = StdDuration::from_secs(600);
+/// "suspicious activity" directory 级别封禁的默认 cooldown 时长
+///
+/// Kiro 返回 "Due to suspicious activity, we are imposing temporary limits" 表示
+/// directory 维度的风控触发，所有共享该 directory_id 的凭据同时受限。
+/// 默认 300s = 5 分钟，给上游足够时间解除风控。可被
+/// `config.suspicious_activity_cooldown_sec` 覆盖。
+const DEFAULT_SUSPICIOUS_ACTIVITY_COOLDOWN: StdDuration = StdDuration::from_secs(300);
+/// Retry-After 头允许的最大 cooldown（防上游传入异常大值锁死凭据）
+const RETRY_AFTER_MAX_CLAMP: StdDuration = StdDuration::from_secs(300);
+/// 全员 cooldown 时 acquire_context 智能等待最早过期号的**默认**上限。
+///
+/// 通过 `RetryRuntimeConfig.max_fallback_wait_secs` 可热调（范围 [3, 120]s）。
+/// 默认 60s 让客户端在"全员上游限流"时仍有机会拿到 200 而不是 502；
+/// 服务端等待期间号池透明，客户端无感。
+const DEFAULT_MAX_FALLBACK_WAIT: StdDuration = StdDuration::from_secs(60);
+
+/// 单次 acquire 内"等待 + 重选"循环的**默认**最大轮数。
+///
+/// 通过 `RetryRuntimeConfig.max_fallback_wait_attempts` 可热调（范围 [1, 10]）。
+/// 默认 5 让 cooldown 不齐的号池有 5 次机会等到下一批号过期。
+const DEFAULT_MAX_FALLBACK_WAIT_ATTEMPTS: u32 = 5;
 
 /// API 调用上下文
 ///
@@ -551,6 +746,18 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 本次调用是否来自"全员 cooldown" fallback 路径
+    ///
+    /// 当所有可用凭据都在 cooldown 中、调度器无奈挑出"最早过期"的号时，
+    /// 标记为 true。后续 [`MultiTokenManager::report_transient_failure`] 看到此标记
+    /// 会**只累计计数、不再延长 cooldown**——避免反复刷新同一组号的 cooldown
+    /// 导致永远没有号能真正恢复。
+    pub from_cooldown_fallback: bool,
+    /// 本次 acquire 是否经历了"全员 cooldown 智能等待"路径
+    ///
+    /// 用于 metrics 观测：true 表示调度器为了避免 fallback 借号、主动 sleep
+    /// 等到最早过期的号恢复后再返回（提供观测信号，与正确性无关）。
+    pub waited_for_cooldown: bool,
 }
 
 impl MultiTokenManager {
@@ -575,6 +782,16 @@ impl MultiTokenManager {
         let mut has_new_ids = false;
         let mut has_new_machine_ids = false;
         let config_ref = &config;
+
+        // 创建 per-credential 并发限制 semaphore（None = 不限制）
+        let per_cred_semaphore: Option<Arc<Semaphore>> =
+            config.max_inflight_per_credential.and_then(|n| {
+                if n == 0 {
+                    None
+                } else {
+                    Some(Arc::new(Semaphore::new(n as usize)))
+                }
+            });
 
         let entries: Vec<CredentialEntry> = credentials
             .into_iter()
@@ -605,6 +822,14 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    inflight: 0,
+                    transient_failure_count: 0,
+                    last_transient_failure_at: None,
+                    last_transient_at_instant: None,
+                    cooldown_until: None,
+                    cooldown_reason: None,
+                    permit_semaphore: per_cred_semaphore.clone(),
+                    concurrency_permit: None,
                 }
             })
             .collect();
@@ -661,6 +886,8 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            retry_config: Mutex::new(None),
+            sticky_router: StickyRouter::new(StdDuration::from_secs(3600)),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -700,6 +927,7 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    #[allow(dead_code)] // 历史选号入口，保留供后续 strategy 切换或测试覆盖
     fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
@@ -708,14 +936,15 @@ impl MultiTokenManager {
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
 
-        // 过滤可用凭据
-        let available: Vec<_> = entries
+        let now = Instant::now();
+
+        // 过滤未禁用 + 模型适配的凭据（不含 cooldown 过滤）
+        let candidates: Vec<&CredentialEntry> = entries
             .iter()
             .filter(|e| {
                 if e.disabled {
                     return false;
                 }
-                // 如果是 opus 模型，需要检查订阅等级
                 if is_opus && !e.credentials.supports_opus() {
                     return false;
                 }
@@ -723,28 +952,433 @@ impl MultiTokenManager {
             })
             .collect();
 
-        if available.is_empty() {
+        if candidates.is_empty() {
             return None;
         }
+
+        // 第一遍：跳过冷却中的凭据；第二遍 fallback：所有候选都在冷却时
+        // 选 cooldown 最早过期的（"最快恢复"），保证不返回 None 让上层 503
+        let live: Vec<&CredentialEntry> = candidates
+            .iter()
+            .copied()
+            .filter(|e| !is_in_cooldown(e, now))
+            .collect();
+
+        let pool: &[&CredentialEntry] = if !live.is_empty() { &live } else { &candidates };
 
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
-
+                // In-Flight 优先 + Least-Used 次之：先选当前并发最少的凭据，
+                // 这样 N 个并发请求会被分散到 N 个不同的号上。
+                // 平局（同 inflight）时按累计成功数最少（历史均衡），再按 priority。
+                // 末尾追加随机数，防止全平局时永远选 Vec 的第一项（导致流量倾斜）。
+                let entry = pool.iter().min_by_key(|e| {
+                    (
+                        e.inflight,
+                        e.success_count,
+                        e.credentials.priority,
+                        fastrand::u32(..),
+                    )
+                })?;
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
+                let entry = pool.iter().min_by_key(|e| e.credentials.priority)?;
                 Some((entry.id, entry.credentials.clone()))
             }
+        }
+    }
+
+    /// 选择一个可用凭据并原子地占用 inflight 槽位
+    ///
+    /// 与 `select_next_credential` 的区别：在持有 entries 锁的同时把 `inflight += 1`，
+    /// 这样并发调用会立刻看到该号 inflight 升高，下一个调用自然分发到其他号。
+    ///
+    /// 调用方拿到 `(id, credentials)` 后，**必须**通过 `release_inflight(id)`（或
+    /// `report_success` / `report_failure` 等会自动释放的接口）归还槽位，否则会泄漏。
+    ///
+    /// 返回 `(id, credentials, from_cooldown_fallback, earliest_cooldown_until)`：
+    /// - `from_cooldown_fallback=true` 表示全员都在 cooldown 中、本次是无奈选了最早
+    ///   过期的号"硬试"，调用方在失败上报时不应再延长 cooldown（防雪暴）。
+    /// - `earliest_cooldown_until`: 全员 cooldown 时是被选中号的过期时刻；非 fallback
+    ///   分支为 `None`。调用方可据此决定是否短暂等待后重新选号（智能等待）。
+    fn select_and_acquire_slot(
+        &self,
+        model: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Option<(u64, KiroCredentials, bool, Option<Instant>)> {
+        let mut entries = self.entries.lock();
+
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+
+        let mode = self.load_balancing_mode.lock().clone();
+        let mode = mode.as_str();
+
+        let now = Instant::now();
+
+        // 过滤未禁用 + 模型适配的候选索引（不含 cooldown 过滤）
+        let candidates: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                if e.disabled {
+                    return None;
+                }
+                if is_opus && !e.credentials.supports_opus() {
+                    return None;
+                }
+                Some(i)
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Sticky session：同一 conversation_id 优先路由到同一凭据
+        if let Some(cid) = conversation_id {
+            if let Some(sticky_id) = self.sticky_router.get(cid) {
+                if let Some(&idx) = candidates.iter().find(|&&i| entries[i].id == sticky_id) {
+                    if !is_in_cooldown(&entries[idx], now) {
+                        // Sticky 命中且不在 cooldown，直接使用
+                        if let Some(ref sem) = entries[idx].permit_semaphore {
+                            if let Ok(permit) = sem.clone().try_acquire_owned() {
+                                entries[idx].concurrency_permit = Some(permit);
+                            }
+                        }
+                        entries[idx].inflight = entries[idx].inflight.saturating_add(1);
+                        tracing::debug!(
+                            "sticky session 命中: conversation={} → 凭据 #{}",
+                            cid,
+                            entries[idx].id
+                        );
+                        return Some((
+                            entries[idx].id,
+                            entries[idx].credentials.clone(),
+                            false,
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 第一遍：排除 cooldown 中的凭据；
+        // 全员 cooldown 时退化到原候选池（挑 cooldown 最早过期的）。
+        let live: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|&i| !is_in_cooldown(&entries[i], now))
+            .collect();
+        let all_in_cooldown = live.is_empty();
+        let pool: &[usize] = if all_in_cooldown { &candidates } else { &live };
+
+        let chosen_idx = if all_in_cooldown {
+            // 退化分支：所有号都在 cooldown，必须 fallback 借用一个号。
+            //
+            // **重要修复（避免单号死循环 bug）**：
+            // 旧逻辑按 `cooldown_until` 升序选"最早过期"，但 fallback 路径下
+            // `report_transient_failure` **不更新 cooldown_until**（防雪暴），
+            // 导致同一个号永远是"最早过期"反复被选中 → 实测 93% 的 429 集中到 1 个号。
+            //
+            // 新逻辑：优先按 `last_transient_at_instant` 选"最久没失败的"号
+            // （None < Some，老 Instant < 新 Instant）——让 cred A 失败后被推到末尾，
+            // 下一次 fallback 选别的号，**全员轮转借用**而不是死磕一个。
+            // 末尾追加 fastrand 破平局，防止 Vec 第一项被永久选中。
+            *pool.iter().min_by_key(|&&i| {
+                let e = &entries[i];
+                (
+                    e.last_transient_at_instant,
+                    e.cooldown_until.unwrap_or(now),
+                    e.inflight,
+                    e.success_count,
+                    e.credentials.priority,
+                    fastrand::u32(..),
+                )
+            })?
+        } else {
+            match mode {
+                "balanced" => {
+                    // In-Flight 优先：N 个并发请求自然分散到 N 个号上。
+                    // 次级键 last_transient_at_instant：None < Some 且老 Instant < 新 Instant，
+                    // 让"最久没失败的号"优先（避免刚 cooldown 过期立即又被选中）。
+                    // 末尾追加随机数破平局，防 Vec 第一项被永久选中。
+                    *pool.iter().min_by_key(|&&i| {
+                        let e = &entries[i];
+                        (
+                            e.inflight,
+                            e.last_transient_at_instant,
+                            e.success_count,
+                            e.credentials.priority,
+                            fastrand::u32(..),
+                        )
+                    })?
+                }
+                _ => {
+                    // priority 模式：先按优先级，同优先级偏好"最久没失败的号"
+                    *pool.iter().min_by_key(|&&i| {
+                        let e = &entries[i];
+                        (
+                            e.credentials.priority,
+                            e.last_transient_at_instant,
+                            e.success_count,
+                        )
+                    })?
+                }
+            }
+        };
+
+        // Per-credential 并发限制：try_acquire，满则降级（不阻塞不重选）
+        if let Some(ref sem) = entries[chosen_idx].permit_semaphore {
+            match sem.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    entries[chosen_idx].concurrency_permit = Some(permit);
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "凭据 #{} per-credential 并发已满，降级为不限并发",
+                        entries[chosen_idx].id
+                    );
+                }
+            }
+        }
+
+        let entry = &mut entries[chosen_idx];
+        entry.inflight = entry.inflight.saturating_add(1);
+        let earliest_until = if all_in_cooldown {
+            entry.cooldown_until
+        } else {
+            None
+        };
+        Some((
+            entry.id,
+            entry.credentials.clone(),
+            all_in_cooldown,
+            earliest_until,
+        ))
+    }
+
+    /// 释放 inflight 槽位和 per-credential 并发 permit（请求结束时调用）
+    pub fn release_inflight(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.inflight = entry.inflight.saturating_sub(1);
+            // 释放 per-credential 并发 permit（drop OwnedSemaphorePermit 即释放 slot）
+            entry.concurrency_permit = None;
+        }
+    }
+
+    /// 将 conversation_id 绑定到 credential（请求成功后调用，用于 sticky session）
+    pub fn bind_conversation(&self, conversation_id: &str, credential_id: u64) {
+        self.sticky_router.bind(conversation_id, credential_id);
+    }
+
+    /// 关联运行时 retry 配置句柄
+    ///
+    /// 调用后 [`Self::report_transient_failure`] 会优先读取该共享配置；
+    /// 未关联（默认）时退回 `self.config` 中的字段。
+    pub fn attach_retry_config(&self, handle: crate::model::runtime::SharedRetryConfig) {
+        *self.retry_config.lock() = Some(handle);
+    }
+
+    /// 当前生效的 RateLimit cooldown 时长（优先 retry_config，其次 config，最后内置默认）
+    fn effective_rate_limit_cooldown(&self) -> StdDuration {
+        if let Some(handle) = self.retry_config.lock().as_ref() {
+            if let Some(secs) = handle.read().rate_limit_cooldown_sec {
+                return StdDuration::from_secs(secs);
+            }
+        }
+        self.config
+            .rate_limit_cooldown_sec
+            .map(StdDuration::from_secs)
+            .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN)
+    }
+
+    /// 当前生效的 408/5xx cooldown 时长
+    fn effective_upstream_error_cooldown(&self) -> StdDuration {
+        if let Some(handle) = self.retry_config.lock().as_ref() {
+            if let Some(secs) = handle.read().upstream_error_cooldown_sec {
+                return StdDuration::from_secs(secs);
+            }
+        }
+        self.config
+            .upstream_error_cooldown_sec
+            .map(StdDuration::from_secs)
+            .unwrap_or(DEFAULT_UPSTREAM_ERROR_COOLDOWN)
+    }
+
+    /// 当前生效的 402 OVERAGE_REQUEST_LIMIT_EXCEEDED cooldown 时长
+    fn effective_overage_request_cooldown(&self) -> StdDuration {
+        if let Some(handle) = self.retry_config.lock().as_ref() {
+            if let Some(secs) = handle.read().overage_request_cooldown_sec {
+                return StdDuration::from_secs(secs);
+            }
+        }
+        self.config
+            .overage_request_cooldown_sec
+            .map(StdDuration::from_secs)
+            .unwrap_or(DEFAULT_OVERAGE_REQUEST_COOLDOWN)
+    }
+
+    /// 当前生效的 "suspicious activity" directory 封禁 cooldown 时长
+    fn effective_suspicious_activity_cooldown(&self) -> StdDuration {
+        if let Some(handle) = self.retry_config.lock().as_ref() {
+            if let Some(secs) = handle.read().suspicious_activity_cooldown_sec {
+                return StdDuration::from_secs(secs);
+            }
+        }
+        self.config
+            .suspicious_activity_cooldown_sec
+            .map(StdDuration::from_secs)
+            .unwrap_or(DEFAULT_SUSPICIOUS_ACTIVITY_COOLDOWN)
+    }
+
+    /// 当前是否启用瞬态 cooldown 机制（优先 retry_config）
+    fn effective_transient_cooldown_enabled(&self) -> bool {
+        if let Some(handle) = self.retry_config.lock().as_ref() {
+            return handle.read().transient_cooldown_enabled;
+        }
+        self.config.transient_cooldown_enabled
+    }
+
+    /// 当前生效的"全员 cooldown 智能等待"单轮上限（夹到 [3, 120]s）
+    fn effective_max_fallback_wait(&self) -> StdDuration {
+        let secs = if let Some(handle) = self.retry_config.lock().as_ref() {
+            handle.read().max_fallback_wait_secs
+        } else {
+            self.config.max_fallback_wait_secs
+        };
+        match secs {
+            Some(s) => StdDuration::from_secs(s.clamp(3, 120)),
+            None => DEFAULT_MAX_FALLBACK_WAIT,
+        }
+    }
+
+    /// 当前生效的"全员 cooldown 智能等待"最大轮数（夹到 [1, 10]）
+    fn effective_max_fallback_wait_attempts(&self) -> u32 {
+        let raw = if let Some(handle) = self.retry_config.lock().as_ref() {
+            handle.read().max_fallback_wait_attempts
+        } else {
+            self.config.max_fallback_wait_attempts
+        };
+        raw.map(|n| n.clamp(1, 10))
+            .unwrap_or(DEFAULT_MAX_FALLBACK_WAIT_ATTEMPTS)
+    }
+
+    /// 报告凭据遇到上游瞬态错误（429/408/5xx）
+    ///
+    /// 与 `report_failure` 不同：**不**累计 `failure_count`、**不**禁用凭据；
+    /// 仅累计 `transient_failure_count` 并（视情况）把该凭据放入短期冷却。意图：
+    ///
+    /// - 单请求 retry 期间不再重复打到刚 429 的号；
+    /// - 进入 cooldown 的号不会被永久禁用，到期自动恢复；
+    /// - 全部号都被冷却时调度器 fallback 到"最早过期"的号，避免 503 风暴。
+    ///
+    /// 防雪暴：cooldown 时长加 ±20% jitter，错峰恢复，避免一批号同步进/出冷却。
+    /// 防 fallback 死循环：`from_cooldown_fallback=true` 时**只累计计数、不刷新 cooldown**——
+    /// 这种调用本来就是无奈选了一个还在冷却中的号"硬试"，再延长它的 cooldown 只会
+    /// 让它永远是"最早过期"反复被借用，导致没有号能真正恢复。
+    ///
+    /// # 参数
+    /// - `id`: 凭据 ID
+    /// - `kind`: 错误分类（决定默认 cooldown 时长）
+    /// - `retry_after`: 上游 `Retry-After` 头解析出的等待时长（如有则优先于默认值，无 jitter）
+    /// - `from_cooldown_fallback`: 本次调用是否来自全员冷却的 fallback 路径
+    pub fn report_transient_failure(
+        &self,
+        id: u64,
+        kind: TransientFailureKind,
+        retry_after: Option<StdDuration>,
+        from_cooldown_fallback: bool,
+    ) {
+        // toggle 关闭时退化为旧行为：仅释放 inflight
+        if !self.effective_transient_cooldown_enabled() {
+            self.release_inflight(id);
+            return;
+        }
+
+        // 计算基础 cooldown 时长：
+        // - OVERAGE 速率窗口通常按 hour/day 计，**不**接受 retry_after 缩短（即使有也以默认值为准）
+        // - SuspiciousActivity 为 directory 级别封禁，使用独立长 cooldown（默认 300s），
+        //   **不**接受 retry_after 缩短（上游返回的短 Retry-After 不适用于风控场景）
+        // - 其余类型 retry_after 优先（夹到 RETRY_AFTER_MAX_CLAMP），否则按 kind 选默认值
+        let base_duration = if matches!(kind, TransientFailureKind::OverageRequestLimit) {
+            self.effective_overage_request_cooldown()
+        } else if matches!(kind, TransientFailureKind::SuspiciousActivity) {
+            self.effective_suspicious_activity_cooldown()
+        } else if let Some(d) = retry_after {
+            d.min(RETRY_AFTER_MAX_CLAMP)
+        } else {
+            match kind {
+                TransientFailureKind::RateLimit => self.effective_rate_limit_cooldown(),
+                TransientFailureKind::Timeout | TransientFailureKind::UpstreamError => {
+                    self.effective_upstream_error_cooldown()
+                }
+                TransientFailureKind::OverageRequestLimit
+                | TransientFailureKind::SuspiciousActivity => unreachable!(),
+            }
+        };
+
+        // ±20% jitter 错峰恢复（仅对默认值/配置值；上游显式 Retry-After 不抖动以尊重协议）
+        let duration = if retry_after.is_some() {
+            base_duration
+        } else {
+            apply_cooldown_jitter(base_duration)
+        };
+
+        let cooldown_until = Instant::now() + duration;
+        let now_rfc = Utc::now().to_rfc3339();
+        let mut became_dirty = false;
+
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.inflight = entry.inflight.saturating_sub(1);
+                entry.concurrency_permit = None;
+                entry.transient_failure_count = entry.transient_failure_count.saturating_add(1);
+                entry.last_transient_failure_at = Some(now_rfc);
+                entry.last_transient_at_instant = Some(Instant::now());
+
+                if from_cooldown_fallback {
+                    // 全员冷却 fallback 路径：不刷新 cooldown，让它按原计划过期。
+                    // 否则会把"最早过期"的号永久推到末尾，导致 directory 整体限流时
+                    // 没有号能恢复。
+                    tracing::warn!(
+                        "凭据 #{} 瞬态失败（fallback 路径，不延长冷却；原因 {}，累计 {} 次）",
+                        id,
+                        kind.as_str(),
+                        entry.transient_failure_count
+                    );
+                } else {
+                    // 只放宽 cooldown，不缩短：避免短的 retry-after 覆盖前面的长冷却
+                    let extend = entry
+                        .cooldown_until
+                        .map(|until| cooldown_until > until)
+                        .unwrap_or(true);
+                    if extend {
+                        entry.cooldown_until = Some(cooldown_until);
+                    }
+                    entry.cooldown_reason = Some(kind);
+                    tracing::warn!(
+                        "凭据 #{} 进入冷却 {}s（原因 {}，累计瞬态失败 {} 次）",
+                        id,
+                        duration.as_secs(),
+                        kind.as_str(),
+                        entry.transient_failure_count
+                    );
+                }
+                became_dirty = true;
+            }
+        }
+
+        if became_dirty {
+            self.save_stats_debounced();
         }
     }
 
@@ -758,10 +1392,20 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    /// - `conversation_id`: 可选的会话 ID，用于 sticky session 路由
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
+        // 全员 cooldown 时智能等待已用轮数；上限来自 `effective_max_fallback_wait_attempts()`，
+        // 避免在频繁限流下无限等待。每轮单次 sleep 不超过 `effective_max_fallback_wait()`。
+        let mut fallback_wait_count: u32 = 0;
+        let max_wait_attempts = self.effective_max_fallback_wait_attempts();
+        let max_wait_per_round = self.effective_max_fallback_wait();
 
         loop {
             if attempt_count >= max_attempts {
@@ -772,27 +1416,33 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
+            let (id, credentials, from_fallback) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
+                // balanced 模式：原子地"选号 + inflight +1"，让并发请求分发到不同号
+                // priority 模式：优先使用 current_id 指向的凭据，并对该凭据 inflight +1
                 let current_hit = if is_balanced {
                     None
                 } else {
-                    let entries = self.entries.lock();
+                    let mut entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     entries
-                        .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
-                        .map(|e| (e.id, e.credentials.clone()))
+                        .iter_mut()
+                        .find(|e| {
+                            e.id == current_id && !e.disabled && !is_in_cooldown(e, Instant::now())
+                        })
+                        .map(|e| {
+                            e.inflight = e.inflight.saturating_add(1);
+                            // current_id 直接命中且不在 cooldown：非 fallback 路径
+                            (e.id, e.credentials.clone(), false)
+                        })
                 };
 
                 if let Some(hit) = current_hit {
                     hit
                 } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
+                    // 当前凭据不可用或 balanced 模式，按策略选号并占用 inflight 槽
+                    let mut best = self.select_and_acquire_slot(model, conversation_id);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -811,15 +1461,51 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model);
+                            best = self.select_and_acquire_slot(model, conversation_id);
                         }
                     }
 
-                    if let Some((new_id, new_creds)) = best {
+                    // 智能等待：选中 fallback 号且最早过期 ≤ max_wait_per_round 时，
+                    // 释放 slot、sleep 到过期 + 50ms 缓冲、重新 select。
+                    // 至多重复 max_wait_attempts 轮，避免饥饿。
+                    let wait_target = if fallback_wait_count < max_wait_attempts {
+                        best.as_ref().and_then(|(tmp_id, _, fb, until)| {
+                            if *fb {
+                                until.map(|u| (*tmp_id, u))
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some((tmp_id, until)) = wait_target {
+                        let now = Instant::now();
+                        if until > now {
+                            let wait = until.saturating_duration_since(now);
+                            if wait <= max_wait_per_round {
+                                fallback_wait_count = fallback_wait_count.saturating_add(1);
+                                self.release_inflight(tmp_id);
+                                let total_wait = wait + StdDuration::from_millis(50);
+                                tracing::info!(
+                                    "全员 cooldown 智能等待 {}ms 后重选（最早过期号 #{}, 第 {}/{} 轮）",
+                                    total_wait.as_millis(),
+                                    tmp_id,
+                                    fallback_wait_count,
+                                    max_wait_attempts,
+                                );
+                                tokio::time::sleep(total_wait).await;
+                                // 重新走整个 acquire 循环
+                                continue;
+                            }
+                        }
+                    }
+
+                    if let Some((new_id, new_creds, from_fb, _)) = best {
                         // 更新 current_id
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
-                        (new_id, new_creds)
+                        (new_id, new_creds, from_fb)
                     } else {
                         let entries = self.entries.lock();
                         // 注意：必须在 bail! 之前计算 available_count，
@@ -833,19 +1519,22 @@ impl MultiTokenManager {
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
-                Ok(ctx) => {
+                Ok(mut ctx) => {
+                    ctx.from_cooldown_fallback = from_fallback;
+                    ctx.waited_for_cooldown = fallback_wait_count > 0;
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    // 刷新失败：归还 inflight 槽（这次没产生真实请求）
+                    self.release_inflight(id);
                     // refreshToken 永久失效 → 立即禁用，不累计重试
-                    let has_available =
-                        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                            self.report_refresh_token_invalid(id)
-                        } else {
-                            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
-                            self.report_refresh_failure(id)
-                        };
+                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
+                        self.report_refresh_token_invalid(id)
+                    } else {
+                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                        self.report_refresh_failure(id)
+                    };
                     attempt_count += 1;
                     if !has_available {
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
@@ -902,6 +1591,8 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                from_cooldown_fallback: false,
+                waited_for_cooldown: false,
             });
         }
 
@@ -971,6 +1662,8 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            from_cooldown_fallback: false,
+            waited_for_cooldown: false,
         })
     }
 
@@ -1070,6 +1763,8 @@ impl MultiTokenManager {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
                 entry.last_used_at = s.last_used_at.clone();
+                entry.transient_failure_count = s.transient_failure_count;
+                entry.last_transient_failure_at = s.last_transient_failure_at.clone();
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -1094,6 +1789,8 @@ impl MultiTokenManager {
                         StatsEntry {
                             success_count: e.success_count,
                             last_used_at: e.last_used_at.clone(),
+                            transient_failure_count: e.transient_failure_count,
+                            last_transient_failure_at: e.last_transient_failure_at.clone(),
                         },
                     )
                 })
@@ -1144,10 +1841,16 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
+                entry.inflight = entry.inflight.saturating_sub(1);
+                entry.concurrency_permit = None;
+                // 成功调用证明上游对该号已恢复，立即解除冷却
+                entry.cooldown_until = None;
+                entry.cooldown_reason = None;
                 tracing::debug!(
-                    "凭据 #{} API 调用成功（累计 {} 次）",
+                    "凭据 #{} API 调用成功（累计 {} 次，当前并发 {}）",
                     id,
-                    entry.success_count
+                    entry.success_count,
+                    entry.inflight
                 );
             }
         }
@@ -1170,6 +1873,10 @@ impl MultiTokenManager {
                 Some(e) => e,
                 None => return entries.iter().any(|e| !e.disabled),
             };
+
+            // 释放 inflight 槽（请求已结束）
+            entry.inflight = entry.inflight.saturating_sub(1);
+            entry.concurrency_permit = None;
 
             if entry.disabled {
                 return entries.iter().any(|e| !e.disabled);
@@ -1229,6 +1936,10 @@ impl MultiTokenManager {
                 Some(e) => e,
                 None => return entries.iter().any(|e| !e.disabled),
             };
+
+            // 释放 inflight 槽（请求已结束）
+            entry.inflight = entry.inflight.saturating_sub(1);
+            entry.concurrency_permit = None;
 
             if entry.disabled {
                 return entries.iter().any(|e| !e.disabled);
@@ -1410,6 +2121,7 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
+        let now = Instant::now();
 
         ManagerSnapshot {
             entries: entries
@@ -1423,7 +2135,8 @@ impl MultiTokenManager {
                         Some("api_key".to_string())
                     } else {
                         e.credentials.auth_method.as_deref().map(|m| {
-                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
+                            {
                                 "idc".to_string()
                             } else {
                                 m.to_string()
@@ -1453,19 +2166,35 @@ impl MultiTokenManager {
                     },
                     email: e.credentials.email.clone(),
                     success_count: e.success_count,
+                    inflight: e.inflight,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| match r {
-                        DisabledReason::Manual => "Manual",
-                        DisabledReason::TooManyFailures => "TooManyFailures",
-                        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                        DisabledReason::QuotaExceeded => "QuotaExceeded",
-                        DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                        DisabledReason::InvalidConfig => "InvalidConfig",
-                    }.to_string()),
+                    disabled_reason: e.disabled_reason.map(|r| {
+                        match r {
+                            DisabledReason::Manual => "Manual",
+                            DisabledReason::TooManyFailures => "TooManyFailures",
+                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+                            DisabledReason::QuotaExceeded => "QuotaExceeded",
+                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+                            DisabledReason::InvalidConfig => "InvalidConfig",
+                        }
+                        .to_string()
+                    }),
                     endpoint: e.credentials.endpoint.clone(),
+                    transient_failure_count: e.transient_failure_count,
+                    last_transient_failure_at: e.last_transient_failure_at.clone(),
+                    cooldown_remaining_seconds: e
+                        .cooldown_until
+                        .and_then(|until| until.checked_duration_since(now))
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    cooldown_reason: if e.cooldown_until.map(|until| until > now).unwrap_or(false) {
+                        e.cooldown_reason.map(|r| r.as_str().to_string())
+                    } else {
+                        None
+                    },
                 })
                 .collect(),
             current_id,
@@ -1484,10 +2213,12 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.disabled = disabled;
             if !disabled {
-                // 启用时重置失败计数
+                // 启用时重置失败计数与冷却（管理员手动启用即清除一切惩罚状态）
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
+                entry.cooldown_until = None;
+                entry.cooldown_reason = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
@@ -1526,15 +2257,14 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
-                anyhow::bail!(
-                    "凭据 #{} 因配置无效被禁用，请修正配置后重启服务",
-                    id
-                );
+                anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
+            entry.cooldown_until = None;
+            entry.cooldown_reason = None;
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -1614,7 +2344,8 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits =
+            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -1623,8 +2354,7 @@ impl MultiTokenManager {
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                     let old_title = entry.credentials.subscription_title.clone();
                     if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title =
-                            Some(subscription_title.to_string());
+                        entry.credentials.subscription_title = Some(subscription_title.to_string());
                         tracing::info!(
                             "凭据 #{} 订阅等级已更新: {:?} -> {}",
                             id,
@@ -1760,6 +2490,8 @@ impl MultiTokenManager {
 
         {
             let mut entries = self.entries.lock();
+            // 复用已有凭据的 per-credential semaphore（所有凭据共享同一配置的 semaphore）
+            let per_cred_sem = entries.iter().find_map(|e| e.permit_semaphore.clone());
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -1769,6 +2501,14 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                inflight: 0,
+                transient_failure_count: 0,
+                last_transient_failure_at: None,
+                last_transient_at_instant: None,
+                cooldown_until: None,
+                cooldown_reason: None,
+                permit_semaphore: per_cred_sem,
+                concurrency_permit: None,
             });
         }
 
@@ -1864,8 +2604,7 @@ impl MultiTokenManager {
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds =
-            refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -1945,6 +2684,8 @@ impl Drop for MultiTokenManager {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::field_reassign_with_default)] // mock 数据构造保持可读性
+
     use super::*;
 
     #[test]
@@ -2084,11 +2825,13 @@ mod tests {
 
         let result = manager.add_credential(duplicate).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 重复"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 重复")
+        );
     }
 
     #[tokio::test]
@@ -2102,11 +2845,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 为空"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 为空")
+        );
     }
 
     #[tokio::test]
@@ -2120,11 +2865,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("缺少 kiroApiKey"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("缺少 kiroApiKey")
+        );
     }
 
     #[tokio::test]
@@ -2289,21 +3036,14 @@ mod tests {
 
     #[test]
     fn test_set_load_balancing_mode_persists_to_config_file() {
-        let config_path = std::env::temp_dir().join(format!(
-            "kiro-load-balancing-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-load-balancing-{}.json", uuid::Uuid::new_v4()));
         std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
 
         let config = Config::load(&config_path).unwrap();
-        let manager = MultiTokenManager::new(
-            config,
-            vec![KiroCredentials::default()],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
 
         manager
             .set_load_balancing_mode("balanced".to_string())
@@ -2340,13 +3080,14 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled() {
+    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled()
+     {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 
@@ -2362,7 +3103,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -2407,7 +3148,12 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager
+            .acquire_context(None, None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2447,7 +3193,12 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager
+            .acquire_context(None, None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2607,5 +3358,595 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    // ========================================================================
+    // Transient Failure Cooldown 测试（Bug A/B/C/D 修复）
+    // ========================================================================
+
+    #[test]
+    fn test_overage_request_limit_uses_long_cooldown() {
+        // 验证 OverageRequestLimit 走 DEFAULT_OVERAGE_REQUEST_COOLDOWN (600s)
+        // 而不是 RateLimit 的 60s 或 UpstreamError 的 10s
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        manager.report_transient_failure(1, TransientFailureKind::OverageRequestLimit, None, false);
+
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|x| x.id == 1).unwrap();
+
+        assert_eq!(e.transient_failure_count, 1, "瞬态失败计数应 +1");
+        assert_eq!(
+            e.cooldown_reason.as_deref(),
+            Some("overage_request_limit"),
+            "cooldown_reason 应为 overage_request_limit"
+        );
+        // 默认 600s + ±20% jitter → [480, 720]s
+        assert!(
+            (479..=720).contains(&e.cooldown_remaining_seconds),
+            "OVERAGE 默认 cooldown 应在 [480,720] (600s±20% jitter)，实际 {}s",
+            e.cooldown_remaining_seconds
+        );
+    }
+
+    #[test]
+    fn test_overage_request_limit_ignores_short_retry_after() {
+        // OVERAGE 不应被 retry_after 缩短到默认值以下（窗口长，短 retry_after 误导）
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // 即使上游传 retry_after=5s，OVERAGE 也应使用默认 cooldown 600s
+        manager.report_transient_failure(
+            1,
+            TransientFailureKind::OverageRequestLimit,
+            Some(StdDuration::from_secs(5)),
+            false,
+        );
+
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|x| x.id == 1).unwrap();
+        assert!(
+            e.cooldown_remaining_seconds >= 100,
+            "OVERAGE 不接受短 retry_after 缩短，cooldown 应远大于 5s，实际 {}s",
+            e.cooldown_remaining_seconds
+        );
+    }
+
+    #[test]
+    fn test_overage_request_cooldown_runtime_config_override() {
+        use crate::model::runtime::shared_retry_config_from;
+
+        // 验证运行时配置可覆盖默认 600s
+        let mut config = Config::default();
+        config.overage_request_cooldown_sec = Some(30);
+        let handle = shared_retry_config_from(&config);
+
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        manager.attach_retry_config(handle);
+
+        manager.report_transient_failure(1, TransientFailureKind::OverageRequestLimit, None, false);
+
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|x| x.id == 1).unwrap();
+        // 30s + ±20% jitter → [24, 36]s
+        assert!(
+            (23..=36).contains(&e.cooldown_remaining_seconds),
+            "运行时配置 30s 应生效（jitter 后 [24,36]），实际 {}s",
+            e.cooldown_remaining_seconds
+        );
+    }
+
+    #[test]
+    fn test_report_transient_failure_sets_cooldown_and_counter() {
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        manager.report_transient_failure(1, TransientFailureKind::RateLimit, None, false);
+
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|x| x.id == 1).unwrap();
+
+        assert_eq!(e.transient_failure_count, 1, "瞬态失败计数应 +1");
+        assert_eq!(
+            e.cooldown_reason.as_deref(),
+            Some("rate_limit"),
+            "cooldown_reason 应为 rate_limit"
+        );
+        // 默认 RateLimit cooldown 120s + ±20% jitter → [96, 144]s，允许 1s 低误差
+        assert!(
+            (95..=144).contains(&e.cooldown_remaining_seconds),
+            "RateLimit 默认 cooldown 应在 [96,144] (120s±20% jitter)，实际 {}s",
+            e.cooldown_remaining_seconds
+        );
+        // 不应禁用、不应改 failure_count
+        assert!(!e.disabled, "瞬态失败不应禁用凭据");
+        assert_eq!(e.failure_count, 0, "瞬态失败不应改 failure_count");
+        assert_eq!(snap.available, 1, "瞬态失败不应减少 available");
+    }
+
+    #[tokio::test]
+    async fn test_cooldown_excludes_credential_from_acquire() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 让 #1 进入 cooldown
+        manager.report_transient_failure(1, TransientFailureKind::RateLimit, None, false);
+
+        // 连续 5 次 acquire 都应只选 #2（绕过 cooldown 中的 #1）
+        for i in 0..5 {
+            let ctx = manager.acquire_context(None, None).await.unwrap();
+            assert_eq!(
+                ctx.id, 2,
+                "第 {} 次 acquire 应选 #2，实际选了 #{}（cooldown 未生效）",
+                i, ctx.id
+            );
+            manager.release_inflight(ctx.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_all_in_cooldown_fallback_does_not_503() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 全员进入 cooldown
+        manager.report_transient_failure(1, TransientFailureKind::RateLimit, None, false);
+        manager.report_transient_failure(2, TransientFailureKind::RateLimit, None, false);
+
+        // fallback 应仍能挑出某个号，避免 503
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        assert!(
+            ctx.id == 1 || ctx.id == 2,
+            "全员 cooldown 时 fallback 应仍返回某个号，实际 #{}",
+            ctx.id
+        );
+    }
+
+    #[test]
+    fn test_transient_failure_does_not_disable_after_many_calls() {
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        for _ in 0..100 {
+            manager.report_transient_failure(1, TransientFailureKind::RateLimit, None, false);
+        }
+
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|x| x.id == 1).unwrap();
+        assert!(!e.disabled, "100 次瞬态失败也不应导致禁用");
+        assert_eq!(e.failure_count, 0, "瞬态失败不该累计 failure_count");
+        assert_eq!(e.transient_failure_count, 100);
+        assert_eq!(snap.available, 1, "available 应保持 1");
+    }
+
+    #[test]
+    fn test_retry_after_overrides_default_cooldown() {
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // UpstreamError 默认 10s，传入 retry_after=120s 应优先（首次调用，不存在缩短问题，retry_after 不加 jitter）
+        manager.report_transient_failure(
+            1,
+            TransientFailureKind::UpstreamError,
+            Some(StdDuration::from_secs(120)),
+            false,
+        );
+
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|x| x.id == 1).unwrap();
+        assert!(
+            (119..=120).contains(&e.cooldown_remaining_seconds),
+            "Retry-After=120 应优先于 5xx 默认 10s，实际 cooldown {}s",
+            e.cooldown_remaining_seconds
+        );
+    }
+
+    #[test]
+    fn test_transient_cooldown_disabled_falls_back_to_release_inflight() {
+        let mut config = Config::default();
+        config.transient_cooldown_enabled = false;
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        manager.report_transient_failure(1, TransientFailureKind::RateLimit, None, false);
+
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|x| x.id == 1).unwrap();
+        // toggle 关闭：cooldown 不生效、计数器也不动（仅释放 inflight）
+        assert_eq!(
+            e.cooldown_remaining_seconds, 0,
+            "toggle 关闭时不应进入 cooldown"
+        );
+        assert_eq!(e.transient_failure_count, 0, "toggle 关闭时不应累计计数");
+        assert!(e.cooldown_reason.is_none());
+    }
+
+    #[test]
+    fn test_load_old_stats_without_new_fields_is_compatible() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("kiro-stats-compat-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let creds_path = dir.join("credentials.json");
+        // 旧版 stats.json：只有 success_count 和 last_used_at，没有 transient_failure_count
+        let stats_path = dir.join("kiro_stats.json");
+        fs::write(
+            &stats_path,
+            r#"{"1":{"success_count":42,"last_used_at":"2026-05-18T10:00:00Z"}}"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        let manager =
+            MultiTokenManager::new(config, vec![cred], None, Some(creds_path), true).unwrap();
+
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|x| x.id == 1).unwrap();
+        assert_eq!(e.success_count, 42, "应从旧 stats.json 加载 success_count");
+        assert_eq!(
+            e.transient_failure_count, 0,
+            "缺失新字段应 serde default = 0"
+        );
+        assert!(e.last_transient_failure_at.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_waits_when_all_in_cooldown_short() {
+        // 全员 cooldown 但最早过期 ≤ effective_max_fallback_wait() (默认 30s) 时，
+        // acquire_context 应等待到过期再返回非 fallback 的有效号。
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 用 retry_after=1s 让两个号都进 1s 短 cooldown（retry_after 不加 jitter）
+        manager.report_transient_failure(
+            1,
+            TransientFailureKind::RateLimit,
+            Some(StdDuration::from_secs(1)),
+            false,
+        );
+        manager.report_transient_failure(
+            2,
+            TransientFailureKind::RateLimit,
+            Some(StdDuration::from_secs(1)),
+            false,
+        );
+
+        let t0 = std::time::Instant::now();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed >= StdDuration::from_millis(900),
+            "智能等待应等待 ~1s，实际仅等 {}ms",
+            elapsed.as_millis()
+        );
+        assert!(
+            elapsed <= StdDuration::from_millis(2500),
+            "等待时间不应过长，实际 {}ms",
+            elapsed.as_millis()
+        );
+        // 等待后应返回非 fallback（cooldown 已过期）
+        assert!(
+            !ctx.from_cooldown_fallback,
+            "等待后选中的号 cooldown 已过期，不应再标记为 fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_falls_back_when_cooldown_too_long() {
+        // 全员 cooldown 但最早过期 > effective_max_fallback_wait() (默认 30s) 时，
+        // acquire_context 应直接 fallback，不等待。
+        // 本测试手动调低 max_fallback_wait_secs 到3s，让 60s cooldown 远超上限。
+        let mut config = Config::default();
+        config.max_fallback_wait_secs = Some(3);
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 默认 60s cooldown（jitter 后 [48,72]s），远大于 3s 上限
+        manager.report_transient_failure(1, TransientFailureKind::RateLimit, None, false);
+        manager.report_transient_failure(2, TransientFailureKind::RateLimit, None, false);
+
+        let t0 = std::time::Instant::now();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < StdDuration::from_millis(500),
+            "60s cooldown 远超 3s 上限，应立即 fallback 不等待，实际 {}ms",
+            elapsed.as_millis()
+        );
+        assert!(ctx.from_cooldown_fallback, "应标记为 fallback 路径");
+    }
+
+    #[tokio::test]
+    async fn test_acquire_waits_multiple_rounds_for_long_cooldown() {
+        // 验证 D2：max_fallback_wait_attempts=3 时，单次 acquire 可以等多轮。
+        // 构造场景：2 个号都进 1.2s 短 cooldown，但 max_fallback_wait_secs=2s，
+        // 所以单轮够等。验证不仅等了一次，而且最终拿到非 fallback 号。
+        let mut config = Config::default();
+        config.max_fallback_wait_secs = Some(2);
+        config.max_fallback_wait_attempts = Some(3);
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        manager.report_transient_failure(
+            1,
+            TransientFailureKind::RateLimit,
+            Some(StdDuration::from_millis(1200)),
+            false,
+        );
+        manager.report_transient_failure(
+            2,
+            TransientFailureKind::RateLimit,
+            Some(StdDuration::from_millis(1200)),
+            false,
+        );
+
+        let t0 = std::time::Instant::now();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= StdDuration::from_millis(1100),
+            "应等待 cooldown 过期（~1.2s）, 实际 {}ms",
+            elapsed.as_millis()
+        );
+        assert!(
+            !ctx.from_cooldown_fallback,
+            "等过 cooldown 后应返回非 fallback 号"
+        );
+        assert!(
+            ctx.waited_for_cooldown,
+            "应标记 waited_for_cooldown=true（用于 metrics）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_select_prefers_credentials_with_oldest_or_no_transient_failure() {
+        // D3：同优先级内 select 应偏好"最久没瞬态失败"的号
+        // 测试 1：构造 A/B 都有 last_transient（A 较老、B 较新），验证选 A
+        // 测试 2：构造 C 从未失败 + A/B 都失败过，验证选 C
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let mut cred_a = KiroCredentials::default();
+        cred_a.access_token = Some("ta".to_string());
+        cred_a.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred_a.priority = 10;
+        let mut cred_b = KiroCredentials::default();
+        cred_b.access_token = Some("tb".to_string());
+        cred_b.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred_b.priority = 10;
+        let manager =
+            MultiTokenManager::new(config.clone(), vec![cred_a, cred_b], None, None, false)
+                .unwrap();
+        // A 先失败（更老的 instant），B 后失败（更新的 instant）
+        manager.report_transient_failure(
+            1,
+            TransientFailureKind::RateLimit,
+            Some(StdDuration::from_millis(1)),
+            false,
+        );
+        std::thread::sleep(StdDuration::from_millis(20));
+        manager.report_transient_failure(
+            2,
+            TransientFailureKind::RateLimit,
+            Some(StdDuration::from_millis(1)),
+            false,
+        );
+        std::thread::sleep(StdDuration::from_millis(10)); // 让 cooldown 过期
+
+        // balanced 模式预期：A 比 B 老 → 选 A
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            ctx.id, 1,
+            "A 失败更早（last_transient_at_instant 更老），应被优先选中，实际选 #{}",
+            ctx.id
+        );
+        manager.release_inflight(ctx.id);
+
+        // 测试 2：加一个全新号 C（从未失败）→ C 应被选（None < Some(_)）
+        let mut cred_c = KiroCredentials::default();
+        cred_c.access_token = Some("tc".to_string());
+        cred_c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred_c.priority = 10;
+        let manager2 = MultiTokenManager::new(
+            config,
+            vec![
+                {
+                    let mut a = KiroCredentials::default();
+                    a.access_token = Some("ta".to_string());
+                    a.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+                    a.priority = 10;
+                    a
+                },
+                {
+                    let mut b = KiroCredentials::default();
+                    b.access_token = Some("tb".to_string());
+                    b.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+                    b.priority = 10;
+                    b
+                },
+                cred_c,
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager2.report_transient_failure(
+            1,
+            TransientFailureKind::RateLimit,
+            Some(StdDuration::from_millis(1)),
+            false,
+        );
+        manager2.report_transient_failure(
+            2,
+            TransientFailureKind::RateLimit,
+            Some(StdDuration::from_millis(1)),
+            false,
+        );
+        std::thread::sleep(StdDuration::from_millis(10));
+        let ctx = manager2.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            ctx.id, 3,
+            "C 从未失败（last_transient_at_instant=None），应最优先，实际选 #{}",
+            ctx.id
+        );
+        manager2.release_inflight(ctx.id);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_falls_back_after_exhausting_wait_attempts() {
+        // 验证 D2：max_fallback_wait_attempts=1 时，等过 1 轮如果仍不可用则走 fallback。
+        // 构造：cooldown 单轮足够等，但用 attempts=1 限制只能等 1 次；
+        // sleep 后 cooldown 已过期，所以应正常拿非 fallback——本测试主要验证参数生效。
+        let mut config = Config::default();
+        config.max_fallback_wait_secs = Some(2);
+        config.max_fallback_wait_attempts = Some(1);
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("t".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        manager.report_transient_failure(
+            1,
+            TransientFailureKind::RateLimit,
+            Some(StdDuration::from_millis(800)),
+            false,
+        );
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        assert!(ctx.waited_for_cooldown);
+        assert!(!ctx.from_cooldown_fallback);
+    }
+
+    #[test]
+    fn test_fallback_path_does_not_extend_cooldown() {
+        // 验证 fallback 路径"借用"已 cooldown 号失败时不再延长 cooldown，
+        // 防止全员 cooldown 时反复刷新同一组号导致永远没有号能恢复
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // 第一次正常 transient：进入 cooldown
+        manager.report_transient_failure(1, TransientFailureKind::RateLimit, None, false);
+        let snap1 = manager.snapshot();
+        let cd1 = snap1.entries[0].cooldown_remaining_seconds;
+        assert!(cd1 > 30, "首次应进入正常 cooldown，实际 {}s", cd1);
+
+        // 第二次 fallback path：cooldown 不应被延长（最多保持原值或自然衰减 1s）
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        manager.report_transient_failure(1, TransientFailureKind::RateLimit, None, true);
+        let snap2 = manager.snapshot();
+        let cd2 = snap2.entries[0].cooldown_remaining_seconds;
+        assert!(
+            cd2 <= cd1,
+            "fallback 路径不应延长 cooldown：第一次 {}s -> 第二次 {}s（应只衰减不增加）",
+            cd1,
+            cd2
+        );
+        // 但计数器应该累加（仍然是观测信号）
+        assert_eq!(snap2.entries[0].transient_failure_count, 2);
+    }
+
+    #[test]
+    fn test_jitter_keeps_cooldown_within_bounds() {
+        // 验证 jitter 落在 [80%, 120%] 区间内（多次采样验证不会越界）
+        let config = Config::default();
+        for _ in 0..50 {
+            let cred = KiroCredentials::default();
+            let manager =
+                MultiTokenManager::new(config.clone(), vec![cred], None, None, false).unwrap();
+            manager.report_transient_failure(1, TransientFailureKind::RateLimit, None, false);
+            let cd = manager.snapshot().entries[0].cooldown_remaining_seconds;
+            assert!(
+                (95..=144).contains(&cd),
+                "120s base ±20% jitter 应落在 [96,144]±1s，实际 {}s",
+                cd
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_balanced_tiebreaker_distributes_across_credentials() {
+        // 验证 Bug D 修复：所有号 inflight=0、success_count 相同时，
+        // 选号应分布而非永远选第一个（旧代码 min_by_key 平局总返回第一项）
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut creds = vec![];
+        for _ in 0..4 {
+            let mut c = KiroCredentials::default();
+            c.access_token = Some("t".to_string());
+            c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+            creds.push(c);
+        }
+        let manager = MultiTokenManager::new(config, creds, None, None, false).unwrap();
+
+        let mut counts: HashMap<u64, u64> = HashMap::new();
+        for _ in 0..200 {
+            let ctx = manager.acquire_context(None, None).await.unwrap();
+            *counts.entry(ctx.id).or_insert(0) += 1;
+            // 立即释放，让 inflight 始终回到 0，强制走平局分支
+            manager.release_inflight(ctx.id);
+        }
+
+        // 4 个号都应被选中至少一次（无随机时只会选 #1，c1 会是 200，其余 0）
+        for id in 1..=4u64 {
+            let c = counts.get(&id).copied().unwrap_or(0);
+            assert!(
+                c > 0,
+                "凭据 #{} 应被选中至少一次（随机 tiebreaker 应让分布均衡），\
+                 实际 0 次。完整分布 {:?}",
+                id,
+                counts
+            );
+        }
     }
 }

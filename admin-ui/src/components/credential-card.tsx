@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Snowflake } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -49,6 +49,45 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+/** 把后端返回的 cooldown_reason 翻译成人类可读的中文标签。 */
+function formatCooldownReason(reason?: string): string {
+  switch (reason) {
+    case 'rate_limit':
+      return '限流'
+    case 'timeout':
+      return '超时'
+    case 'upstream_error':
+      return '上游错误'
+    default:
+      return reason || '冷却'
+  }
+}
+
+/**
+ * 实时倒计时 hook：
+ * 后端 30s refetch 一次，前端基于上次拿到的剩余秒数 + 本地经过时间秒级自减，
+ * 让用户能看到 "59s -> 0s" 的连续视觉，避免数据滞后。
+ */
+function useLiveCooldown(remainingSeconds: number | undefined): number {
+  // 锚点：每次 props 的 remainingSeconds 改变时重置（react-query refetch）
+  const anchorRef = useRef<{ at: number; secs: number }>({ at: Date.now(), secs: 0 })
+  const [, force] = useState(0)
+
+  useEffect(() => {
+    anchorRef.current = { at: Date.now(), secs: remainingSeconds ?? 0 }
+    force(t => t + 1)
+  }, [remainingSeconds])
+
+  useEffect(() => {
+    if (!remainingSeconds || remainingSeconds <= 0) return
+    const id = setInterval(() => force(t => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [remainingSeconds])
+
+  const elapsed = Math.floor((Date.now() - anchorRef.current.at) / 1000)
+  return Math.max(0, anchorRef.current.secs - elapsed)
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -60,6 +99,10 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+
+  const liveCooldown = useLiveCooldown(credential.cooldownRemainingSeconds)
+  const isCoolingDown = !credential.disabled && liveCooldown > 0
+  const transientFailureCount = credential.transientFailureCount ?? 0
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -162,6 +205,17 @@ export function CredentialCard({
                 {credential.disabled && credential.disabledReason && (
                   <Badge variant="outline">{credential.disabledReason}</Badge>
                 )}
+                {isCoolingDown && (
+                  <Badge
+                    variant="outline"
+                    className="border-amber-500 bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300"
+                    title={`上游${formatCooldownReason(credential.cooldownReason)}，本号将在 ${liveCooldown}s 后重新参与调度`}
+                  >
+                    <Snowflake className="h-3 w-3 mr-1" />
+                    冷却中 {liveCooldown}s
+                    <span className="ml-1 opacity-70">· {formatCooldownReason(credential.cooldownReason)}</span>
+                  </Badge>
+                )}
                 {credential.authMethod && (
                   <Badge variant="secondary">
                     {credential.authMethod === 'api_key' ? 'API Key' :
@@ -240,6 +294,24 @@ export function CredentialCard({
               <span className="text-muted-foreground">刷新失败：</span>
               <span className={credential.refreshFailureCount > 0 ? 'text-red-500 font-medium' : ''}>
                 {credential.refreshFailureCount}
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">瞬态失败：</span>
+              <span
+                className={transientFailureCount > 0 ? 'font-medium text-amber-600 dark:text-amber-400' : ''}
+                title={
+                  credential.lastTransientFailureAt
+                    ? `最近一次：${formatLastUsed(credential.lastTransientFailureAt)}`
+                    : undefined
+                }
+              >
+                {transientFailureCount}
+                {credential.lastTransientFailureAt && transientFailureCount > 0 && (
+                  <span className="text-xs text-muted-foreground ml-1">
+                    ({formatLastUsed(credential.lastTransientFailureAt)})
+                  </span>
+                )}
               </span>
             </div>
             <div>

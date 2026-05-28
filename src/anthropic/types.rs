@@ -198,6 +198,7 @@ where
         {
             Ok(Some(vec![SystemMessage {
                 text: value.to_string(),
+                cache_control: None,
             }]))
         }
 
@@ -246,6 +247,39 @@ pub struct Message {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
     pub text: String,
+    /// Anthropic prompt caching 标记。中转层不会回传给上游 Kiro（上游协议不支持），
+    /// 但会用于 prompt_cache 模块判定 cache breakpoint，让命中信号传递给客户端。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Anthropic prompt caching 控制标记
+///
+/// 规范：客户端在 system / message content block / tool 上打 `cache_control: {type: "ephemeral"}`，
+/// 表示从这条内容开始（含）的 prefix 应被缓存 5 分钟。中转层据此判断 cache breakpoint。
+///
+/// 上游 Kiro 协议不支持，本字段仅在 kiro-rs 内部使用。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub cache_type: String,
+    /// 缓存 TTL：Anthropic 支持 `"5m"`（默认）或 `"1h"`。未提供时按 5m 处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
+impl CacheControl {
+    pub fn is_ephemeral(&self) -> bool {
+        self.cache_type == "ephemeral"
+    }
+
+    /// 解析 TTL 字符串为秒数。`"1h"` → 3600，其余（含 `"5m"`/None/未知）→ 300。
+    pub fn ttl_secs(&self) -> u64 {
+        match self.ttl.as_deref() {
+            Some("1h") | Some("1H") => 3600,
+            _ => 300,
+        }
+    }
 }
 
 /// 工具定义
@@ -270,6 +304,9 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// Anthropic prompt caching 标记（同 SystemMessage）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 内容块
@@ -295,6 +332,9 @@ pub struct ContentBlock {
     pub is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ImageSource>,
+    /// Anthropic prompt caching 标记（同 SystemMessage）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 图片数据源

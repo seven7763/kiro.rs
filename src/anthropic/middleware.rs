@@ -14,6 +14,7 @@ use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::model::runtime::SharedPromptConfig;
 
+use super::prompt_cache::PromptCache;
 use super::types::ErrorResponse;
 
 /// 应用共享状态
@@ -28,6 +29,8 @@ pub struct AppState {
     pub extract_thinking: bool,
     /// 共享 Prompt 注入配置（可由 Admin API 热更新）
     pub prompt_config: SharedPromptConfig,
+    /// Prompt prefix 缓存（中转层自实现，让 cache_*_input_tokens 不再永远是 0）
+    pub prompt_cache: PromptCache,
 }
 
 impl AppState {
@@ -42,12 +45,19 @@ impl AppState {
             kiro_provider: None,
             extract_thinking,
             prompt_config,
+            prompt_cache: PromptCache::default(),
         }
     }
 
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
+        self
+    }
+
+    /// 注入自定义 PromptCache（用于热配置 / 测试）
+    pub fn with_prompt_cache(mut self, cache: PromptCache) -> Self {
+        self.prompt_cache = cache;
         self
     }
 }
