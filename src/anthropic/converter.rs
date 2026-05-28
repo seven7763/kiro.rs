@@ -111,7 +111,12 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.5".to_string())
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-7") || model_lower.contains("4.7") {
+        if model_lower.contains("4-8") || model_lower.contains("4.8") {
+            // 预埋：Kiro 上架 opus 4.8 后自动生效（上游别名预期为 claude-opus-4.8）。
+            // 上架前若有人硬请求 4.8，上游会返回"未知模型"——诚实失败，
+            // 优于静默降级到 4.6 让用户误以为在用 4.8。
+            Some("claude-opus-4.8".to_string())
+        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
             Some("claude-opus-4.7".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
@@ -160,6 +165,10 @@ pub fn canonical_anthropic_model(requested: &str) -> String {
         return "claude-sonnet-4-5-20250929".to_string();
     }
     if lower.contains("opus") {
+        if lower.contains("4-8") || lower.contains("4.8") {
+            // 预埋 opus 4.8：发布日期未知，暂用无日期 ID（上架后可补日期版本号）
+            return "claude-opus-4-8".to_string();
+        }
         if lower.contains("4-7") || lower.contains("4.7") {
             return "claude-opus-4-7-20260301".to_string();
         }
@@ -182,7 +191,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7" =>
+                || mapped == "claude-opus-4.7"
+                || mapped == "claude-opus-4.8" =>
         {
             1_000_000
         }
@@ -1131,6 +1141,68 @@ mod tests {
             map_model("claude-opus-4-20250514")
                 .unwrap()
                 .contains("opus")
+        );
+    }
+
+    /// 预埋 opus 4.8：上架后自动正确映射，且不影响 4.7/4.6/4.5 路由
+    #[test]
+    fn test_map_model_opus_4_8_preregistered() {
+        assert_eq!(
+            map_model("claude-opus-4-8"),
+            Some("claude-opus-4.8".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4.8"),
+            Some("claude-opus-4.8".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-8-thinking"),
+            Some("claude-opus-4.8".to_string())
+        );
+    }
+
+    /// 回归保护：预埋 4.8 后，现有 opus 各版本路由必须不变
+    #[test]
+    fn test_map_model_opus_existing_versions_unaffected() {
+        assert_eq!(
+            map_model("claude-opus-4-7"),
+            Some("claude-opus-4.7".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4.7"),
+            Some("claude-opus-4.7".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-6"),
+            Some("claude-opus-4.6".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-5"),
+            Some("claude-opus-4.5".to_string())
+        );
+        // 无版本号兜底仍是 4.6
+        assert_eq!(
+            map_model("claude-opus-foo"),
+            Some("claude-opus-4.6".to_string())
+        );
+    }
+
+    /// 4.8 上下文窗口预埋为 1M，canonical 名为无日期 claude-opus-4-8
+    #[test]
+    fn test_opus_4_8_context_and_canonical() {
+        assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
+        assert_eq!(
+            canonical_anthropic_model("claude-opus-4.8"),
+            "claude-opus-4-8"
+        );
+        assert_eq!(
+            canonical_anthropic_model("claude-opus-4-8-thinking"),
+            "claude-opus-4-8"
+        );
+        // 回归：4.7 canonical 不变
+        assert_eq!(
+            canonical_anthropic_model("claude-opus-4.7"),
+            "claude-opus-4-7-20260301"
         );
     }
 
