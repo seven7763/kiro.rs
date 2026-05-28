@@ -1,11 +1,14 @@
 //! Anthropic API 路由配置
 
+use std::time::Duration;
+
 use axum::{
     Router,
     extract::DefaultBodyLimit,
     middleware,
     routing::{get, post},
 };
+use tower_http::timeout::RequestBodyTimeoutLayer;
 
 use crate::kiro::provider::KiroProvider;
 use crate::model::runtime::SharedPromptConfig;
@@ -18,6 +21,12 @@ use super::{
 
 /// 请求体最大大小限制 (50MB)
 const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
+
+/// 请求体读取超时 (60s)
+///
+/// 只限制"读完客户端请求体"的时间，防慢 loris 式上传拖住连接；
+/// 不限制响应阶段，因此正常的 SSE 流式响应（可能持续数分钟）不受影响。
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 创建 Anthropic API 路由
 ///
@@ -73,6 +82,7 @@ pub fn create_router_with_provider(
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
         .layer(cors_layer())
+        .layer(RequestBodyTimeoutLayer::new(REQUEST_BODY_TIMEOUT))
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .with_state(state)
 }

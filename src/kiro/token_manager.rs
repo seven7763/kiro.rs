@@ -1424,12 +1424,21 @@ impl MultiTokenManager {
                 let current_hit = if is_balanced {
                     None
                 } else {
+                    // priority 快路径必须与 select_and_acquire_slot 做同样的 opus 订阅过滤，
+                    // 否则当 current_id 指向 FREE 号且来 opus 请求时会直接命中它，
+                    // 请求打到上游必被拒（402/403），白白浪费一次上游调用并可能误计失败。
+                    let is_opus = model
+                        .map(|m| m.to_lowercase().contains("opus"))
+                        .unwrap_or(false);
                     let mut entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     entries
                         .iter_mut()
                         .find(|e| {
-                            e.id == current_id && !e.disabled && !is_in_cooldown(e, Instant::now())
+                            e.id == current_id
+                                && !e.disabled
+                                && !is_in_cooldown(e, Instant::now())
+                                && (!is_opus || e.credentials.supports_opus())
                         })
                         .map(|e| {
                             e.inflight = e.inflight.saturating_add(1);
@@ -3838,6 +3847,68 @@ mod tests {
         assert_eq!(
             ctx.id, 3,
             "C 从未失败（last_transient_at_instant=None），应最优先，实际选 #{}",
+            ctx.id
+        );
+        manager2.release_inflight(ctx.id);
+    }
+
+    #[tokio::test]
+    async fn test_priority_fastpath_skips_free_credential_for_opus() {
+        // 回归测试：priority 模式下，即便 current_id 指向 FREE 号（不支持 opus），
+        // 来 opus 请求时也不能命中它，必须跳到支持 opus 的号。
+        // 防止 acquire_context 的 priority 快路径绕过 select_and_acquire_slot 的 opus 过滤。
+        let config = Config::default(); // 默认 priority 模式
+
+        // #1：FREE 号（current_id 默认指向第一个），不支持 opus
+        let mut free = KiroCredentials::default();
+        free.access_token = Some("free".to_string());
+        free.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        free.subscription_title = Some("KIRO FREE".to_string());
+        free.priority = 10;
+
+        // #2：PRO 号，支持 opus
+        let mut pro = KiroCredentials::default();
+        pro.access_token = Some("pro".to_string());
+        pro.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        pro.subscription_title = Some("KIRO PRO".to_string());
+        pro.priority = 10;
+
+        let manager = MultiTokenManager::new(config, vec![free, pro], None, None, false).unwrap();
+
+        // opus 请求：必须选 #2（PRO），绝不能命中 #1（FREE）
+        let ctx = manager
+            .acquire_context(Some("claude-opus-4-7"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.id, 2,
+            "opus 请求不应命中 FREE 号 #1，应跳到支持 opus 的 PRO 号 #2，实际选 #{}",
+            ctx.id
+        );
+        manager.release_inflight(ctx.id);
+
+        // 对照：用全新 manager（避免上面 opus 请求已把 current_id 移到 #2），
+        // 非 opus 请求（sonnet）priority 模式应正常命中 current_id #1（FREE 也能跑 sonnet）
+        let config2 = Config::default();
+        let mut free2 = KiroCredentials::default();
+        free2.access_token = Some("free".to_string());
+        free2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        free2.subscription_title = Some("KIRO FREE".to_string());
+        free2.priority = 10;
+        let mut pro2 = KiroCredentials::default();
+        pro2.access_token = Some("pro".to_string());
+        pro2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        pro2.subscription_title = Some("KIRO PRO".to_string());
+        pro2.priority = 10;
+        let manager2 =
+            MultiTokenManager::new(config2, vec![free2, pro2], None, None, false).unwrap();
+        let ctx = manager2
+            .acquire_context(Some("claude-sonnet-4-5"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.id, 1,
+            "非 opus 请求 priority 模式应命中 current_id #1，实际选 #{}",
             ctx.id
         );
         manager2.release_inflight(ctx.id);

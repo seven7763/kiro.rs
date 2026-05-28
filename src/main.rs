@@ -81,9 +81,15 @@ async fn main() {
 
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
-    // 获取第一个凭据用于日志显示
+    // 获取第一个凭据用于日志显示（仅打印非敏感摘要，绝不 Debug dump 明文凭据）
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
-    tracing::debug!("主凭证: {:?}", first_credentials);
+    tracing::debug!(
+        "主凭证: auth_method={:?}",
+        first_credentials
+            .auth_method
+            .as_deref()
+            .unwrap_or("default")
+    );
 
     // 获取 API Key
     let api_key = config.api_key.clone().unwrap_or_else(|| {
@@ -236,7 +242,13 @@ async fn main() {
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    // API Key 脱敏：打印一半会折损暴力破解空间且可能泄露短 key，改为首 4 + 尾 4
+    let masked_api_key = if api_key.is_ascii() && api_key.len() > 16 {
+        format!("{}...{}", &api_key[..4], &api_key[api_key.len() - 4..])
+    } else {
+        "***".to_string()
+    };
+    tracing::info!("API Key: {}", masked_api_key);
     if config.strip_system_restrictions {
         tracing::info!("系统提示词限制剥离: 已启用");
     }

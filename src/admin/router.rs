@@ -1,9 +1,13 @@
 //! Admin API 路由配置
 
 use axum::{
-    Router, middleware,
+    Router,
+    extract::DefaultBodyLimit,
+    middleware,
     routing::{delete, get, post},
 };
+use std::time::Duration;
+use tower_http::timeout::TimeoutLayer;
 
 use super::{
     handlers::{
@@ -16,6 +20,12 @@ use super::{
     },
     middleware::{AdminState, admin_auth_middleware},
 };
+
+/// Admin 请求超时（30s）：所有 admin 接口都是非流式小响应，超过即视为异常。
+const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Admin 请求体上限（1MB）：preset/system-prompt 文本远小于此，收紧防磁盘放大。
+const ADMIN_MAX_BODY_SIZE: usize = 1024 * 1024;
 
 /// 创建 Admin API 路由
 ///
@@ -83,5 +93,12 @@ pub fn create_admin_router(state: AdminState) -> Router {
             state.clone(),
             admin_auth_middleware,
         ))
+        // Admin 接口都是小 JSON 载荷、无流式响应，因此可以套完整请求超时
+        // （防慢 loris）+ 收紧 body 上限（防超大 preset/system-prompt 磁盘放大）。
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            ADMIN_REQUEST_TIMEOUT,
+        ))
+        .layer(DefaultBodyLimit::max(ADMIN_MAX_BODY_SIZE))
         .with_state(state)
 }

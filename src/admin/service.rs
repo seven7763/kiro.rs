@@ -566,6 +566,11 @@ impl AdminService {
             }
         }
 
+        // 校验自定义 content 长度（防超大载荷写入 config.json）
+        if let Some(ref content) = req.content {
+            validate_preset_content(content)?;
+        }
+
         // 1. 更新共享运行时配置，同步生成快照
         let snapshot = {
             let mut cfg = self.prompt_config.write();
@@ -658,6 +663,9 @@ impl AdminService {
                 "content 不能为空".into(),
             ));
         }
+        validate_preset_name(&req.name)?;
+        validate_preset_content(&req.content)?;
+        validate_preset_description(&req.description)?;
 
         // 不能与内置或现有 user preset id 冲突
         if crate::anthropic::prompt_presets::is_builtin(&req.id) {
@@ -701,6 +709,7 @@ impl AdminService {
             if name.trim().is_empty() {
                 return Err(AdminServiceError::InvalidCredential("name 不能为空".into()));
             }
+            validate_preset_name(name)?;
         }
         if let Some(ref content) = req.content {
             if content.trim().is_empty() {
@@ -708,6 +717,10 @@ impl AdminService {
                     "content 不能为空".into(),
                 ));
             }
+            validate_preset_content(content)?;
+        }
+        if let Some(ref description) = req.description {
+            validate_preset_description(description)?;
         }
 
         let snapshot = {
@@ -845,7 +858,9 @@ impl AdminService {
 
     /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
     fn classify_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
-        let msg = e.to_string();
+        // 先脱敏：错误信息可能回显上游响应体（含 token/client_secret 片段）。
+        // 脱敏只替换 JSON 字段值/Bearer，不影响下方中文关键词分类。
+        let msg = crate::common::redact::redact_secret_text(&e.to_string());
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
         } else {
@@ -855,7 +870,7 @@ impl AdminService {
 
     /// 分类余额查询错误（可能涉及上游 API 调用）
     fn classify_balance_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
-        let msg = e.to_string();
+        let msg = crate::common::redact::redact_secret_text(&e.to_string());
 
         // 1. 凭据不存在
         if msg.contains("不存在") {
@@ -893,7 +908,7 @@ impl AdminService {
 
     /// 分类添加凭据错误
     fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
-        let msg = e.to_string();
+        let msg = crate::common::redact::redact_secret_text(&e.to_string());
 
         // 凭据验证失败（refreshToken 无效、格式错误等）
         let is_invalid_credential = msg.contains("缺少 refreshToken")
@@ -922,7 +937,7 @@ impl AdminService {
 
     /// 分类删除凭据错误
     fn classify_delete_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
-        let msg = e.to_string();
+        let msg = crate::common::redact::redact_secret_text(&e.to_string());
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
         } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
@@ -969,6 +984,49 @@ fn validate_user_preset_id(id: &str) -> Result<(), AdminServiceError> {
         return Err(AdminServiceError::InvalidCredential(
             "preset id 不能以连字符开头或结尾".into(),
         ));
+    }
+    Ok(())
+}
+
+/// preset/system-prompt 的 name 字段最大字符数
+const MAX_PRESET_NAME_CHARS: usize = 128;
+/// preset/system-prompt 的 content 字段最大字符数
+///
+/// 这些内容会被持久化进 config.json，且每次请求都注入到 system prompt。
+/// 上限防止超大载荷造成磁盘放大 / 配置文件膨胀 / 注入成本失控。
+const MAX_PRESET_CONTENT_CHARS: usize = 64 * 1024;
+/// preset description 字段最大字符数
+const MAX_PRESET_DESC_CHARS: usize = 512;
+
+/// 校验 name 长度（按字符数，避免多字节绕过）
+fn validate_preset_name(name: &str) -> Result<(), AdminServiceError> {
+    if name.chars().count() > MAX_PRESET_NAME_CHARS {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "name 长度不能超过 {} 字符",
+            MAX_PRESET_NAME_CHARS
+        )));
+    }
+    Ok(())
+}
+
+/// 校验 content 长度（按字符数）
+fn validate_preset_content(content: &str) -> Result<(), AdminServiceError> {
+    if content.chars().count() > MAX_PRESET_CONTENT_CHARS {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "content 长度不能超过 {} 字符",
+            MAX_PRESET_CONTENT_CHARS
+        )));
+    }
+    Ok(())
+}
+
+/// 校验 description 长度（按字符数）
+fn validate_preset_description(desc: &str) -> Result<(), AdminServiceError> {
+    if desc.chars().count() > MAX_PRESET_DESC_CHARS {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "description 长度不能超过 {} 字符",
+            MAX_PRESET_DESC_CHARS
+        )));
     }
     Ok(())
 }
@@ -1028,6 +1086,24 @@ mod tests {
                 id
             );
         }
+    }
+
+    /// name/content/description 长度上限
+    #[test]
+    fn validate_preset_field_length_limits() {
+        // name：边界内通过，超界拒绝（按字符数，多字节也算 1 字符）
+        assert!(validate_preset_name(&"a".repeat(MAX_PRESET_NAME_CHARS)).is_ok());
+        assert!(validate_preset_name(&"a".repeat(MAX_PRESET_NAME_CHARS + 1)).is_err());
+        assert!(validate_preset_name(&"中".repeat(MAX_PRESET_NAME_CHARS + 1)).is_err());
+
+        // content：边界内通过，超界拒绝
+        assert!(validate_preset_content(&"a".repeat(MAX_PRESET_CONTENT_CHARS)).is_ok());
+        assert!(validate_preset_content(&"a".repeat(MAX_PRESET_CONTENT_CHARS + 1)).is_err());
+
+        // description：边界内通过，超界拒绝；空串永远 ok
+        assert!(validate_preset_description("").is_ok());
+        assert!(validate_preset_description(&"a".repeat(MAX_PRESET_DESC_CHARS)).is_ok());
+        assert!(validate_preset_description(&"a".repeat(MAX_PRESET_DESC_CHARS + 1)).is_err());
     }
 
     /// 路径穿越/控制字符（被 [a-z0-9_-] 白名单自动拦截）

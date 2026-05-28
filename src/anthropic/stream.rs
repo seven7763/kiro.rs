@@ -2,7 +2,7 @@
 //!
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use serde_json::json;
@@ -274,7 +274,11 @@ pub struct SseStateManager {
     /// message_delta 是否已发送
     message_delta_sent: bool,
     /// 活跃的内容块状态
-    active_blocks: HashMap<i32, BlockState>,
+    ///
+    /// 用 `BTreeMap` 而非 `HashMap`：关闭多个块时按 index 升序迭代发送
+    /// `content_block_stop`，保证符合 Anthropic SSE 协议的块有序关闭要求
+    /// （严格客户端会因先收到 index:1 再收到 index:0 的 stop 而报错）。
+    active_blocks: BTreeMap<i32, BlockState>,
     /// 消息是否已结束
     message_ended: bool,
     /// 下一个块索引
@@ -296,7 +300,7 @@ impl SseStateManager {
         Self {
             message_started: false,
             message_delta_sent: false,
-            active_blocks: HashMap::new(),
+            active_blocks: BTreeMap::new(),
             message_ended: false,
             next_block_index: 0,
             stop_reason: None,
