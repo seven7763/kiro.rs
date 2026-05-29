@@ -899,6 +899,17 @@ async fn handle_non_stream_request(
                         {
                             stop_reason = "max_tokens".to_string();
                         }
+                        Event::Unknown {
+                            event_type,
+                            payload_preview,
+                        } => {
+                            // 非流式路径同样记录未处理事件（如 reasoningContentEvent）
+                            tracing::warn!(
+                                "收到未处理的上游事件(非流式): event_type={} payload_preview={:?}",
+                                event_type,
+                                payload_preview
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -918,9 +929,19 @@ async fn handle_non_stream_request(
     let mut content: Vec<serde_json::Value> = Vec::new();
 
     if thinking_enabled {
-        // 从完整文本中提取 thinking 块
-        let (thinking, remaining_text) =
+        // 从完整文本中提取 thinking 块。
+        // 块顺序与流式路径保持一致：<thinking> 之前的正文 → thinking → 之后的正文。
+        let (before_text, thinking, remaining_text) =
             super::stream::extract_thinking_from_complete_text(&text_content);
+
+        if let Some(before) = before_text {
+            if !before.trim().is_empty() {
+                content.push(json!({
+                    "type": "text",
+                    "text": before
+                }));
+            }
+        }
 
         if let Some(thinking_text) = thinking {
             content.push(json!({

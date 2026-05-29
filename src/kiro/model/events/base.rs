@@ -71,8 +71,13 @@ pub enum Event {
     Metering(()),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
-    /// 未知事件 (保留原始帧数据)
-    Unknown {},
+    /// 未知事件 (保留事件类型与 payload 预览，便于发现上游新增事件如 reasoningContentEvent)
+    Unknown {
+        /// 上游事件类型字符串（来自 frame 的 :event-type header）
+        event_type: String,
+        /// payload 文本预览（截断，便于排查）
+        payload_preview: String,
+    },
     /// 服务端错误
     Error {
         /// 错误代码
@@ -121,7 +126,16 @@ impl Event {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
             }
-            EventType::Unknown => Ok(Self::Unknown {}),
+            EventType::Unknown => {
+                // 保留事件类型与 payload 预览：上游可能新增 reasoningContentEvent 等事件，
+                // 静默丢弃会导致 thinking 内容丢失且无从排查。
+                let payload = frame.payload_as_str();
+                let preview: String = payload.chars().take(256).collect();
+                Ok(Self::Unknown {
+                    event_type: event_type_str.to_string(),
+                    payload_preview: preview,
+                })
+            }
         }
     }
 

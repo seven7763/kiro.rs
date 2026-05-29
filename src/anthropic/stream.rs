@@ -175,12 +175,19 @@ fn find_real_thinking_start_tag(buffer: &str) -> Option<usize> {
 /// 非流式场景下文本已完整，无需处理跨 chunk 分割问题。
 ///
 /// # 返回值
-/// - `(Some(thinking_content), remaining_text)` — 检测到有效 thinking 块
-/// - `(None, original_text)` — 未检测到，原样返回
-pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>, String) {
+/// `(before_text, thinking_content, after_text)`：
+/// - `before_text` — `<thinking>` 之前的非空白正文（与流式一致地放在 thinking 块**之前**）；
+///   纯空白则为 `None`
+/// - `thinking_content` — 检测到的 thinking 内容；未检测到为 `None`
+/// - `after_text` — thinking 块之后的剩余文本
+///
+/// 未检测到有效 thinking 块时返回 `(None, None, original_text)`。
+pub(crate) fn extract_thinking_from_complete_text(
+    text: &str,
+) -> (Option<String>, Option<String>, String) {
     let start_pos = match find_real_thinking_start_tag(text) {
         Some(pos) => pos,
-        None => return (None, text.to_string()),
+        None => return (None, None, text.to_string()),
     };
 
     let before = &text[..start_pos];
@@ -197,24 +204,26 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
         (&after_open[..end_pos], after_open[after_tag..].trim_start())
     } else {
         // 找不到有效的结束标签，不做提取
-        return (None, text.to_string());
+        return (None, None, text.to_string());
     };
 
     // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
     let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
 
-    // 组装剩余文本：跳过纯空白的 before 部分
-    let mut remaining = String::new();
-    if !before.trim().is_empty() {
-        remaining.push_str(before);
-    }
-    remaining.push_str(text_after);
-
-    if thinking_content.is_empty() {
-        (None, remaining)
+    // before 文本：跳过纯空白部分，放在 thinking 块之前（与流式 process_content_with_thinking 一致）
+    let before_text = if before.trim().is_empty() {
+        None
     } else {
-        (Some(thinking_content.to_string()), remaining)
-    }
+        Some(before.to_string())
+    };
+
+    let thinking = if thinking_content.is_empty() {
+        None
+    } else {
+        Some(thinking_content.to_string())
+    };
+
+    (before_text, thinking, text_after.to_string())
 }
 
 /// SSE 事件
@@ -709,6 +718,19 @@ impl StreamContext {
                     self.state_manager.set_stop_reason("max_tokens");
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                Vec::new()
+            }
+            Event::Unknown {
+                event_type,
+                payload_preview,
+            } => {
+                // 上游出现我们尚未处理的事件类型。重点关注 reasoningContentEvent：
+                // 若上游改用原生 reasoning 事件发 thinking，纯文本协议会漏接，需扩展解析。
+                tracing::warn!(
+                    "收到未处理的上游事件: event_type={} payload_preview={:?}",
+                    event_type,
+                    payload_preview
+                );
                 Vec::new()
             }
             _ => Vec::new(),
@@ -1650,6 +1672,37 @@ mod tests {
             find_real_thinking_start_tag("about \"<thinking>\" and '<thinking>' then<thinking>"),
             Some(40)
         );
+    }
+
+    #[test]
+    fn test_extract_thinking_before_text_goes_before_thinking() {
+        // H2 回归：<thinking> 之前的正文应作为独立 before_text 返回（与流式块顺序一致），
+        // 而不是被拼到 thinking 之后的 remaining 里。
+        let input = "前置正文<thinking>\n推理内容</thinking>\n\n最终答案";
+        let (before, thinking, after) = extract_thinking_from_complete_text(input);
+        assert_eq!(before.as_deref(), Some("前置正文"), "before 应单独返回");
+        assert_eq!(thinking.as_deref(), Some("推理内容"));
+        assert_eq!(after, "最终答案");
+    }
+
+    #[test]
+    fn test_extract_thinking_blank_before_is_none() {
+        // 纯空白的 before（如 adaptive 模式的 \n\n）应为 None，不产生空 text 块
+        let input = "\n\n<thinking>\n推理</thinking>\n\n答案";
+        let (before, thinking, after) = extract_thinking_from_complete_text(input);
+        assert_eq!(before, None, "纯空白 before 应为 None");
+        assert_eq!(thinking.as_deref(), Some("推理"));
+        assert_eq!(after, "答案");
+    }
+
+    #[test]
+    fn test_extract_thinking_no_tag_returns_original() {
+        // 无 thinking 标签时原样返回，before/thinking 均为 None
+        let input = "纯文本没有思考标签";
+        let (before, thinking, after) = extract_thinking_from_complete_text(input);
+        assert_eq!(before, None);
+        assert_eq!(thinking, None);
+        assert_eq!(after, "纯文本没有思考标签");
     }
 
     #[test]
