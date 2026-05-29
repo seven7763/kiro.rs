@@ -57,67 +57,6 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(raw))
 }
 
-/// 判断成功响应（2xx）是否其实是"伪装成 200 的 AWS 错误信封"。
-///
-/// Kiro/CodeWhisperer 偶尔返回 HTTP 200 但 body 是 `application/json` 的 AWS 异常
-/// （ThrottlingException / InternalServerException 等）。若不识别，会把 JSON 当
-/// event-stream 喂给解码器，最终报一个误导性的 "prelude 解析失败"，真实的上游错误
-/// 被掩盖、且不会触发重试/切号。
-///
-/// 仅依据 **Content-Type header**（无需消费 body）：正常成功流是 event-stream，
-/// 只有当 Content-Type 明确为 JSON/text 时才认为是伪装错误，需进一步消费 body 分类。
-fn is_masked_error_response(response: &reqwest::Response) -> bool {
-    match response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-    {
-        // 正常 event-stream 成功响应
-        Some(ct) if ct.contains("eventstream") => false,
-        // 明确是 JSON：伪装错误
-        Some(ct) if ct.contains("json") => true,
-        // 其他/缺失：保守认为是正常流（避免误伤未知但合法的成功响应）
-        _ => false,
-    }
-}
-
-/// 从 AWS 异常信封 body 提取异常类型名，并判断是否可重试。
-///
-/// 异常类型可能在 JSON 的 `__type`/`type`/`code` 字段，或形如 `Throttling#...`，
-/// 统一 strip `#` 后缀与 `:` 后缀。可重试白名单参考 AWS SDK 通用瞬态异常。
-fn classify_masked_aws_error(body: &str) -> (Option<String>, bool) {
-    let exc_type = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            ["__type", "type", "code"]
-                .iter()
-                .find_map(|k| v.get(*k).and_then(|s| s.as_str()).map(String::from))
-        })
-        .map(|t| {
-            // strip "ns#Name" 的命名空间前缀 和 "Name:msg" 的后缀
-            t.rsplit('#')
-                .next()
-                .unwrap_or(&t)
-                .split(':')
-                .next()
-                .unwrap_or(&t)
-                .to_string()
-        });
-
-    let retryable = matches!(
-        exc_type.as_deref(),
-        Some(
-            "ThrottlingException"
-                | "TooManyRequestsException"
-                | "ServiceUnavailableException"
-                | "InternalServerException"
-                | "InternalFailureException"
-                | "InternalServerError"
-        )
-    );
-    (exc_type, retryable)
-}
-
 /// 上游 `ListAvailableModels` 返回的单个模型元数据（取我们关心的字段）。
 #[derive(Debug, Clone)]
 pub struct UpstreamModel {
@@ -809,43 +748,6 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                // 防伪装错误：上游偶尔返回 200 + JSON 异常信封（ThrottlingException 等）。
-                // 仅当 Content-Type 明确为 JSON 时才消费 body 分类，正常 event-stream 不受影响。
-                if is_masked_error_response(&response) {
-                    let body = response.text().await.unwrap_or_default();
-                    let (exc_type, retryable) = classify_masked_aws_error(&body);
-                    if retryable {
-                        tracing::warn!(
-                            "上游返回 200 但实为可重试异常 {:?}（尝试 {}/{}），按瞬态失败处理: {}",
-                            exc_type,
-                            attempt + 1,
-                            max_retries,
-                            crate::common::redact::redact_secret_text(&body)
-                        );
-                        self.token_manager.report_transient_failure(
-                            ctx.id,
-                            TransientFailureKind::UpstreamError,
-                            None,
-                            ctx.from_cooldown_fallback,
-                        );
-                        last_error = Some(anyhow::anyhow!(
-                            "上游 200 伪装错误 {:?}: {}",
-                            exc_type,
-                            crate::common::redact::redact_secret_text(&body)
-                        ));
-                        if attempt + 1 < max_retries {
-                            sleep(Self::retry_delay(attempt, RetryReason::SwitchCredential)).await;
-                        }
-                        continue;
-                    }
-                    // 不可重试的伪装错误：释放槽位并明确失败（避免喂给解码器报误导性错误）
-                    self.token_manager.release_inflight(ctx.id);
-                    anyhow::bail!(
-                        "上游 200 但返回不可重试异常 {:?}: {}",
-                        exc_type,
-                        crate::common::redact::redact_secret_text(&body)
-                    );
-                }
                 self.token_manager.report_success(ctx.id);
                 return Ok(response);
             }
@@ -1076,42 +978,6 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                // 防伪装错误：上游偶尔返回 200 + JSON 异常信封（ThrottlingException 等）。
-                // 仅当 Content-Type 明确为 JSON 时才消费 body 分类，正常 event-stream 不受影响。
-                if is_masked_error_response(&response) {
-                    let body = response.text().await.unwrap_or_default();
-                    let (exc_type, retryable) = classify_masked_aws_error(&body);
-                    if retryable {
-                        tracing::warn!(
-                            "上游返回 200 但实为可重试异常 {:?}（尝试 {}/{}），按瞬态失败处理: {}",
-                            exc_type,
-                            attempt + 1,
-                            max_retries,
-                            crate::common::redact::redact_secret_text(&body)
-                        );
-                        self.token_manager.report_transient_failure(
-                            ctx.id,
-                            TransientFailureKind::UpstreamError,
-                            None,
-                            ctx.from_cooldown_fallback,
-                        );
-                        last_error = Some(anyhow::anyhow!(
-                            "上游 200 伪装错误 {:?}: {}",
-                            exc_type,
-                            crate::common::redact::redact_secret_text(&body)
-                        ));
-                        if attempt + 1 < max_retries {
-                            sleep(Self::retry_delay(attempt, RetryReason::SwitchCredential)).await;
-                        }
-                        continue;
-                    }
-                    self.token_manager.release_inflight(ctx.id);
-                    anyhow::bail!(
-                        "上游 200 但返回不可重试异常 {:?}: {}",
-                        exc_type,
-                        crate::common::redact::redact_secret_text(&body)
-                    );
-                }
                 self.token_manager.report_success(ctx.id);
                 // 绑定 conversation_id 到该凭据（sticky session）
                 if let Some(ref cid) = conversation_id {
@@ -1379,66 +1245,6 @@ pub(crate) enum RetryReason {
     SwitchCredential,
     /// 网络层错误（连接失败/超时），可能是链路抖动 → 指数退避
     Network,
-}
-
-#[cfg(test)]
-mod masked_error_tests {
-    use super::classify_masked_aws_error;
-
-    #[test]
-    fn throttling_exception_is_retryable() {
-        let body = r#"{"__type":"ThrottlingException","message":"Rate exceeded"}"#;
-        let (t, retryable) = classify_masked_aws_error(body);
-        assert_eq!(t.as_deref(), Some("ThrottlingException"));
-        assert!(retryable);
-    }
-
-    #[test]
-    fn internal_server_exception_is_retryable() {
-        let body = r#"{"__type":"InternalServerException"}"#;
-        let (_, retryable) = classify_masked_aws_error(body);
-        assert!(retryable);
-    }
-
-    #[test]
-    fn strips_namespace_prefix_and_msg_suffix() {
-        // "ns#Name:msg" 形式应被规整为 "Name"
-        let body = r#"{"__type":"com.amazon.coral.service#ThrottlingException:too fast"}"#;
-        let (t, retryable) = classify_masked_aws_error(body);
-        assert_eq!(t.as_deref(), Some("ThrottlingException"));
-        assert!(retryable);
-    }
-
-    #[test]
-    fn validation_exception_not_retryable() {
-        let body = r#"{"__type":"ValidationException","message":"bad input"}"#;
-        let (t, retryable) = classify_masked_aws_error(body);
-        assert_eq!(t.as_deref(), Some("ValidationException"));
-        assert!(!retryable, "ValidationException 不应重试");
-    }
-
-    #[test]
-    fn unparseable_body_is_not_retryable() {
-        let (t, retryable) = classify_masked_aws_error("not json at all");
-        assert_eq!(t, None);
-        assert!(!retryable);
-    }
-
-    #[test]
-    fn falls_back_to_type_and_code_fields() {
-        assert_eq!(
-            classify_masked_aws_error(r#"{"code":"ServiceUnavailableException"}"#)
-                .0
-                .as_deref(),
-            Some("ServiceUnavailableException")
-        );
-        assert_eq!(
-            classify_masked_aws_error(r#"{"type":"TooManyRequestsException"}"#)
-                .0
-                .as_deref(),
-            Some("TooManyRequestsException")
-        );
-    }
 }
 
 #[cfg(test)]
