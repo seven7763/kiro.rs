@@ -23,7 +23,6 @@ use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::interval;
-use uuid::Uuid;
 
 use super::converter::{ConversionError, canonical_anthropic_model, convert_request_with_options};
 use super::middleware::AppState;
@@ -480,6 +479,17 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+
+    // 客户端可见的 input_tokens 口径：在注入自定义 system prompt（pentest preset 等）之前
+    // 按"客户端实际发送的内容"计数。注入是中转层实现细节，不应转嫁到客户端可见 usage，
+    // 否则客户端发 1 个字也会看到几百 token（注入开销）。与 /count_tokens 端点同口径。
+    let client_input_tokens = saturating_to_i32(token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ));
+
     // 注入自定义系统提示词
     inject_system_prompt(&mut payload, &state.prompt_config);
 
@@ -585,7 +595,11 @@ pub async fn post_messages(
     // 客户端可见的 input_tokens 应该剔除 cache_read + cache_creation 两部分
     // —— Anthropic 协议规定 input_tokens / cache_creation_input_tokens / cache_read_input_tokens
     // 三字段互斥不重叠。下游计费系统（如 sub2api）会按三者独立计价相加，重叠会导致溢价。
-    let input_tokens_for_client = (input_tokens
+    //
+    // 基数用 client_input_tokens（注入前的纯客户端口径），而非 input_tokens（含注入的
+    // pentest preset）。这样客户端看到的 input + cache 三字段和 = 它实际发送的内容，
+    // 不暴露中转层注入开销，与 cctest 等检测工具的预期一致。
+    let input_tokens_for_client = (client_input_tokens
         - cache_decision.cache_read_input_tokens
         - cache_decision.cache_creation_input_tokens)
         .max(0);
@@ -610,6 +624,7 @@ pub async fn post_messages(
             tool_name_map,
             cache_decision.cache_creation_input_tokens,
             cache_decision.cache_read_input_tokens,
+            payload.max_tokens,
         )
         .await
     } else {
@@ -624,6 +639,7 @@ pub async fn post_messages(
             tool_name_map,
             cache_decision.cache_creation_input_tokens,
             cache_decision.cache_read_input_tokens,
+            payload.max_tokens,
         )
         .await
     }
@@ -639,9 +655,10 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     cache_creation_input_tokens: i32,
     cache_read_input_tokens: i32,
+    max_output_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let (response, record) = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -651,6 +668,9 @@ async fn handle_stream_request(
         StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
     ctx.cache_creation_input_tokens = cache_creation_input_tokens;
     ctx.cache_read_input_tokens = cache_read_input_tokens;
+    ctx.record = Some(record);
+    // 客户端输出预算（max_tokens）：Kiro 上游无限长字段，由本层累计 output 到顶截断断流
+    ctx.set_max_output_tokens(max_output_tokens);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -725,6 +745,23 @@ fn create_sse_stream(
                                 }
                             }
 
+                            // 输出预算耗尽：已截断当前 delta，立即收尾并断开上游流。
+                            // 设 finished=true 让下一次 poll 返回 None，drop body_stream 即关闭
+                            // 上游连接，避免为客户端收不到的内容继续付费（参考 kirocc）。
+                            if ctx.budget_exceeded {
+                                events.extend(ctx.generate_final_events());
+                                ctx.log_completion();
+                                tracing::info!(
+                                    output_tokens = ctx.output_tokens,
+                                    "输出达 max_tokens 预算，主动截断并断开上游流"
+                                );
+                                let bytes: Vec<Result<Bytes, Infallible>> = events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                            }
+
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
@@ -784,10 +821,11 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     cache_creation_input_tokens: i32,
     cache_read_input_tokens: i32,
+    max_output_tokens: i32,
 ) -> Response {
     let start_time = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let (response, record) = match provider.call_api(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -820,8 +858,9 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
-    // 从 contextUsageEvent 计算的实际输入 tokens
-    let mut context_input_tokens: Option<i32> = None;
+    // 收集 reasoningContentEvent 的 thinking 内容
+    let mut thinking_content = String::new();
+    let mut thinking_signature: Option<String> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -882,22 +921,35 @@ async fn handle_non_stream_request(
                             let actual_input_tokens = (pct * (window_size as f64) / 100.0)
                                 .clamp(0.0, i32::MAX as f64)
                                 as i32;
-                            context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if pct >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
-                            tracing::debug!(
-                                "收到 contextUsageEvent: {}% (clamped from {}), 计算 input_tokens: {}",
-                                pct,
-                                context_usage.context_usage_percentage,
-                                actual_input_tokens
+                            // 探针：token 双计根因定位（非流式路径），与流式同口径
+                            tracing::warn!(
+                                target: "kiro::probe::context_usage",
+                                model = %model,
+                                raw_pct = context_usage.context_usage_percentage,
+                                clamped_pct = pct,
+                                window_size = window_size,
+                                derived_context_input = actual_input_tokens,
+                                local_input_after_cache = input_tokens,
+                                cache_creation = cache_creation_input_tokens,
+                                cache_read = cache_read_input_tokens,
+                                "contextUsageEvent 探针（非流式，token 双计根因定位）"
                             );
                         }
                         Event::Exception { exception_type, .. }
                             if exception_type == "ContentLengthExceededException" =>
                         {
                             stop_reason = "max_tokens".to_string();
+                        }
+                        Event::ReasoningContent(reasoning) => {
+                            if let Some(text) = &reasoning.text {
+                                thinking_content.push_str(text);
+                            } else if let Some(sig) = &reasoning.signature {
+                                thinking_signature = Some(sig.clone());
+                            }
                         }
                         Event::Unknown {
                             event_type,
@@ -925,36 +977,76 @@ async fn handle_non_stream_request(
         stop_reason = "tool_use".to_string();
     }
 
+    // 输出预算（客户端 max_tokens）：Kiro 上游无限长字段，非流式整体响应已收齐，
+    // 在此把 thinking + text 总输出截断到预算内，避免客户端按 max_tokens 校验后 abort。
+    // thinking 与 text 共享预算（与流式、与 Claude Code 客户端口径一致）：先扣 thinking，
+    // text 用剩余配额。工具调用不截断（截断 JSON 会破坏参数）。
+    if max_output_tokens > 0 {
+        use super::stream::{estimate_tokens, truncate_text_to_token_budget};
+        let thinking_tokens = if thinking_content.is_empty() {
+            0
+        } else {
+            estimate_tokens(&thinking_content)
+        };
+        if thinking_tokens >= max_output_tokens {
+            // thinking 已吃满预算：截断 thinking，正文清空
+            thinking_content = truncate_text_to_token_budget(&thinking_content, max_output_tokens);
+            text_content.clear();
+            stop_reason = "max_tokens".to_string();
+        } else {
+            let text_budget = max_output_tokens - thinking_tokens;
+            if estimate_tokens(&text_content) > text_budget {
+                text_content = truncate_text_to_token_budget(&text_content, text_budget);
+                stop_reason = "max_tokens".to_string();
+            }
+        }
+    }
+
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
     if thinking_enabled {
-        // 从完整文本中提取 thinking 块。
-        // 块顺序与流式路径保持一致：<thinking> 之前的正文 → thinking → 之后的正文。
-        let (before_text, thinking, remaining_text) =
-            super::stream::extract_thinking_from_complete_text(&text_content);
-
-        if let Some(before) = before_text {
-            if !before.trim().is_empty() {
-                content.push(json!({
-                    "type": "text",
-                    "text": before
-                }));
-            }
-        }
-
-        if let Some(thinking_text) = thinking {
+        if !thinking_content.is_empty() {
+            // 4.8+ 路径：thinking 通过 reasoningContentEvent 独立传输
             content.push(json!({
                 "type": "thinking",
-                "thinking": thinking_text
+                "thinking": thinking_content,
+                "signature": thinking_signature.unwrap_or_default()
             }));
-        }
+            if !text_content.is_empty() {
+                content.push(json!({
+                    "type": "text",
+                    "text": text_content
+                }));
+            }
+        } else {
+            // 旧路径：thinking 嵌入在 assistantResponseEvent 的 <thinking> 标签中
+            let (before_text, thinking, remaining_text) =
+                super::stream::extract_thinking_from_complete_text(&text_content);
 
-        if !remaining_text.is_empty() {
-            content.push(json!({
-                "type": "text",
-                "text": remaining_text
-            }));
+            if let Some(before) = before_text {
+                if !before.trim().is_empty() {
+                    content.push(json!({
+                        "type": "text",
+                        "text": before
+                    }));
+                }
+            }
+
+            if let Some(thinking_text) = thinking {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": thinking_text,
+                    "signature": super::stream::generate_fake_signature_for_model(model)
+                }));
+            }
+
+            if !remaining_text.is_empty() {
+                content.push(json!({
+                    "type": "text",
+                    "text": remaining_text
+                }));
+            }
         }
     } else if !text_content.is_empty() {
         content.push(json!({
@@ -968,34 +1060,48 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 使用从 contextUsageEvent 计算的 input_tokens（"全量"），再扣去 cache_read + cache_creation 让
-    // 客户端看到的三个字段（input_tokens / cache_creation_input_tokens / cache_read_input_tokens）
-    // 互斥不重叠 —— 这是 Anthropic 官方协议语义，下游计费系统（如 sub2api）会按三者独立计价相加，
-    // 若不扣 cache_creation 会被 sub2api 重复算一次 input_price，导致 MISS 时溢出 ~25%。
-    //
-    // 注：handler 入口 input_tokens 参数已扣过 cache_read + cache_creation（input_tokens_for_client），
-    // 所以 unwrap_or 回退分支需要"反加"两者得到全量，再统一减得到非缓存 input。
-    let total_input_tokens = context_input_tokens
-        .unwrap_or(input_tokens + cache_read_input_tokens + cache_creation_input_tokens);
-    let final_input_tokens =
-        (total_input_tokens - cache_read_input_tokens - cache_creation_input_tokens).max(0);
+    // 客户端可见的 input_tokens：用 input_tokens 参数（注入前纯客户端口径，已扣 cache）。
+    // 不再用 context_input_tokens 反推——那是上游真实收到的全量（含 Kiro 自带 agent prompt
+    // + 注入的 preset），客户端发 1 个字也会看到几千 token，被检测判为用量异常。
+    let final_input_tokens = input_tokens.max(0);
 
     // 构建 Anthropic 响应
+    // 字段对齐官方 API（jp.pincc.ai 实测）：stop_details、usage.cache_creation/iterations/
+    // output_tokens_details/inference_geo、顶层 context_management。
     let response_body = json!({
-        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "model": canonical_anthropic_model(model),
+        "id": super::stream::generate_message_id(),
         "type": "message",
         "role": "assistant",
         "content": content,
-        "model": canonical_anthropic_model(model),
         "stop_reason": stop_reason,
         "stop_sequence": null,
+        "stop_details": null,
         "usage": {
             "input_tokens": final_input_tokens,
             "cache_creation_input_tokens": cache_creation_input_tokens,
             "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": cache_creation_input_tokens.max(0),
+                "ephemeral_1h_input_tokens": 0
+            },
+            "iterations": [{
+                "input_tokens": final_input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_input_tokens": cache_read_input_tokens,
+                "cache_creation_input_tokens": cache_creation_input_tokens,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": cache_creation_input_tokens.max(0),
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "type": "message"
+            }],
             "output_tokens": output_tokens,
-            "service_tier": "standard"
-        }
+            "output_tokens_details": { "thinking_tokens": 0 },
+            "service_tier": "standard",
+            "inference_geo": "not_available"
+        },
+        "context_management": { "applied_edits": [] }
     });
 
     // 记录请求完成日志（含 token 用量与耗时）
@@ -1008,6 +1114,13 @@ async fn handle_non_stream_request(
         stop_reason = %stop_reason,
         elapsed_ms = start_time.elapsed().as_millis() as u64,
         "请求处理完成（非流式）"
+    );
+
+    // 把最终 token 回填到 metrics（与客户端可见 usage 口径一致）
+    record.update_tokens(
+        Some(final_input_tokens.max(0) as u32),
+        Some(output_tokens.max(0) as u32),
+        Some(cache_read_input_tokens.max(0) as u32),
     );
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -1311,6 +1424,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             cache_decision.cache_creation_input_tokens,
             cache_decision.cache_read_input_tokens,
+            payload.max_tokens,
         )
         .await
     } else {
@@ -1325,6 +1439,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             cache_decision.cache_creation_input_tokens,
             cache_decision.cache_read_input_tokens,
+            payload.max_tokens,
         )
         .await
     }
@@ -1343,9 +1458,10 @@ async fn handle_stream_request_buffered(
     tool_name_map: std::collections::HashMap<String, String>,
     cache_creation_input_tokens: i32,
     cache_read_input_tokens: i32,
+    max_output_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let (response, record) = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -1359,6 +1475,9 @@ async fn handle_stream_request_buffered(
     );
     ctx.cache_creation_input_tokens = cache_creation_input_tokens;
     ctx.cache_read_input_tokens = cache_read_input_tokens;
+    ctx.set_record(record);
+    // 客户端输出预算（max_tokens）：到顶截断并提前断开上游
+    ctx.set_max_output_tokens(max_output_tokens);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
@@ -1433,6 +1552,18 @@ fn create_buffered_sse_stream(
                                             tracing::warn!("解码事件失败: {}", e);
                                         }
                                     }
+                                }
+
+                                // 输出预算耗尽：收尾并断开上游流（drop body_stream 关连接）。
+                                if ctx.budget_exceeded() {
+                                    let all_events = ctx.finish_and_get_all_events();
+                                    ctx.log_completion();
+                                    tracing::info!("输出达 max_tokens 预算，主动截断并断开上游流（缓冲模式）");
+                                    let bytes: Vec<Result<Bytes, Infallible>> = all_events
+                                        .into_iter()
+                                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                        .collect();
+                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
                                 }
                                 // 继续读取下一个 chunk，不发送任何数据
                             }

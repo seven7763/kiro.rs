@@ -679,8 +679,8 @@ pub struct MultiTokenManager {
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
-    /// Token 刷新锁，确保同一时间只有一个刷新操作
-    refresh_lock: TokioMutex<()>,
+    /// Token 刷新锁，per-credential 避免跨凭据阻塞
+    refresh_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
@@ -880,7 +880,7 @@ impl MultiTokenManager {
             proxy,
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
-            refresh_lock: TokioMutex::new(()),
+            refresh_locks: Mutex::new(HashMap::new()),
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
@@ -1609,8 +1609,9 @@ impl MultiTokenManager {
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
 
         let creds = if needs_refresh {
-            // 获取刷新锁，确保同一时间只有一个刷新操作
-            let _guard = self.refresh_lock.lock().await;
+            // per-credential 刷新锁，不阻塞其他凭据的请求
+            let lock = self.refresh_lock_for(id);
+            let _guard = lock.lock().await;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -1684,6 +1685,15 @@ impl MultiTokenManager {
     ///
     /// # Returns
     /// - `Ok(true)` - 成功写入文件
+    /// 获取指定凭据的刷新锁（per-credential single-flight）
+    fn refresh_lock_for(&self, id: u64) -> Arc<TokioMutex<()>> {
+        let mut locks = self.refresh_locks.lock();
+        locks
+            .entry(id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
     /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
@@ -2303,7 +2313,8 @@ impl MultiTokenManager {
                 is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
 
             if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
+                let lock = self.refresh_lock_for(id);
+                let _guard = lock.lock().await;
                 let current_creds = {
                     let entries = self.entries.lock();
                     entries
@@ -2608,8 +2619,9 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
+        // per-credential 刷新锁防止并发刷新
+        let lock = self.refresh_lock_for(id);
+        let _guard = lock.lock().await;
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());

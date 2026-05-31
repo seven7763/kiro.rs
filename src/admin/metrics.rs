@@ -637,6 +637,7 @@ mod tests {
                 Arc::from("sonnet")
             };
             metrics.record(RequestRecord {
+                seq: 0,
                 finished_at: now,
                 latency: Duration::from_millis(100 + i * 50),
                 kind: if i < 8 {
@@ -687,6 +688,7 @@ mod tests {
         let metrics = Arc::new(MetricsRecorder::new());
         let now = Instant::now();
         metrics.record(RequestRecord {
+            seq: 0,
             finished_at: now,
             latency: Duration::from_millis(123),
             kind: RequestKind::Success,
@@ -728,6 +730,7 @@ mod tests {
         // 当前分钟桶记 3 条成功
         for _ in 0..3 {
             metrics.record(RequestRecord {
+                seq: 0,
                 finished_at: now,
                 latency: Duration::from_millis(100),
                 kind: RequestKind::Success,

@@ -16,7 +16,7 @@ use tokio::time::{sleep, timeout};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
-use crate::kiro::metrics::{MetricsRecorder, RequestKind, RequestRecord};
+use crate::kiro::metrics::{MetricsRecorder, RecordHandle, RequestKind, RequestRecord};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{MultiTokenManager, TransientFailureKind};
 use crate::model::config::TlsBackend;
@@ -303,12 +303,15 @@ impl KiroProvider {
         }
     }
 
-    /// 记录一次完整请求的结果到 metrics ring buffer
+    /// 记录一次完整请求的结果到 metrics ring buffer，返回该记录的单调 seq
     ///
     /// `model` 与 `credential_id` 让 admin metrics 能按维度切片
     /// （e.g. "opus 模型 p95 是多少 / 哪个号在打瞬态"）。两者都允许 None：
     /// `model` 在 MCP / 错误路径下可能拿不到；`credential_id` 在所有 retry
     /// 都没获取到 token 时为 None。
+    ///
+    /// token 字段此刻填 None：流式请求记录发生在**建连完成**时，token 尚未产生；
+    /// 由 anthropic 层在响应处理完成后凭返回的 seq 调 `metrics.update_tokens` 回填。
     fn record_outcome(
         &self,
         started_at: Instant,
@@ -317,8 +320,9 @@ impl KiroProvider {
         waited_for_cooldown: bool,
         model: Option<&str>,
         credential_id: Option<u64>,
-    ) {
+    ) -> u64 {
         self.metrics.record(RequestRecord {
+            seq: 0, // 占位，record() 内部分配真实 seq
             finished_at: Instant::now(),
             latency: started_at.elapsed(),
             kind,
@@ -336,7 +340,7 @@ impl KiroProvider {
             input_tokens: None,
             output_tokens: None,
             cache_read_tokens: None,
-        });
+        })
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
@@ -428,7 +432,10 @@ impl KiroProvider {
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     /// 受 [`REQUEST_TOTAL_TIMEOUT_SECS`] 总超时保护，超时返回带
     /// [`REQUEST_TIMEOUT_MARKER`] 标记的错误供上层映射为 503+Retry-After。
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<(reqwest::Response, RecordHandle)> {
         let _permit = self.acquire_inflight_permit().await;
         let t0 = Instant::now();
         let mut used_fallback = false;
@@ -462,7 +469,7 @@ impl KiroProvider {
             }
         };
         let kind = classify_outcome(&result);
-        self.record_outcome(
+        let seq = self.record_outcome(
             t0,
             kind,
             used_fallback,
@@ -470,7 +477,7 @@ impl KiroProvider {
             model.as_deref(),
             last_cred_id,
         );
-        result
+        result.map(|resp| (resp, RecordHandle::new(self.metrics.clone(), seq)))
     }
 
     /// 发送流式 API 请求
@@ -478,7 +485,10 @@ impl KiroProvider {
     /// 同 [`Self::call_api`] 同样受 90s 总超时保护：建连阶段（含 retry）超时
     /// 直接放弃，避免 CF 在 100/120s 切断后客户端瞎重试。
     /// 一旦建连完成（拿到 `reqwest::Response`），后续 SSE 流不再受此 timeout 影响。
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api_stream(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<(reqwest::Response, RecordHandle)> {
         let _permit = self.acquire_inflight_permit().await;
         let t0 = Instant::now();
         let mut used_fallback = false;
@@ -512,7 +522,7 @@ impl KiroProvider {
             }
         };
         let kind = classify_outcome(&result);
-        self.record_outcome(
+        let seq = self.record_outcome(
             t0,
             kind,
             used_fallback,
@@ -520,7 +530,7 @@ impl KiroProvider {
             model.as_deref(),
             last_cred_id,
         );
-        result
+        result.map(|resp| (resp, RecordHandle::new(self.metrics.clone(), seq)))
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -617,8 +627,7 @@ impl KiroProvider {
             // ListAvailableModels 是 GET，沿用 decorate_mcp 的鉴权头（含 profileArn）
             let base = client
                 .get(&url)
-                .header("content-type", "application/json")
-                .header("Connection", "close");
+                .header("content-type", "application/json");
             let request = endpoint.decorate_mcp(base, &rctx);
 
             let response = match request.send().await {
@@ -722,8 +731,7 @@ impl KiroProvider {
                 .client_for_attempt(&ctx.credentials, attempt)?
                 .post(&url)
                 .body(body)
-                .header("content-type", "application/json")
-                .header("Connection", "close");
+                .header("content-type", "application/json");
             let request = endpoint.decorate_mcp(base, &rctx);
 
             let response = match request.send().await {
@@ -950,8 +958,7 @@ impl KiroProvider {
                 .client_for_attempt(&ctx.credentials, attempt)?
                 .post(&url)
                 .body(body)
-                .header("content-type", "application/json")
-                .header("Connection", "close");
+                .header("content-type", "application/json");
             let request = endpoint.decorate_api(base, &rctx);
 
             let response = match request.send().await {

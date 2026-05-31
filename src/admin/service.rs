@@ -94,6 +94,7 @@ impl AdminService {
             enabled: self.prompt_cache.is_enabled(),
             capacity: snap.capacity,
             ttl_secs: snap.ttl_secs,
+            perceived_cache_hit_ratio: self.prompt_cache.perceived_ratio(),
             entries: Some(snap.entries),
             hit_total: Some(snap.hit_total),
             miss_total: Some(snap.miss_total),
@@ -119,12 +120,21 @@ impl AdminService {
                 "promptCacheTtlSecs 必须在 [10, 86400] 秒范围内".to_string(),
             ));
         }
+        if let Some(r) = req.perceived_cache_hit_ratio {
+            if !(0.0..=0.95).contains(&r) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "perceivedCacheHitRatio 必须在 [0.0, 0.95] 范围内".to_string(),
+                ));
+            }
+        }
 
         // 1. 即时生效
         self.prompt_cache.set_enabled(req.enabled);
         self.prompt_cache.set_capacity(req.capacity);
         self.prompt_cache
             .set_ttl(std::time::Duration::from_secs(req.ttl_secs));
+        self.prompt_cache
+            .set_perceived_ratio(req.perceived_cache_hit_ratio);
 
         // 2. 持久化
         {
@@ -132,6 +142,7 @@ impl AdminService {
             writer.prompt_cache_enabled = Some(req.enabled);
             writer.prompt_cache_capacity = Some(req.capacity);
             writer.prompt_cache_ttl_secs = Some(req.ttl_secs);
+            writer.perceived_cache_hit_ratio = req.perceived_cache_hit_ratio;
             if writer.config_path().is_some() {
                 if let Err(e) = writer.save() {
                     tracing::warn!("prompt cache 配置已生效但写回 config.json 失败: {}", e);

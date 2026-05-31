@@ -31,6 +31,12 @@ pub enum RequestKind {
 /// 单条请求的完整生命周期记录
 #[derive(Debug, Clone)]
 pub struct RequestRecord {
+    /// 单调递增序号（由 recorder 在 push 时分配，调用方传入的占位值会被覆盖）
+    ///
+    /// 用于 token 后填：record() 返回此 seq，anthropic 层流结束后凭 seq
+    /// 调 update_tokens 把 input/output/cache_read 补回对应 slot。
+    /// slot 若已被环形覆盖（seq 不匹配）则安全跳过。
+    pub seq: u64,
     /// 请求结束时刻（用 Instant 比 unix 更稳定，admin 计算时与 now 比较）
     pub finished_at: Instant,
     /// 端到端耗时
@@ -105,6 +111,8 @@ struct RingBuffer {
     head: usize,
     /// 是否已绕回过一圈（决定 data 长度是否已满）
     wrapped: bool,
+    /// 下一个分配的单调序号（永不回绕，用于 token 后填定位）
+    next_seq: u64,
 }
 
 impl RingBuffer {
@@ -113,10 +121,15 @@ impl RingBuffer {
             data: Vec::with_capacity(capacity),
             head: 0,
             wrapped: false,
+            next_seq: 0,
         }
     }
 
-    fn push(&mut self, rec: RequestRecord) {
+    /// 写入一条记录，分配并返回其单调序号 `seq`
+    fn push(&mut self, mut rec: RequestRecord) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        rec.seq = seq;
         let cap = self.data.capacity();
         if self.data.len() < cap {
             self.data.push(rec);
@@ -127,6 +140,33 @@ impl RingBuffer {
         if self.head >= cap {
             self.head = 0;
             self.wrapped = true;
+        }
+        seq
+    }
+
+    /// 按 seq 定位仍存活的 slot 并补填 token（流结束后由 anthropic 层调用）
+    ///
+    /// seq → slot 的映射：插入顺序与 seq 一致，data 满之前 slot==seq，
+    /// 满之后 slot==seq % cap。校验 slot 内记录的 seq 是否匹配，
+    /// 不匹配说明该 slot 已被更新的请求覆盖（高并发下旧请求迟到），安全跳过。
+    fn update_tokens(
+        &mut self,
+        seq: u64,
+        input: Option<u32>,
+        output: Option<u32>,
+        cache_read: Option<u32>,
+    ) {
+        let cap = self.data.capacity();
+        if cap == 0 {
+            return;
+        }
+        let slot = (seq % cap as u64) as usize;
+        if let Some(rec) = self.data.get_mut(slot) {
+            if rec.seq == seq {
+                rec.input_tokens = input;
+                rec.output_tokens = output;
+                rec.cache_read_tokens = cache_read;
+            }
         }
     }
 
@@ -153,9 +193,27 @@ impl MetricsRecorder {
         self.started_at
     }
 
-    /// 记录一次请求结果
-    pub fn record(&self, rec: RequestRecord) {
-        self.buf.lock().push(rec);
+    /// 记录一次请求结果，返回其单调序号 `seq`
+    ///
+    /// 调用方可凭 seq 在请求后期（如流式 SSE 解析完成）调 [`Self::update_tokens`]
+    /// 把最终 token 用量补填回该记录。
+    pub fn record(&self, rec: RequestRecord) -> u64 {
+        self.buf.lock().push(rec)
+    }
+
+    /// 按 seq 补填 token 用量（input / output / cache_read）
+    ///
+    /// 用于 token 在记录时尚不可知的路径：provider 层流式请求在**建连完成**时
+    /// 就 record 了（此时 token 还没产生），由 anthropic 层在流结束后回填。
+    /// slot 若已被环形覆盖则静默跳过（见 [`RingBuffer::update_tokens`]）。
+    pub fn update_tokens(
+        &self,
+        seq: u64,
+        input: Option<u32>,
+        output: Option<u32>,
+        cache_read: Option<u32>,
+    ) {
+        self.buf.lock().update_tokens(seq, input, output, cache_read);
     }
 
     /// 当前缓冲已记录的请求总数（被环形覆盖前）
@@ -172,6 +230,30 @@ impl MetricsRecorder {
 impl Default for MetricsRecorder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// token 后填句柄
+///
+/// 由 provider 层在 record 后返回，携带 recorder 与该记录的 seq。
+/// anthropic 层在流式/非流式响应处理完成、拿到最终 token 后调
+/// [`Self::update_tokens`] 把用量补回。
+#[derive(Clone)]
+pub struct RecordHandle {
+    recorder: Arc<MetricsRecorder>,
+    seq: u64,
+}
+
+impl RecordHandle {
+    /// 构造一个携带 seq 的句柄
+    pub fn new(recorder: Arc<MetricsRecorder>, seq: u64) -> Self {
+        Self { recorder, seq }
+    }
+
+    /// 补填最终 token 用量
+    pub fn update_tokens(&self, input: Option<u32>, output: Option<u32>, cache_read: Option<u32>) {
+        self.recorder
+            .update_tokens(self.seq, input, output, cache_read);
     }
 }
 
@@ -527,6 +609,7 @@ mod tests {
         credential_id: Option<u64>,
     ) -> RequestRecord {
         RequestRecord {
+            seq: 0,
             finished_at: Instant::now() - Duration::from_secs(secs_ago),
             latency: Duration::from_millis(latency_ms),
             kind,
@@ -565,13 +648,88 @@ mod tests {
     }
 
     #[test]
+    fn record_assigns_monotonic_seq() {
+        let rec = MetricsRecorder::new();
+        let s0 = rec.record(make(0, 100, RequestKind::Success, false, false));
+        let s1 = rec.record(make(0, 100, RequestKind::Success, false, false));
+        let s2 = rec.record(make(0, 100, RequestKind::Success, false, false));
+        assert_eq!((s0, s1, s2), (0, 1, 2));
+    }
+
+    #[test]
+    fn update_tokens_patches_matching_record() {
+        let rec = MetricsRecorder::new();
+        let seq = rec.record(make(0, 100, RequestKind::Success, false, false));
+        // 记录时 token 为 None（provider 层占位）
+        assert!(rec.snapshot()[0].input_tokens.is_none());
+
+        rec.update_tokens(seq, Some(120), Some(45), Some(8));
+        let snap = rec.snapshot();
+        assert_eq!(snap[0].input_tokens, Some(120));
+        assert_eq!(snap[0].output_tokens, Some(45));
+        assert_eq!(snap[0].cache_read_tokens, Some(8));
+    }
+
+    #[test]
+    fn update_tokens_skips_overwritten_slot() {
+        // 容量 2：seq 0/1 占满后，seq 2 覆盖 seq 0 的物理 slot。
+        // 用迟到的 seq 0 回填不应污染现在住在该 slot 的 seq 2。
+        let rb_recorder = MetricsRecorder {
+            buf: Mutex::new(RingBuffer::new(2)),
+            started_at: Instant::now(),
+        };
+        let s0 = rb_recorder.record(make(0, 100, RequestKind::Success, false, false));
+        let _s1 = rb_recorder.record(make(0, 100, RequestKind::Success, false, false));
+        let s2 = rb_recorder.record(make(0, 100, RequestKind::Success, false, false));
+        assert_eq!((s0, s2), (0, 2)); // s2 与 s0 落在同一 slot（2 % 2 == 0）
+
+        // 迟到的 s0 回填：slot 0 现在是 s2，seq 不匹配 → 跳过
+        rb_recorder.update_tokens(s0, Some(999), Some(999), Some(999));
+        let slot0 = &rb_recorder.snapshot()[0];
+        assert_eq!(slot0.seq, 2);
+        assert!(slot0.input_tokens.is_none(), "迟到 seq 不应污染已覆盖的 slot");
+
+        // 当前 s2 的回填正常生效
+        rb_recorder.update_tokens(s2, Some(50), Some(20), Some(0));
+        assert_eq!(rb_recorder.snapshot()[0].input_tokens, Some(50));
+    }
+
+    #[test]
+    fn time_series_reflects_patched_tokens() {
+        let rec = MetricsRecorder::new();
+        let seq = rec.record(make(5, 100, RequestKind::Success, false, false));
+        rec.update_tokens(seq, Some(200), Some(60), Some(10));
+
+        let series = compute_time_series_60m(&rec.snapshot(), Instant::now());
+        let totals: (u64, u64, u64) = series.iter().fold((0, 0, 0), |acc, p| {
+            (
+                acc.0 + p.input_tokens,
+                acc.1 + p.output_tokens,
+                acc.2 + p.cache_read_tokens,
+            )
+        });
+        assert_eq!(totals, (200, 60, 10), "回填的 token 应进入 60min 时间序列");
+    }
+
+    #[test]
+    fn record_handle_patches_via_seq() {
+        let rec = Arc::new(MetricsRecorder::new());
+        let seq = rec.record(make(0, 100, RequestKind::Success, false, false));
+        let handle = RecordHandle::new(rec.clone(), seq);
+        handle.update_tokens(Some(11), Some(22), Some(3));
+        let snap = rec.snapshot();
+        assert_eq!(snap[0].input_tokens, Some(11));
+        assert_eq!(snap[0].output_tokens, Some(22));
+        assert_eq!(snap[0].cache_read_tokens, Some(3));
+    }
+
+    #[test]
     fn window_filters_old_records() {
         let recs = vec![
             make(10, 100, RequestKind::Success, false, false),
             make(40, 200, RequestKind::Success, false, false),
             make(120, 300, RequestKind::Success, false, false),
-        ];
-        // 过去 60s 窗口：只 10s 和 40s 这两条进
+        ];        // 过去 60s 窗口：只 10s 和 40s 这两条进
         let stats = compute_window_stats(&recs, Instant::now(), Duration::from_secs(60));
         assert_eq!(stats.count, 2);
         assert_eq!(stats.success, 2);

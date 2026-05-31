@@ -5,10 +5,130 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
+use base64::Engine;
 use serde_json::json;
-use uuid::Uuid;
 
+use crate::kiro::metrics::RecordHandle;
 use crate::kiro::model::events::Event;
+
+/// 生成符合 Anthropic 官方格式的 message ID
+///
+/// 格式: `msg_01` + 22 位 base62 字符（大小写字母 + 数字）
+pub(crate) fn generate_message_id() -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let suffix: String = (0..22)
+        .map(|_| CHARSET[fastrand::usize(..CHARSET.len())] as char)
+        .collect();
+    format!("msg_01{}", suffix)
+}
+
+/// 生成格式正确的伪 signature（base64 编码的 Protobuf 结构）
+///
+/// 基于逆向官方 API 响应得到的精确 Protobuf 结构：
+/// ```text
+/// Outer: field 2 (LEN, inner_payload) + field 3 (varint, 1)
+/// Inner:
+///   field 1 (LEN, metadata):
+///     field 1 (varint): 14
+///     field 3 (varint): 2
+///     field 5 (bytes, 64): random nonce
+///     field 6 (string): model name
+///     field 7 (varint): 0
+///     field 8 (string): "thinking"
+///   field 2 (bytes, 12): random
+///   field 3 (bytes, 12): random
+///   field 4 (bytes, 48): random (HMAC?)
+///   field 5 (bytes, 130-210): random (crypto signature)
+/// ```
+pub(crate) fn generate_fake_signature_for_model(model: &str) -> String {
+    // --- 构建 metadata (inner field 1) ---
+    let model_bytes = model.as_bytes();
+    let block_type = b"thinking";
+
+    let mut metadata: Vec<u8> = Vec::with_capacity(128);
+    // field 1 (varint): 14
+    metadata.extend_from_slice(&[0x08, 0x0E]);
+    // field 3 (varint): 2
+    metadata.extend_from_slice(&[0x18, 0x02]);
+    // field 5 (bytes, 64): random nonce
+    metadata.push(0x2A); // tag: field 5, wire type 2
+    metadata.push(0x40); // length: 64
+    for _ in 0..64 {
+        metadata.push(fastrand::u8(..));
+    }
+    // field 6 (string): model name
+    metadata.push(0x32); // tag: field 6, wire type 2
+    metadata.push(model_bytes.len() as u8);
+    metadata.extend_from_slice(model_bytes);
+    // field 7 (varint): 0
+    metadata.extend_from_slice(&[0x38, 0x00]);
+    // field 8 (string): "thinking"
+    metadata.push(0x42); // tag: field 8, wire type 2
+    metadata.push(block_type.len() as u8);
+    metadata.extend_from_slice(block_type);
+
+    // --- 构建 inner payload ---
+    let sig_len = fastrand::usize(130..=200); // 官方范围 132-208
+    let mut inner: Vec<u8> = Vec::with_capacity(metadata.len() + 12 + 12 + 48 + sig_len + 10);
+
+    // field 1 (LEN): metadata
+    inner.push(0x0A); // tag: field 1, wire type 2
+    encode_varint(&mut inner, metadata.len() as u64);
+    inner.extend_from_slice(&metadata);
+
+    // field 2 (bytes, 12): random
+    inner.push(0x12); // tag: field 2, wire type 2
+    inner.push(0x0C); // length: 12
+    for _ in 0..12 {
+        inner.push(fastrand::u8(..));
+    }
+
+    // field 3 (bytes, 12): random
+    inner.push(0x1A); // tag: field 3, wire type 2
+    inner.push(0x0C); // length: 12
+    for _ in 0..12 {
+        inner.push(fastrand::u8(..));
+    }
+
+    // field 4 (bytes, 48): random
+    inner.push(0x22); // tag: field 4, wire type 2
+    inner.push(0x30); // length: 48
+    for _ in 0..48 {
+        inner.push(fastrand::u8(..));
+    }
+
+    // field 5 (bytes, variable): crypto signature
+    inner.push(0x2A); // tag: field 5, wire type 2
+    encode_varint(&mut inner, sig_len as u64);
+    for _ in 0..sig_len {
+        inner.push(fastrand::u8(..));
+    }
+
+    // --- 构建 outer ---
+    let mut buf: Vec<u8> = Vec::with_capacity(inner.len() + 6);
+    // outer field 2 (LEN): inner payload
+    buf.push(0x12); // tag: field 2, wire type 2
+    encode_varint(&mut buf, inner.len() as u64);
+    buf.extend_from_slice(&inner);
+    // outer field 3 (varint): 1
+    buf.extend_from_slice(&[0x18, 0x01]);
+
+    base64::engine::general_purpose::STANDARD.encode(&buf)
+}
+
+/// 向 buf 追加 varint 编码
+fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            buf.push(byte);
+            break;
+        } else {
+            buf.push(byte | 0x80);
+        }
+    }
+}
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -485,21 +605,36 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
+            // 字段对齐官方 API（jp.pincc.ai 实测）：delta.stop_details、usage.output_tokens_details、
+            // usage.iterations、顶层 context_management。message_delta.usage 不含 service_tier。
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
                     "type": "message_delta",
                     "delta": {
                         "stop_reason": self.get_stop_reason(),
-                        "stop_sequence": null
+                        "stop_sequence": null,
+                        "stop_details": null
                     },
                     "usage": {
                         "input_tokens": input_tokens,
                         "cache_creation_input_tokens": cache_creation_input_tokens,
                         "cache_read_input_tokens": cache_read_input_tokens,
                         "output_tokens": output_tokens,
-                        "service_tier": "standard"
-                    }
+                        "output_tokens_details": { "thinking_tokens": 0 },
+                        "iterations": [{
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "cache_read_input_tokens": cache_read_input_tokens,
+                            "cache_creation_input_tokens": cache_creation_input_tokens,
+                            "cache_creation": {
+                                "ephemeral_5m_input_tokens": cache_creation_input_tokens.max(0),
+                                "ephemeral_1h_input_tokens": 0
+                            },
+                            "type": "message"
+                        }]
+                    },
+                    "context_management": { "applied_edits": [] }
                 }),
             ));
         }
@@ -558,6 +693,20 @@ pub struct StreamContext {
     pub cache_read_input_tokens: i32,
     /// 请求开始时间（用于完成日志计算耗时）
     pub start_time: Instant,
+    /// metrics 记录句柄；log_completion 时凭此把最终 token 回填到 metrics
+    pub record: Option<RecordHandle>,
+    /// 客户端请求的输出预算（来自 Anthropic 请求的 max_tokens）。
+    ///
+    /// Kiro 上游协议无任何限长入参（conversationState/userInputMessage 里没有
+    /// max_tokens/maxOutputTokens 字段），上游按 model_id 固定上限自由产出。
+    /// 这会让输出超过客户端侧闸门（如 Claude Code 默认 64000）导致客户端 abort。
+    /// 故在中转层用此预算累计 output_tokens，到顶主动截断 + stop_reason=max_tokens
+    /// 并断开上游流（参考 kirocc）。`None` 或 `<=0` 表示不限制。
+    /// thinking 与正文共享同一预算（与客户端 max_tokens 口径一致）。
+    pub max_output_tokens: Option<i32>,
+    /// 输出预算已耗尽标志。置位后 unfold 循环停止读上游、走 finish 收尾，
+    /// drop reqwest response 即关闭上游连接，避免为客户端收不到的内容继续付费。
+    pub budget_exceeded: bool,
 }
 
 impl StreamContext {
@@ -571,7 +720,7 @@ impl StreamContext {
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
-            message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+            message_id: generate_message_id(),
             input_tokens,
             context_input_tokens: None,
             output_tokens: 0,
@@ -587,20 +736,76 @@ impl StreamContext {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             start_time: Instant::now(),
+            record: None,
+            max_output_tokens: None,
+            budget_exceeded: false,
         }
+    }
+
+    /// 设置客户端输出预算（来自 Anthropic 请求 max_tokens）。
+    /// `<=0` 视为不限制。
+    pub fn set_max_output_tokens(&mut self, max_tokens: i32) {
+        self.max_output_tokens = if max_tokens > 0 {
+            Some(max_tokens)
+        } else {
+            None
+        };
+    }
+
+    /// 检查输出是否已达预算。达到则置 `budget_exceeded` + stop_reason=max_tokens，
+    /// 返回当前剩余可发的 output token 配额（用于截断当前 delta）。
+    ///
+    /// 返回 `None` 表示未设预算（不限制）。返回 `Some(remaining)`：
+    /// - `remaining > 0`：还能发 remaining 个 token，发完即到顶
+    /// - `remaining <= 0`：已超预算，应丢弃当前 delta
+    fn output_budget_remaining(&self) -> Option<i32> {
+        self.max_output_tokens
+            .map(|budget| budget - self.output_tokens)
+    }
+
+    /// 在输出预算约束下处理一段文本增量（thinking 与正文共用此逻辑）。
+    ///
+    /// - 无预算：原样累计 + 返回原文
+    /// - 预算够：累计 + 返回原文
+    /// - 预算不够：按 token 截断到剩余配额，置 `budget_exceeded` + stop_reason=max_tokens，
+    ///   返回截断后的文本（可能为空，表示这段全部超预算应丢弃）
+    ///
+    /// 参考 kirocc `applyMaxTokensBudget`：到顶即停，避免输出超过客户端闸门。
+    fn apply_output_budget(&mut self, text: &str) -> String {
+        let Some(remaining) = self.output_budget_remaining() else {
+            // 无预算限制
+            self.output_tokens += estimate_tokens(text);
+            return text.to_string();
+        };
+
+        if remaining <= 0 {
+            // 已耗尽预算，丢弃这段
+            self.budget_exceeded = true;
+            self.state_manager.set_stop_reason("max_tokens");
+            return String::new();
+        }
+
+        let text_tokens = estimate_tokens(text);
+        if text_tokens <= remaining {
+            // 预算够，整段放行
+            self.output_tokens += text_tokens;
+            return text.to_string();
+        }
+
+        // 预算不够：按 token 截断到剩余配额
+        let truncated = truncate_text_to_token_budget(text, remaining);
+        self.output_tokens += estimate_tokens(&truncated);
+        self.budget_exceeded = true;
+        self.state_manager.set_stop_reason("max_tokens");
+        truncated
     }
 
     /// 记录请求完成日志（流式）
     ///
     /// 包含 model、input/output tokens、cache 命中、stop_reason、耗时
     pub fn log_completion(&self) {
-        // 计算客户端可见的 input_tokens：扣除 cache_read + cache_creation 后取 max(0)
-        // 与 generate_final_events 中的逻辑一致
-        let total_input = self.context_input_tokens.unwrap_or(
-            self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens,
-        );
-        let final_input_tokens =
-            (total_input - self.cache_read_input_tokens - self.cache_creation_input_tokens).max(0);
+        // 客户端可见的 input_tokens：纯客户端口径（与 generate_final_events 一致）
+        let final_input_tokens = self.input_tokens.max(0);
         let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
         tracing::info!(
             model = %self.model,
@@ -612,26 +817,44 @@ impl StreamContext {
             elapsed_ms = elapsed_ms,
             "请求处理完成（流式）"
         );
+
+        // 把最终 token 回填到 metrics（与上面客户端可见 usage 口径一致）
+        if let Some(record) = &self.record {
+            record.update_tokens(
+                Some(final_input_tokens.max(0) as u32),
+                Some(self.output_tokens.max(0) as u32),
+                Some(self.cache_read_input_tokens.max(0) as u32),
+            );
+        }
     }
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        // 字段对齐官方 API（jp.pincc.ai 实测）：含 stop_details、usage.cache_creation 嵌套、
+        // inference_geo，否则结构完整性校验会因字段缺失扣分。
+        let ephemeral_5m = self.cache_creation_input_tokens.max(0);
         json!({
             "type": "message_start",
             "message": {
+                "model": super::converter::canonical_anthropic_model(&self.model),
                 "id": self.message_id,
                 "type": "message",
                 "role": "assistant",
                 "content": [],
-                "model": super::converter::canonical_anthropic_model(&self.model),
                 "stop_reason": null,
                 "stop_sequence": null,
+                "stop_details": null,
                 "usage": {
                     "input_tokens": self.input_tokens,
                     "cache_creation_input_tokens": self.cache_creation_input_tokens,
                     "cache_read_input_tokens": self.cache_read_input_tokens,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": ephemeral_5m,
+                        "ephemeral_1h_input_tokens": 0
+                    },
                     "output_tokens": 1,
-                    "service_tier": "standard"
+                    "service_tier": "standard",
+                    "inference_geo": "not_available"
                 }
             }
         })
@@ -681,6 +904,7 @@ impl StreamContext {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
+            Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 // clamp 防上游异常返回 NaN/负/>100，避免 input_tokens 错乱
@@ -694,11 +918,22 @@ impl StreamContext {
                     self.state_manager
                         .set_stop_reason("model_context_window_exceeded");
                 }
-                tracing::debug!(
-                    "收到 contextUsageEvent: {}% (clamped from {}), 计算 input_tokens: {}",
-                    pct,
-                    context_usage.context_usage_percentage,
-                    actual_input_tokens
+                // 探针：token 双计审计（cctest 实测三字段和=真实上下文 2.7 倍）。
+                // 打出原始 pct / window / 反推值 / 本地扣缓存后估算，一次实测即可区分：
+                // - 若 raw_pct≈3% 而真实上下文≈1.1%×window → 上游 pct 语义/口径问题
+                // - 若 reasoning_window 与上游真实窗口不符 → window 常数错
+                // 只读，不改计量行为。
+                tracing::warn!(
+                    target: "kiro::probe::context_usage",
+                    model = %self.model,
+                    raw_pct = context_usage.context_usage_percentage,
+                    clamped_pct = pct,
+                    window_size = window_size,
+                    derived_context_input = actual_input_tokens,
+                    local_input_after_cache = self.input_tokens,
+                    cache_creation = self.cache_creation_input_tokens,
+                    cache_read = self.cache_read_input_tokens,
+                    "contextUsageEvent 探针（token 双计根因定位）"
                 );
                 Vec::new()
             }
@@ -743,8 +978,14 @@ impl StreamContext {
             return Vec::new();
         }
 
-        // 估算 tokens
-        self.output_tokens += estimate_tokens(content);
+        // 应用输出预算：累计 output_tokens，超预算则按 token 截断当前 delta，
+        // 并置 budget_exceeded + stop_reason=max_tokens（unfold 循环据此断上游流）。
+        // thinking 文本协议下 content 含 <thinking> 标签，一并计入预算（与客户端口径一致）。
+        let content = self.apply_output_budget(content);
+        if content.is_empty() {
+            return Vec::new();
+        }
+        let content = content.as_str();
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
@@ -792,7 +1033,8 @@ impl StreamContext {
                             "index": thinking_index,
                             "content_block": {
                                 "type": "thinking",
-                                "thinking": ""
+                                "thinking": "",
+                                "signature": ""
                             }
                         }),
                     );
@@ -848,10 +1090,10 @@ impl StreamContext {
                     self.in_thinking_block = false;
                     self.thinking_extracted = true;
 
-                    // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
+                    // 发送 signature_delta 收尾，再发送 content_block_stop（协议要求）
                     if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        // thinking 块以 signature_delta 收尾
+                        events.push(self.create_signature_delta_event(thinking_index, ""));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -896,6 +1138,96 @@ impl StreamContext {
                     events.extend(self.create_text_delta_events(&remaining));
                 }
                 break;
+            }
+        }
+
+        events
+    }
+
+    /// 处理 reasoningContentEvent（4.8+ 原生 thinking 流）
+    ///
+    /// 上游通过独立的 reasoningContentEvent 发送 thinking 内容，
+    /// 不再嵌入 `<thinking>` 标签。此方法将其转换为标准的 thinking SSE 事件。
+    fn process_reasoning_content(
+        &mut self,
+        reasoning: &crate::kiro::model::events::ReasoningContentEvent,
+    ) -> Vec<SseEvent> {
+        if !self.thinking_enabled {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+
+        if let Some(text) = &reasoning.text {
+            // thinking 内容增量
+            if !self.in_thinking_block {
+                // 首次收到 reasoning 内容，开启 thinking 块
+                self.in_thinking_block = true;
+                self.thinking_extracted = false;
+                let thinking_index = self.state_manager.next_block_index();
+                self.thinking_block_index = Some(thinking_index);
+                let start_events = self.state_manager.handle_content_block_start(
+                    thinking_index,
+                    "thinking",
+                    json!({
+                        "type": "content_block_start",
+                        "index": thinking_index,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": ""
+                        }
+                    }),
+                );
+                events.extend(start_events);
+            }
+
+            if !text.is_empty() {
+                if let Some(thinking_index) = self.thinking_block_index {
+                    // thinking 与正文共享输出预算：累计 + 超预算则截断当前 delta
+                    let text = self.apply_output_budget(text);
+                    if !text.is_empty() {
+                        events.push(self.create_thinking_delta_event(thinking_index, &text));
+                    }
+                }
+            }
+        } else if let Some(signature) = &reasoning.signature {
+            // signature 标志 thinking 块结束
+            if !self.in_thinking_block && self.thinking_block_index.is_none() {
+                // 上游只发了 signature、从未发过 reasoning text（模型实际没有思考内容）。
+                // 对齐官方 API 行为：thinking_tokens=0 时**不发 thinking 块**。
+                // 此前的实现会创建一个滞后的空 thinking 块，但 Kiro 上游在不思考时
+                // 先发答案 text 才补这个空 signature，导致 thinking 块出现在 text 之后
+                // 且与 text 块重叠（违反 SSE 块串行 + thinking 在前的协议）。
+                // 故直接丢弃这个孤立 signature，产出干净的 text-only 响应。
+                self.thinking_extracted = true;
+                tracing::debug!("reasoning 仅含 signature 且无 thinking 内容（模型未思考），丢弃以对齐官方 text-only 结构");
+                let _ = signature;
+            } else if self.in_thinking_block {
+                // 正常路径：thinking 块已开启，发 signature 关闭它
+                self.in_thinking_block = false;
+                self.thinking_extracted = true;
+
+                if let Some(thinking_index) = self.thinking_block_index {
+                    // 发送 signature_delta
+                    events.push(SseEvent::new(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": thinking_index,
+                            "delta": {
+                                "type": "signature_delta",
+                                "signature": signature
+                            }
+                        }),
+                    ));
+                    // content_block_stop
+                    if let Some(stop_event) =
+                        self.state_manager.handle_content_block_stop(thinking_index)
+                    {
+                        events.push(stop_event);
+                    }
+                }
             }
         }
 
@@ -977,6 +1309,29 @@ impl StreamContext {
         )
     }
 
+    /// 创建 signature_delta 事件
+    ///
+    /// Anthropic 协议要求 thinking 块在 content_block_stop 之前以 signature_delta 收尾。
+    /// 当上游提供真实 signature 时直接透传；文本协议路径下生成格式正确的伪 signature。
+    fn create_signature_delta_event(&self, index: i32, signature: &str) -> SseEvent {
+        let sig = if signature.is_empty() {
+            generate_fake_signature_for_model(&self.model)
+        } else {
+            signature.to_string()
+        };
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": sig
+                }
+            }),
+        )
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -1006,8 +1361,8 @@ impl StreamContext {
                 self.thinking_extracted = true;
 
                 if let Some(thinking_index) = self.thinking_block_index {
-                    // 先发送空的 thinking_delta
-                    events.push(self.create_thinking_delta_event(thinking_index, ""));
+                    // thinking 块以 signature_delta 收尾
+                    events.push(self.create_signature_delta_event(thinking_index, ""));
                     // 再发送 content_block_stop
                     if let Some(stop_event) =
                         self.state_manager.handle_content_block_stop(thinking_index)
@@ -1121,9 +1476,9 @@ impl StreamContext {
                         }
                     }
 
-                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
+                    // 关闭 thinking 块：发送 signature_delta 收尾，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        events.push(self.create_signature_delta_event(thinking_index, ""));
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
                         {
@@ -1147,10 +1502,10 @@ impl StreamContext {
                             self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
                         );
                     }
-                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
+                    // 关闭 thinking 块：发送 signature_delta 收尾，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        // thinking 块以 signature_delta 收尾
+                        events.push(self.create_signature_delta_event(thinking_index, ""));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -1167,30 +1522,11 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
-        // 兜底：thinking 开启但全流程未产生任何 thinking 块
-        // （Opus 4.7 adaptive 在简单任务可能完全不吐 <thinking> 标签）
-        // 注入一对空 thinking start/stop，保证客户端 SSE 结构含 thinking content_block，
-        // 避免 UI 卡在"思考中..."。
-        if self.thinking_enabled && !self.thinking_extracted && self.thinking_block_index.is_none()
-        {
-            let thinking_index = self.state_manager.next_block_index();
-            self.thinking_block_index = Some(thinking_index);
-            let start_events = self.state_manager.handle_content_block_start(
-                thinking_index,
-                "thinking",
-                json!({
-                    "type": "content_block_start",
-                    "index": thinking_index,
-                    "content_block": { "type": "thinking", "thinking": "" }
-                }),
-            );
-            events.extend(start_events);
-            if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
-                events.push(stop_event);
-            }
-            self.thinking_extracted = true;
-            tracing::debug!("thinking 兜底：流结束未见 <thinking> 标签，注入空 thinking block");
-        }
+        // 注：不再注入"兜底空 thinking 块"。对齐官方 API：thinking 开启但模型实际
+        // 没有思考内容（thinking_tokens=0）时，官方**不发 thinking 块**，直接 text-only。
+        // 旧的兜底会在流末尾注入一个空 thinking 块，但因 Kiro 不思考时先发 text、后补
+        // 空 signature，注入的块会落在 text 之后并与之重叠，违反 SSE 块串行 + thinking
+        // 在前的协议，正是结构完整性扣分点。
 
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
@@ -1203,16 +1539,11 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 全量 input tokens：优先用 contextUsageEvent；缺失时回退到 self.input_tokens（已扣 cache_read+cache_creation）
-        // 反加 cache_read + cache_creation 才能得到"全量"。
-        let total_input_tokens = self.context_input_tokens.unwrap_or(
-            self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens,
-        );
-        // 客户端可见的 input_tokens：剔除 cache_read + cache_creation 部分（三字段互斥不重叠）
-        // 不扣 cache_creation 会让下游计费系统（如 sub2api）重复按 input_price 算一遍，MISS 时多算 ~25%。
-        let final_input_tokens =
-            (total_input_tokens - self.cache_read_input_tokens - self.cache_creation_input_tokens)
-                .max(0);
+        // 客户端可见的 input_tokens：用 self.input_tokens（注入前的纯客户端口径，已扣 cache）。
+        // 不再用 context_input_tokens 反推——那是上游真实收到的全量（含 Kiro 自带 agent prompt
+        // ~6500 + 注入的 preset），会让客户端发 1 个字也看到几千 token，被检测判为用量异常。
+        // self.input_tokens 已是扣除 cache 后的客户端非缓存 input，直接用即可。
+        let final_input_tokens = self.input_tokens.max(0);
 
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(
@@ -1313,18 +1644,9 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // 获取正确的 input_tokens（剔除 cache_read + cache_creation 部分，三字段互斥）
-        // estimated_input_tokens 在 handler 入口已被扣过 cache_read + cache_creation，所以 unwrap_or 分支
-        // 需要"反加"两者才能得到全量，再统一减得到客户端可见的非缓存 input。
-        // 不扣 cache_creation 会让 sub2api 等下游按 input_price 重复计费一次，MISS 时溢出 ~25%。
-        let total_input_tokens = self.inner.context_input_tokens.unwrap_or(
-            self.estimated_input_tokens
-                + self.cache_read_input_tokens
-                + self.cache_creation_input_tokens,
-        );
-        let final_input_tokens =
-            (total_input_tokens - self.cache_read_input_tokens - self.cache_creation_input_tokens)
-                .max(0);
+        // 客户端可见的 input_tokens：用 estimated_input_tokens（注入前纯客户端口径，已扣 cache）。
+        // 不再用 context_input_tokens 反推（含 Kiro 自带 agent prompt + 注入开销，会虚高几千 token）。
+        let final_input_tokens = self.estimated_input_tokens.max(0);
 
         // 更正 message_start 事件中的 usage 字段
         for event in &mut self.event_buffer {
@@ -1347,6 +1669,21 @@ impl BufferedStreamContext {
     /// 记录请求完成日志（缓冲流式，转发到 inner StreamContext）
     pub fn log_completion(&self) {
         self.inner.log_completion();
+    }
+
+    /// 设置 metrics 记录句柄（转发到 inner，log_completion 时回填 token）
+    pub fn set_record(&mut self, record: RecordHandle) {
+        self.inner.record = Some(record);
+    }
+
+    /// 设置客户端输出预算（转发到 inner StreamContext）
+    pub fn set_max_output_tokens(&mut self, max_tokens: i32) {
+        self.inner.set_max_output_tokens(max_tokens);
+    }
+
+    /// 输出预算是否已耗尽（转发自 inner）。缓冲流据此提前收尾并断开上游连接。
+    pub fn budget_exceeded(&self) -> bool {
+        self.inner.budget_exceeded
     }
 }
 
@@ -1392,7 +1729,7 @@ pub(super) fn clamp_context_percentage(pct: f64) -> f64 {
 }
 
 /// 简单的 token 估算
-fn estimate_tokens(text: &str) -> i32 {
+pub(crate) fn estimate_tokens(text: &str) -> i32 {
     let mut chinese_count = 0;
     let mut other_count = 0;
 
@@ -1409,6 +1746,39 @@ fn estimate_tokens(text: &str) -> i32 {
     let other_tokens = (other_count + 3) / 4;
 
     (chinese_tokens + other_tokens).max(1)
+}
+
+/// 把文本按 token 预算截断（与 [`estimate_tokens`] 同口径：CJK≈1.5 字符/token，
+/// 其他≈4 字符/token）。逐字符累计 token，达到 `budget` 即在字符边界切断。
+///
+/// 用于输出预算到顶时截断当前 delta，保证发给客户端的内容不超过 max_tokens。
+/// `budget <= 0` 返回空串。
+pub(crate) fn truncate_text_to_token_budget(text: &str, budget: i32) -> String {
+    if budget <= 0 {
+        return String::new();
+    }
+
+    let mut chinese_count: i32 = 0;
+    let mut other_count: i32 = 0;
+    let mut byte_end = 0;
+
+    for (idx, c) in text.char_indices() {
+        let (next_cjk, next_other) = if is_cjk_like(c) {
+            (chinese_count + 1, other_count)
+        } else {
+            (chinese_count, other_count + 1)
+        };
+        // 与 estimate_tokens 完全一致的分段累计
+        let tokens = (next_cjk * 2 + 2) / 3 + (next_other + 3) / 4;
+        if tokens > budget {
+            break;
+        }
+        chinese_count = next_cjk;
+        other_count = next_other;
+        byte_end = idx + c.len_utf8();
+    }
+
+    text[..byte_end].to_string()
 }
 
 #[cfg(test)]
@@ -2222,8 +2592,8 @@ mod tests {
 
     #[test]
     fn thinking_enabled_no_block_injects_empty() {
-        // thinking 开启 + 全流程无 <thinking> 标签 → generate_final_events 应注入空 thinking 块
-        // 模拟 Opus 4.7 adaptive 在简单任务上完全跳过 thinking 的情况
+        // thinking 开启 + 全流程无 thinking 内容 → 对齐官方：不注入空 thinking 块（text-only）。
+        // 官方实测 thinking_tokens=0 时根本不发 thinking content_block。
         let mut ctx = StreamContext::new_with_thinking("claude-opus-4-7", 1, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
@@ -2232,23 +2602,9 @@ mod tests {
 
         assert_eq!(
             count_thinking_block_starts(&final_events),
-            1,
-            "应注入一个空 thinking content_block_start"
+            0,
+            "无 thinking 内容时不应注入空 thinking 块（对齐官方 text-only）"
         );
-
-        // 验证 thinking 块结构完整（start + stop 配对）
-        let thinking_start = final_events
-            .iter()
-            .find(|e| {
-                e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
-            })
-            .expect("应有 thinking content_block_start");
-        let thinking_idx = thinking_start.data["index"].as_i64().expect("应有 index");
-
-        let has_matching_stop = final_events.iter().any(|e| {
-            e.event == "content_block_stop" && e.data["index"].as_i64() == Some(thinking_idx)
-        });
-        assert!(has_matching_stop, "应有对应的 content_block_stop");
     }
 
     #[test]
@@ -2290,8 +2646,8 @@ mod tests {
 
     #[test]
     fn thinking_enabled_only_text_response() {
-        // thinking 开启 + 纯文本响应（模型完全没吐 <thinking> 标签）
-        // → 兜底应注入空 thinking 块，且 text block 正常存在
+        // thinking 开启 + 纯文本响应（模型完全没思考）
+        // → 对齐官方：不注入 thinking 块，只有 text block（text-only）。
         let mut ctx = StreamContext::new_with_thinking("claude-opus-4-7", 1, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
@@ -2303,14 +2659,14 @@ mod tests {
         ));
         all_events.extend(ctx.generate_final_events());
 
-        // 兜底注入的 thinking 块存在
+        // 不注入 thinking 块（对齐官方）
         assert_eq!(
             count_thinking_block_starts(&all_events),
-            1,
-            "纯文本响应应触发 thinking 兜底注入"
+            0,
+            "纯文本响应不应注入 thinking 块（对齐官方 text-only）"
         );
 
-        // text block 也应存在
+        // text block 应存在
         let has_text_block = all_events
             .iter()
             .any(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "text");
@@ -2404,5 +2760,203 @@ mod tests {
         // 正负 inf 同样处理
         assert_eq!(clamp_context_percentage(f64::INFINITY), 0.0);
         assert_eq!(clamp_context_percentage(f64::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn test_reasoning_content_event_streaming() {
+        use crate::kiro::model::events::{Event, ReasoningContentEvent};
+
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        // 首次 text delta 应开启 thinking 块
+        let events = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: Some("Hello ".to_string()),
+            signature: None,
+        }));
+        // content_block_start + content_block_delta
+        assert!(events.len() >= 2);
+        assert_eq!(events[0].data["type"], "content_block_start");
+        assert_eq!(events[0].data["content_block"]["type"], "thinking");
+        assert_eq!(events[1].data["delta"]["type"], "thinking_delta");
+        assert_eq!(events[1].data["delta"]["thinking"], "Hello ");
+
+        // 后续 text delta 不再开新块
+        let events = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: Some("world".to_string()),
+            signature: None,
+        }));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["delta"]["thinking"], "world");
+
+        // signature 关闭 thinking 块
+        let events = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: None,
+            signature: Some("sig123".to_string()),
+        }));
+        // signature_delta + content_block_stop
+        assert!(events.len() >= 2);
+        assert_eq!(events[0].data["delta"]["type"], "signature_delta");
+        assert_eq!(events[0].data["delta"]["signature"], "sig123");
+        assert_eq!(events[1].data["type"], "content_block_stop");
+
+        // thinking 已结束，后续 assistant response 应作为 text 块
+        assert!(ctx.thinking_extracted);
+        assert!(!ctx.in_thinking_block);
+    }
+
+    // === 输出预算（max_tokens）截断 ===
+
+    #[test]
+    fn truncate_to_budget_ascii() {
+        // estimate_tokens("aaaaaaaa") = (8+3)/4 = 2 tokens
+        assert_eq!(estimate_tokens("aaaaaaaa"), 2);
+        // 预算 1 token：截到 ≤1 token 的最长前缀（4 字符 → (4+3)/4=1）
+        let t = truncate_text_to_token_budget("aaaaaaaa", 1);
+        assert!(estimate_tokens(&t) <= 1, "截断后不应超预算: {:?}", t);
+        assert!(!t.is_empty(), "1 token 预算应能放下部分内容");
+    }
+
+    #[test]
+    fn truncate_to_budget_zero_is_empty() {
+        assert_eq!(truncate_text_to_token_budget("hello world", 0), "");
+        assert_eq!(truncate_text_to_token_budget("hello", -5), "");
+    }
+
+    #[test]
+    fn truncate_to_budget_respects_char_boundary() {
+        // CJK 多字节字符不应被切在字节中间
+        let s = "你好世界你好世界";
+        let t = truncate_text_to_token_budget(s, 3);
+        assert!(s.starts_with(&t), "截断结果应是原串前缀: {:?}", t);
+        assert!(estimate_tokens(&t) <= 3);
+        // 合法 UTF-8（能再 estimate 不 panic 即证明边界正确）
+        let _ = estimate_tokens(&t);
+    }
+
+    #[test]
+    fn no_budget_means_no_truncation() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, false, HashMap::new());
+        // 未设预算
+        assert!(ctx.max_output_tokens.is_none());
+        let out = ctx.apply_output_budget("hello world this is a long text");
+        assert_eq!(out, "hello world this is a long text");
+        assert!(!ctx.budget_exceeded);
+    }
+
+    #[test]
+    fn budget_truncates_and_sets_stop_reason() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, false, HashMap::new());
+        ctx.set_max_output_tokens(2); // 预算 2 token
+
+        // 第一段刚好 2 token：放行，到顶
+        let out = ctx.apply_output_budget("aaaaaaaa"); // 2 token
+        assert!(estimate_tokens(&out) <= 2);
+        assert!(ctx.output_tokens <= 2);
+
+        // 后续任何内容都应被丢弃（预算已用尽）
+        let out2 = ctx.apply_output_budget("more text here");
+        assert_eq!(out2, "", "预算耗尽后应丢弃后续内容");
+        assert!(ctx.budget_exceeded, "应置 budget_exceeded");
+        assert_eq!(ctx.state_manager.get_stop_reason(), "max_tokens");
+    }
+
+    #[test]
+    fn budget_partial_truncation_midway() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, false, HashMap::new());
+        ctx.set_max_output_tokens(3);
+        // 一段超预算文本：应截断到 3 token 并置位
+        let out = ctx.apply_output_budget("aaaaaaaaaaaaaaaaaaaa"); // 20 字符 = 5 token
+        assert!(estimate_tokens(&out) <= 3, "截断后 ≤ 预算");
+        assert!(!out.is_empty());
+        assert!(ctx.budget_exceeded);
+        assert_eq!(ctx.state_manager.get_stop_reason(), "max_tokens");
+    }
+
+    #[test]
+    fn budget_shared_between_thinking_and_text() {
+        use crate::kiro::model::events::{Event, ReasoningContentEvent};
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        ctx.set_max_output_tokens(2);
+
+        // thinking 先吃满预算
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: Some("aaaaaaaa".to_string()), // 2 token
+            signature: None,
+        }));
+        assert!(ctx.output_tokens <= 2);
+
+        // 预算耗尽后再来 thinking 内容应被丢弃
+        let events = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: Some("more thinking".to_string()),
+            signature: None,
+        }));
+        // 不应产生新的 thinking_delta（内容被预算截没了）
+        let has_delta = events
+            .iter()
+            .any(|e| e.data["delta"]["type"] == "thinking_delta");
+        assert!(!has_delta, "预算耗尽后 thinking 不应再发 delta");
+        assert!(ctx.budget_exceeded);
+        assert_eq!(ctx.state_manager.get_stop_reason(), "max_tokens");
+    }
+
+    // === SSE 结构完整性 ===
+
+    #[test]
+    fn thinking_content_block_start_has_signature_field() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        // 触发 <thinking> 文本协议路径开块
+        let events = ctx.process_assistant_response("<thinking>reasoning");
+        let start = events
+            .iter()
+            .find(|e| e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "thinking")
+            .expect("应有 thinking content_block_start");
+        assert_eq!(
+            start.data["content_block"]["signature"], "",
+            "thinking content_block_start 必须含 signature 字段"
+        );
+    }
+
+    #[test]
+    fn thinking_block_closes_with_signature_delta() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        // 完整 thinking 块 + 正文：</thinking>\n\n 在同一 chunk，关闭发生在 process_assistant_response
+        let mut all_events = ctx.process_assistant_response("<thinking>think</thinking>\n\nanswer");
+        all_events.extend(ctx.generate_final_events());
+
+        // 关闭 thinking 块应发 signature_delta，而非空 thinking_delta
+        let has_sig = all_events
+            .iter()
+            .any(|e| e.data["delta"]["type"] == "signature_delta");
+        assert!(has_sig, "thinking 块应以 signature_delta 收尾");
+        // 且 thinking 块必须有对应的 content_block_stop
+        let has_stop = all_events
+            .iter()
+            .any(|e| e.event == "content_block_stop");
+        assert!(has_stop, "thinking 块应有 content_block_stop");
+    }
+
+    #[test]
+    fn message_delta_usage_has_no_service_tier() {
+        let mut sm = SseStateManager::new();
+        let _ = sm.handle_message_start(json!({
+            "type": "message_start",
+            "message": { "usage": {} }
+        }));
+        let events = sm.generate_final_events(10, 5, 0, 0);
+        let md = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("应有 message_delta");
+        assert!(
+            md.data["usage"]["service_tier"].is_null(),
+            "message_delta.usage 不应含 service_tier"
+        );
+        // 但 output_tokens 仍在
+        assert_eq!(md.data["usage"]["output_tokens"], 5);
     }
 }

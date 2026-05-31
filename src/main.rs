@@ -180,7 +180,7 @@ async fn main() {
     let config_writer: Arc<Mutex<Config>> = Arc::new(Mutex::new(config.clone()));
 
     // 构建中转层 Prompt cache（Anthropic handler 与 Admin 共享同一实例）
-    let prompt_cache = anthropic::prompt_cache::PromptCache::new(
+    let prompt_cache = anthropic::prompt_cache::PromptCache::new_with_perceived(
         config
             .prompt_cache_capacity
             .unwrap_or(anthropic::prompt_cache::DEFAULT_CAPACITY),
@@ -190,6 +190,7 @@ async fn main() {
                 .unwrap_or(anthropic::prompt_cache::DEFAULT_TTL.as_secs()),
         ),
         config.prompt_cache_enabled.unwrap_or(true),
+        config.perceived_cache_hit_ratio,
     );
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）

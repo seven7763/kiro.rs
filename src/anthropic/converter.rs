@@ -160,22 +160,24 @@ pub fn canonical_anthropic_model(requested: &str) -> String {
     }
     if lower.contains("sonnet") {
         if lower.contains("4-6") || lower.contains("4.6") {
-            return "claude-sonnet-4-6-20260217".to_string();
+            return "claude-sonnet-4-6".to_string();
         }
         return "claude-sonnet-4-5-20250929".to_string();
     }
     if lower.contains("opus") {
         if lower.contains("4-8") || lower.contains("4.8") {
-            // 预埋 opus 4.8：发布日期未知，暂用无日期 ID（上架后可补日期版本号）
             return "claude-opus-4-8".to_string();
         }
         if lower.contains("4-7") || lower.contains("4.7") {
-            return "claude-opus-4-7-20260301".to_string();
+            return "claude-opus-4-7".to_string();
+        }
+        if lower.contains("4-6") || lower.contains("4.6") {
+            return "claude-opus-4-6".to_string();
         }
         if lower.contains("4-5") || lower.contains("4.5") {
             return "claude-opus-4-5-20251101".to_string();
         }
-        return "claude-opus-4-6-20260204".to_string();
+        return "claude-opus-4-6".to_string();
     }
     // 兜底：未识别就原样返回
     cleaned
@@ -1187,7 +1189,7 @@ mod tests {
         );
     }
 
-    /// 4.8 上下文窗口预埋为 1M，canonical 名为无日期 claude-opus-4-8
+    /// 4.8 上下文窗口预埋为 1M，canonical 名无日期后缀
     #[test]
     fn test_opus_4_8_context_and_canonical() {
         assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
@@ -1202,7 +1204,7 @@ mod tests {
         // 回归：4.7 canonical 不变
         assert_eq!(
             canonical_anthropic_model("claude-opus-4.7"),
-            "claude-opus-4-7-20260301"
+            "claude-opus-4-7"
         );
     }
 

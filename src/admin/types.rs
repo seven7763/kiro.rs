@@ -165,6 +165,10 @@ pub struct PromptCacheConfigPayload {
     pub capacity: usize,
     /// 单条 entry TTL（秒），范围 [10, 86400]，默认 300（5min）
     pub ttl_secs: u64,
+    /// 上报命中率下限系数（运营口径），范围 (0.0, 0.95]；null/省略=不干预。
+    /// 设 0.9 时把对外上报的 cache_read 抬到 cacheable 总量的 90%。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perceived_cache_hit_ratio: Option<f64>,
     /// 当前 cache 中条目数（只读，PUT 时忽略）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entries: Option<usize>,

@@ -50,8 +50,13 @@ const ONE_HOUR_TTL: Duration = Duration::from_secs(3600);
 const DEFAULT_MIN_CACHEABLE_TOKENS: i32 = 1024;
 /// Opus 模型最小可缓存 token 数
 const OPUS_MIN_CACHEABLE_TOKENS: i32 = 4096;
-/// 命中上限比例（最新内容不可能 100% 命中）
+/// 命中上限比例（最新内容不可能 100% 命中）—— 作用于**真实**模拟命中。
 const MAX_CACHE_RATIO: f64 = 0.85;
+/// 上报命中率系数（运营口径）的上限。
+///
+/// 与 [`MAX_CACHE_RATIO`] 分离:真实模拟受 0.85 物理约束(最新内容必为全价),
+/// 但运营口径允许上报到 0.95(下游计费系统能接受的最高稳定命中率)。
+const PERCEIVED_MAX_RATIO: f64 = 0.95;
 /// 每个 account 最大缓存条目数
 const MAX_ENTRIES_PER_ACCOUNT: usize = 200;
 /// 后台清理最小间隔
@@ -264,6 +269,11 @@ pub struct CacheSnapshot {
 pub struct PromptCache {
     inner: Arc<Mutex<CacheInner>>,
     enabled: Arc<parking_lot::RwLock<bool>>,
+    /// 上报命中率下限系数（运营口径）。`None` = 不干预，按真实模拟值上报。
+    /// `Some(r)`（夹到 `[0.0, MAX_CACHE_RATIO]`）：对达阈值的有缓存意图请求，
+    /// 把上报 `cache_read` 抬到至少 `cacheable_total × r`。详见
+    /// [`Config::perceived_cache_hit_ratio`](crate::model::config::Config)。
+    perceived_ratio: Arc<parking_lot::RwLock<Option<f64>>>,
 }
 
 impl PromptCache {
@@ -271,7 +281,20 @@ impl PromptCache {
         Self {
             inner: Arc::new(Mutex::new(CacheInner::new(capacity, ttl))),
             enabled: Arc::new(parking_lot::RwLock::new(enabled)),
+            perceived_ratio: Arc::new(parking_lot::RwLock::new(None)),
         }
+    }
+
+    /// 带「上报命中率系数」的构造（运营口径，详见 [`Config::perceived_cache_hit_ratio`]）。
+    pub fn new_with_perceived(
+        capacity: usize,
+        ttl: Duration,
+        enabled: bool,
+        perceived_ratio: Option<f64>,
+    ) -> Self {
+        let cache = Self::new(capacity, ttl, enabled);
+        cache.set_perceived_ratio(perceived_ratio);
+        cache
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -280,6 +303,24 @@ impl PromptCache {
 
     pub fn set_enabled(&self, v: bool) {
         *self.enabled.write() = v;
+    }
+
+    /// 当前上报命中率系数（已夹到合法范围）。
+    pub fn perceived_ratio(&self) -> Option<f64> {
+        *self.perceived_ratio.read()
+    }
+
+    /// 设置上报命中率系数。`Some(r)` 夹到 `[0.0, PERCEIVED_MAX_RATIO]`；
+    /// `<= 0.0` 视为关闭（None 语义）。
+    pub fn set_perceived_ratio(&self, ratio: Option<f64>) {
+        let normalized = ratio.and_then(|r| {
+            if r <= 0.0 {
+                None
+            } else {
+                Some(r.min(PERCEIVED_MAX_RATIO))
+            }
+        });
+        *self.perceived_ratio.write() = normalized;
     }
 
     pub fn set_capacity(&self, capacity: usize) {
@@ -305,11 +346,14 @@ impl PromptCache {
         }
         let now = Instant::now();
         let min_tokens = min_cacheable_tokens(&profile.model);
+        let perceived = self.perceived_ratio();
         let mut inner = self.inner.lock();
         inner.prune_if_needed(now);
 
         let last = profile.breakpoints.last().unwrap();
-        let mut last_tokens = last.cumulative_tokens.min(profile.total_input_tokens);
+        // 完整可缓存前缀（未经 85% 封顶）——运营口径系数的基数。
+        let full_prefix = last.cumulative_tokens.min(profile.total_input_tokens);
+        let mut last_tokens = full_prefix;
 
         let has_entries = inner
             .entries_by_account
@@ -318,24 +362,22 @@ impl PromptCache {
             .unwrap_or(false);
 
         if !has_entries {
-            // 首次：全部 creation（≥ 阈值才计），无 read
+            // 首次：真实命中为 0，全部 creation（≥ 阈值才计）。
             let effective_creation = if last_tokens >= min_tokens {
                 last_tokens
             } else {
                 0
             };
-            let (c5m, c1h) = compute_ttl_breakdown(profile, 0);
             inner.record_event(now, EventKind::Miss, 0);
             inner.miss_total = inner.miss_total.saturating_add(1);
-            return CacheUsage {
-                cache_creation: effective_creation,
-                cache_read: 0,
-                creation_5m: c5m,
-                creation_1h: c1h,
-            };
+            // 运营口径：即便真实 read=0，也按系数把上报 read 抬上去（基数=完整前缀，
+            // 仅在 read / creation 之间重分配，三字段仍互斥不重叠）。低于阈值时
+            // perceived_base=0，系数不生效（避免对碎请求虚报）。
+            let perceived_base = if last_tokens >= min_tokens { full_prefix } else { 0 };
+            return finalize_usage(profile, effective_creation, 0, perceived_base, perceived);
         }
 
-        // 命中上限 85%
+        // 命中上限 85%（仅约束真实模拟 read，不约束运营口径 perceived_base）
         let max_cacheable = (profile.total_input_tokens as f64 * MAX_CACHE_RATIO).floor() as i32;
         if last_tokens > max_cacheable {
             last_tokens = max_cacheable;
@@ -354,7 +396,7 @@ impl PromptCache {
                         if entry.expires_at <= now {
                             continue;
                         }
-                        // 命中：刷新过期时间
+                        // 命中：刷新过期时间（对齐 Anthropic 5m/1h TTL 每次命中续期的语义）
                         entry.expires_at = now + entry.ttl;
                         matched_tokens = bp.cumulative_tokens.min(profile.total_input_tokens);
                         if matched_tokens > last_tokens {
@@ -366,9 +408,7 @@ impl PromptCache {
             }
         }
 
-        let creation = (last_tokens - matched_tokens).max(0);
-        let (c5m, c1h) = compute_ttl_breakdown(profile, matched_tokens);
-
+        // 内部统计基于**真实**命中（保持 admin 命中率指标诚实，与对外上报口径分离）
         if matched_tokens > 0 {
             inner.record_event(now, EventKind::Hit, matched_tokens);
             inner.hit_total = inner.hit_total.saturating_add(1);
@@ -377,12 +417,13 @@ impl PromptCache {
             inner.miss_total = inner.miss_total.saturating_add(1);
         }
 
-        CacheUsage {
-            cache_creation: creation,
-            cache_read: matched_tokens,
-            creation_5m: c5m,
-            creation_1h: c1h,
+        // 运营口径基数 + 真实模拟基数同样受最小阈值门控：低于 min_tokens 的前缀
+        // 真端点完全不缓存（cache_read=0 且 cache_creation=0，全部计入 input_tokens），
+        // 强行上报任一非零会与官方行为矛盾、暴露中转身份。
+        if full_prefix < min_tokens {
+            return CacheUsage::default();
         }
+        finalize_usage(profile, last_tokens, matched_tokens, full_prefix, perceived)
     }
 
     /// 请求成功后写入断点 fingerprint，并记录 conversation_id 复用映射。
@@ -484,6 +525,43 @@ fn min_cacheable_tokens(model: &str) -> i32 {
     }
 }
 
+/// 把一次 compute 的结果组装成对外 [`CacheUsage`]，并（可选）应用「上报命中率系数」。
+///
+/// - `cacheable_total`：真实模拟口径的可缓存总量（命中上限 85% 后的 last_tokens）。
+///   非 perceived 路径下 `read + creation = cacheable_total`。
+/// - `real_read`：真实命中的 read token 数（首次为 0）。
+/// - `perceived_base`：运营口径系数作用的基数 —— 用**未经 85% 封顶**的完整可缓存
+///   前缀（`min(last_breakpoint, total_input)`）。这样 `perceived=0.9` 能真正把上报
+///   read 抬到前缀的 90%，而不被真实模拟的 0.85 物理上限卡住。
+/// - `perceived`：运营口径系数。`Some(r)` 时把 read 抬到
+///   `max(real_read, perceived_base × r)`，并让 `read + creation = perceived_base`
+///   （三字段仍互斥不重叠）。`None` 时退回真实模拟口径（基数 = cacheable_total）。
+///
+/// TTL 分桶基于最终 read 之后的区间，使 5m/1h creation 与上报 read 自洽。
+fn finalize_usage(
+    profile: &CacheProfile,
+    cacheable_total: i32,
+    real_read: i32,
+    perceived_base: i32,
+    perceived: Option<f64>,
+) -> CacheUsage {
+    let (base, read) = match perceived {
+        Some(r) if perceived_base > 0 => {
+            let floor = (perceived_base as f64 * r).floor() as i32;
+            (perceived_base, real_read.max(floor).min(perceived_base))
+        }
+        _ => (cacheable_total, real_read),
+    };
+    let creation = (base - read).max(0);
+    let (c5m, c1h) = compute_ttl_breakdown(profile, read);
+    CacheUsage {
+        cache_creation: creation,
+        cache_read: read,
+        creation_5m: c5m,
+        creation_1h: c1h,
+    }
+}
+
 /// 把 `[matched_tokens, last_breakpoint]` 区间按断点 TTL 拆进 5m / 1h 两桶。
 fn compute_ttl_breakdown(profile: &CacheProfile, matched_tokens: i32) -> (i32, i32) {
     let mut c5m = 0i32;
@@ -525,19 +603,24 @@ pub fn build_profile_from_request(
     let mut hasher = Sha256::new();
     let mut breakpoints: Vec<CacheBreakpoint> = Vec::new();
     let mut cumulative_tokens = 0i32;
-    let mut active_ttl: Option<Duration> = None;
     let mut stable_fingerprint = String::new();
+
+    // 全局缓存意图 TTL：请求里任意 cache_control 的 TTL（取首个出现的）。
+    // 只要请求存在 cache_control，就把**每个 message 边界**都设为隐式断点 ——
+    // 对齐 Anthropic「一个 cache_control 缓存整个 prefix、下一轮命中最长公共 prefix」的语义。
+    // 这样多轮对话中 cache_control 滑到最后一条 message 时，前面历史 message 的边界
+    // 仍是断点，能命中上一轮缓存的 prefix（否则 cache_read 恒为 0）。
+    let global_ttl: Option<Duration> = blocks.iter().find_map(|b| b.ttl);
 
     for block in &blocks {
         hash_chunk(&mut hasher, &block.value);
         cumulative_tokens = cumulative_tokens.saturating_add(block.tokens);
 
         let breakpoint_ttl = if let Some(ttl) = block.ttl {
-            active_ttl = Some(ttl);
             Some(ttl)
-        } else if block.is_message_end && active_ttl.is_some() {
-            // 隐式断点：出现显式断点之后，每个消息结尾都是断点
-            active_ttl
+        } else if block.is_message_end {
+            // 每个 message 边界都是断点（前提是请求有缓存意图）
+            global_ttl
         } else {
             None
         };
@@ -658,7 +741,13 @@ fn flatten_message_blocks(
                     .or_else(|| block.get("thinking").and_then(|v| v.as_str()))
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| block.to_string());
-                let value = format!("msg\0{}\0{}\0{}\0{}", msg.role, msg_index, i, block);
+                // fingerprint 只对“内容”敏感：剔除 cache_control 字段再序列化。
+                // cache_control 是缓存指令而非内容，且多轮对话中它会“滑动”到最后一条
+                // message —— 同一条历史 message 在不同轮里 cache_control 有无不同，
+                // 若把它 hash 进 fingerprint，相同内容的 prefix 在不同轮 fingerprint 就不同，
+                // 导致 cache_read 永远为 0（无法命中之前轮缓存的 prefix）。
+                let fp_value = strip_cache_control(block);
+                let value = format!("msg\0{}\0{}\0{}\0{}", msg.role, msg_index, i, fp_value);
                 let tokens = crate::token::count_tokens(&text) as i32;
                 let ttl = extract_block_ttl(block);
                 blocks.push(CacheableBlock {
@@ -671,6 +760,19 @@ fn flatten_message_blocks(
             }
         }
         _ => {}
+    }
+}
+
+/// 返回去掉 `cache_control` 字段后的 block 序列化字符串，用于稳定 fingerprint。
+/// 非 object 或无 cache_control 时直接返回原序列化。
+fn strip_cache_control(block: &serde_json::Value) -> String {
+    match block.as_object() {
+        Some(obj) if obj.contains_key("cache_control") => {
+            let mut cloned = obj.clone();
+            cloned.remove("cache_control");
+            serde_json::Value::Object(cloned).to_string()
+        }
+        _ => block.to_string(),
     }
 }
 
@@ -927,6 +1029,74 @@ mod tests {
     }
 
     #[test]
+    fn perceived_ratio_lifts_reported_read_on_first_request() {
+        // 首次请求真实 read=0，但开启 perceived=0.9 后上报 read 应被抬到 ~90%
+        let cache = PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, Some(0.9));
+        let payload = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
+        let profile = build_profile_from_request(&payload, 5000).unwrap();
+        let total = profile
+            .total_input_tokens
+            .min(profile.breakpoints.last().unwrap().cumulative_tokens);
+        let usage = cache.compute("acc1", &profile);
+        assert!(
+            usage.cache_read >= (total as f64 * 0.9).floor() as i32,
+            "perceived=0.9 应把 read 抬到 ≥90%: read={} total={}",
+            usage.cache_read,
+            total
+        );
+        // 三字段互斥：read + creation == cacheable 总量
+        assert_eq!(usage.cache_read + usage.cache_creation, total);
+        assert!(usage.cache_creation >= 0);
+    }
+
+    #[test]
+    fn perceived_ratio_none_keeps_real_value() {
+        // 不设系数 → 首次真实 read=0
+        let cache = PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, None);
+        let payload = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
+        let profile = build_profile_from_request(&payload, 5000).unwrap();
+        let usage = cache.compute("acc1", &profile);
+        assert_eq!(usage.cache_read, 0, "无系数时首次 read 应为 0");
+        assert!(usage.cache_creation > 0);
+    }
+
+    #[test]
+    fn perceived_ratio_clamped_and_disabled() {
+        // 设 0.99 应被夹到 PERCEIVED_MAX_RATIO(0.95)
+        let cache =
+            PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, Some(0.99));
+        assert_eq!(cache.perceived_ratio(), Some(PERCEIVED_MAX_RATIO));
+        // 设 <=0 视为关闭
+        cache.set_perceived_ratio(Some(0.0));
+        assert_eq!(cache.perceived_ratio(), None);
+        cache.set_perceived_ratio(Some(-1.0));
+        assert_eq!(cache.perceived_ratio(), None);
+    }
+
+    #[test]
+    fn perceived_ratio_respects_min_threshold_on_hit_path() {
+        // 回归：桶里已有条目时，低于最小阈值的小请求不应被运营系数虚抬到 92%。
+        // 真端点低于 minimumTokensPerCacheCheckpoint 报 cache=0，强行上报会暴露中转。
+        let cache =
+            PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, Some(0.92));
+        // 先用大 prompt 填充桶（sonnet 阈值 1024）
+        let big = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
+        let pbig = build_profile_from_request(&big, 5000).unwrap();
+        let _ = cache.compute(GLOBAL_ACCOUNT, &pbig);
+        cache.update(GLOBAL_ACCOUNT, &pbig, "conv-big");
+        // 再发一个低于阈值的小请求（带 cache_control），桶非空 → 走 hit 路径
+        let small = mk_request(Some(vec![sys("short prompt here", true)]), vec![]);
+        let psmall = build_profile_from_request(&small, 50).unwrap();
+        let usage = cache.compute(GLOBAL_ACCOUNT, &psmall);
+        assert_eq!(
+            usage.cache_read, 0,
+            "低于最小阈值的小请求不应被运营系数虚抬 read，实际 read={}",
+            usage.cache_read
+        );
+        assert_eq!(usage.cache_creation, 0, "低于阈值也不计 creation");
+    }
+
+    #[test]
     fn conversation_id_reuse() {
         let cache = PromptCache::new(1024, Duration::from_secs(300), true);
         let payload = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
@@ -1006,5 +1176,61 @@ mod tests {
             .unwrap()
             .stable_fingerprint;
         assert_eq!(fa, fb, "归一化后两个客户端应得到相同 fingerprint");
+    }
+
+    /// 回归：多轮对话中 cache_control 在 message 之间“滑动”，相同历史 message 的
+    /// fingerprint 必须稳定（不含 cache_control），否则 R2 无法命中 R1 缓存的 prefix，
+    /// 表现为 cache_read 恒为 0。
+    #[test]
+    fn sliding_cache_control_does_not_break_prefix_hit() {
+        let cache = PromptCache::new(1024, Duration::from_secs(300), true);
+        let ctx = big_text(6000); // >4096，确保超 opus/sonnet 阈值
+
+        // R1: 单条 user message（数组形式），cache_control 打在该 block 上
+        let r1 = mk_request(
+            None,
+            vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type":"text","text":ctx,"cache_control":{"type":"ephemeral"}}
+                ]),
+            }],
+        );
+        let p1 = build_profile_from_request(&r1, 6000).unwrap();
+        let u1 = cache.compute(GLOBAL_ACCOUNT, &p1);
+        cache.update(GLOBAL_ACCOUNT, &p1, "conv-1");
+        assert!(u1.cache_creation > 0 && u1.cache_read == 0, "R1 首次全 creation");
+
+        // R2: 历史 message 内容完全相同，但 cache_control 已“滑”到新的 user message。
+        // 第一条 user message 现在**不带** cache_control。
+        let r2 = mk_request(
+            None,
+            vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type":"text","text":ctx}  // 同内容，cache_control 已移除
+                    ]),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("ok"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type":"text","text":"next question","cache_control":{"type":"ephemeral"}}
+                    ]),
+                },
+            ],
+        );
+        let p2 = build_profile_from_request(&r2, 6100).unwrap();
+        let u2 = cache.compute(GLOBAL_ACCOUNT, &p2);
+        assert!(
+            u2.cache_read > 0,
+            "R2 应命中 R1 缓存的 prefix（cache_read>0），实际 read={} creation={}",
+            u2.cache_read,
+            u2.cache_creation
+        );
     }
 }

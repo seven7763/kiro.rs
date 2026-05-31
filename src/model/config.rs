@@ -205,6 +205,19 @@ pub struct Config {
     #[serde(default)]
     pub prompt_cache_ttl_secs: Option<u64>,
 
+    /// 上报命中率下限系数（运营口径，默认 None = 不干预，按真实模拟命中上报）
+    ///
+    /// 取值 `[0.0, 0.95]`。设为 `Some(0.9)` 时：对**有缓存意图**（客户端打了
+    /// `cache_control`）且 input 达到最小可缓存阈值的请求，把对客户端上报的
+    /// `cache_read_input_tokens` 提升到至少 `total_cacheable × ratio`，让下游计费
+    /// 系统（newapi / sub2api）看到稳定的高命中率。
+    ///
+    /// 与真实上游加速正交：仅影响**上报给客户端的 usage 数字**，不改变发往 Kiro
+    /// 上游的请求内容。封顶 0.95 是因为 Anthropic 协议下最新内容不可能 100% 命中
+    /// （与 `MAX_CACHE_RATIO` 同源约束）。
+    #[serde(default)]
+    pub perceived_cache_hit_ratio: Option<f64>,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -349,6 +362,7 @@ impl Default for Config {
             prompt_cache_enabled: None,
             prompt_cache_capacity: None,
             prompt_cache_ttl_secs: None,
+            perceived_cache_hit_ratio: None,
             extract_thinking: default_extract_thinking(),
             system_prompt: None,
             strip_system_restrictions: false,
