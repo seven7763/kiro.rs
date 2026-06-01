@@ -16,8 +16,23 @@ pub struct CredentialsStatusResponse {
     pub available: usize,
     /// 当前活跃凭据 ID
     pub current_id: u64,
+    /// 已配置的凭据分组列表
+    pub credential_groups: Vec<CredentialGroupStatusItem>,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
+}
+
+/// 凭据分组状态信息
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialGroupStatusItem {
+    /// 分组 ID
+    pub id: String,
+    /// 分组代理 URL；None 表示该组直连
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    /// 是否配置为代理出口
+    pub has_proxy: bool,
 }
 
 /// 单个凭据的状态信息
@@ -57,6 +72,11 @@ pub struct CredentialStatusItem {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 凭据分组 ID（如果配置）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// 有效代理来源：credential / credential_direct / group / group_direct / global / none
+    pub proxy_source: String,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -94,6 +114,14 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 修改凭据分组请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialGroupRequest {
+    /// 新分组 ID；null/空字符串表示移出分组
+    pub group: Option<String>,
 }
 
 /// 添加凭据请求
@@ -143,6 +171,9 @@ pub struct AddCredentialRequest {
     /// 凭据级代理认证密码（可选）
     pub proxy_password: Option<String>,
 
+    /// 凭据分组 ID（可选）
+    pub group: Option<String>,
+
     /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -165,8 +196,8 @@ pub struct PromptCacheConfigPayload {
     pub capacity: usize,
     /// 单条 entry TTL（秒），范围 [10, 86400]，默认 300（5min）
     pub ttl_secs: u64,
-    /// 上报命中率下限系数（运营口径），范围 (0.0, 0.95]；null/省略=不干预。
-    /// 设 0.9 时把对外上报的 cache_read 抬到 cacheable 总量的 90%。
+    /// 上报命中率系数（运营/计费口径），范围 [0.0, 0.95]；null/省略=不干预。
+    /// 设 0.9 时把对外上报的 cache_read 固定到客户端可见 input 的 90%，creation 置 0。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perceived_cache_hit_ratio: Option<f64>,
     /// 当前 cache 中条目数（只读，PUT 时忽略）
@@ -190,6 +221,12 @@ pub struct PromptCacheConfigPayload {
     /// 5 分钟内累计节省 input tokens（只读）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_input_tokens_5m: Option<i64>,
+    /// 1 分钟窗口上报/计费口径命中率（百分比，只读）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_hit_rate_1m: Option<f64>,
+    /// 5 分钟内上报/计费口径节省 input tokens（只读）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_saved_input_tokens_5m: Option<i64>,
 }
 
 /// GET/PUT /api/admin/runtime/retry-config 的请求/响应

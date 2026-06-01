@@ -220,9 +220,18 @@ pub fn create_websearch_sse_stream(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(
+        &model,
+        &query,
+        &tool_use_id,
+        search_results,
+        input_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+    );
 
     stream::iter(
         events
@@ -238,9 +247,15 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
+    let cache_creation = json!({
+        "ephemeral_5m_input_tokens": cache_creation_input_tokens.max(0),
+        "ephemeral_1h_input_tokens": 0
+    });
 
     // 1. message_start
     events.push(SseEvent::new(
@@ -254,11 +269,16 @@ fn generate_websearch_events(
                 "model": model,
                 "content": [],
                 "stop_reason": null,
+                "stop_sequence": null,
+                "stop_details": null,
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens,
+                    "cache_creation": cache_creation.clone(),
+                    "service_tier": "standard",
+                    "inference_geo": "not_available"
                 }
             }
         }),
@@ -422,6 +442,10 @@ fn generate_websearch_events(
                 "stop_reason": "end_turn"
             },
             "usage": {
+                "input_tokens": input_tokens,
+                "cache_creation_input_tokens": cache_creation_input_tokens,
+                "cache_read_input_tokens": cache_read_input_tokens,
+                "cache_creation": cache_creation,
                 "output_tokens": output_tokens,
                 "server_tool_use": {
                     "web_search_requests": 1
@@ -472,6 +496,8 @@ pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -504,8 +530,15 @@ pub async fn handle_websearch_request(
 
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    let stream = create_websearch_sse_stream(
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        input_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+    );
 
     Response::builder()
         .status(StatusCode::OK)
@@ -757,5 +790,41 @@ mod tests {
         assert!(summary.contains("Test Result"));
         assert!(summary.contains("https://example.com"));
         assert!(summary.contains("This is a test snippet"));
+    }
+
+    #[test]
+    fn test_generate_events_preserves_visible_cache_usage() {
+        let events = generate_websearch_events(
+            "claude-sonnet-4-5",
+            "rust",
+            "toolu_test",
+            None,
+            1,
+            0,
+            17_999,
+        );
+        let start = events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("应有 message_start");
+        let usage = &start.data["message"]["usage"];
+        assert_eq!(usage["input_tokens"], 1);
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
+        assert_eq!(usage["cache_read_input_tokens"], 17_999);
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 0);
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 0);
+
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("应有 message_delta");
+        let delta_usage = &delta.data["usage"];
+        assert_eq!(delta_usage["input_tokens"], 1);
+        assert_eq!(delta_usage["cache_creation_input_tokens"], 0);
+        assert_eq!(delta_usage["cache_read_input_tokens"], 17_999);
+        assert_eq!(
+            delta_usage["cache_creation"]["ephemeral_5m_input_tokens"],
+            0
+        );
     }
 }

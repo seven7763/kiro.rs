@@ -37,6 +37,22 @@ pub struct UserPreset {
     pub content: String,
 }
 
+/// 凭据分组代理配置。
+///
+/// 凭据可在 credentials.json 中设置 `"group": "group-id"` 继承这里的出口。
+/// `proxyUrl = "direct"` 或省略 `proxyUrl` 都表示该组直连，不继承全局代理。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialGroupConfig {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,6 +118,10 @@ pub struct Config {
     /// 代理认证密码（可选）
     #[serde(default)]
     pub proxy_password: Option<String>,
+
+    /// 凭据分组。每个组可指定一个 socks5/http 代理，或显式直连。
+    #[serde(default)]
+    pub credential_groups: Vec<CredentialGroupConfig>,
 
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
@@ -208,9 +228,10 @@ pub struct Config {
     /// 上报命中率下限系数（运营口径，默认 None = 不干预，按真实模拟命中上报）
     ///
     /// 取值 `[0.0, 0.95]`。设为 `Some(0.9)` 时：对**有缓存意图**（客户端打了
-    /// `cache_control`）且 input 达到最小可缓存阈值的请求，把对客户端上报的
-    /// `cache_read_input_tokens` 提升到至少 `total_cacheable × ratio`，让下游计费
-    /// 系统（newapi / sub2api）看到稳定的高命中率。
+    /// `cache_control`）且客户端可见 input 达到最小可缓存阈值的请求，把对客户端上报的
+    /// `cache_read_input_tokens` 固定为 `client_input × ratio`，剩余归入普通
+    /// `input_tokens`，`cache_creation_input_tokens` 置 0，避免 cache write 溢价导致
+    /// 下游计费异常。
     ///
     /// 与真实上游加速正交：仅影响**上报给客户端的 usage 数字**，不改变发往 Kiro
     /// 上游的请求内容。封顶 0.95 是因为 Anthropic 协议下最新内容不可能 100% 命中
@@ -346,6 +367,7 @@ impl Default for Config {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            credential_groups: Vec::new(),
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             transient_cooldown_enabled: default_transient_cooldown_enabled(),
@@ -393,6 +415,15 @@ impl Config {
     /// 优先使用 api_region，未配置时回退到 region
     pub fn effective_api_region(&self) -> &str {
         self.api_region.as_deref().unwrap_or(&self.region)
+    }
+
+    /// 查找凭据分组配置。空字符串视为未配置。
+    pub fn credential_group(&self, id: &str) -> Option<&CredentialGroupConfig> {
+        let id = id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        self.credential_groups.iter().find(|g| g.id == id)
     }
 
     /// 从文件加载配置

@@ -10,8 +10,9 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, CreateUserPresetRequest, PromptCacheConfigPayload,
-        RetryConfigPayload, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse, UpdateSystemPromptRequest, UpdateUserPresetRequest,
+        RetryConfigPayload, SetCredentialGroupRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
+        UpdateSystemPromptRequest, UpdateUserPresetRequest,
     },
 };
 
@@ -115,6 +116,24 @@ pub async fn set_credential_priority(
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} 优先级已设置为 {}",
             id, payload.priority
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/group
+/// 设置凭据分组
+pub async fn set_credential_group(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialGroupRequest>,
+) -> impl IntoResponse {
+    match state.service.set_group(id, payload.group.clone()) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 分组已设置为 {}",
+            id,
+            payload.group.unwrap_or_else(|| "(none)".to_string())
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),

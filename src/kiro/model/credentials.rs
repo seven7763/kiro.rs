@@ -93,6 +93,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
 
+    /// 凭据分组 ID。配置后继承 config.credentialGroups 中该组的代理/直连策略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
@@ -124,6 +128,18 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
     } else {
         value
     }
+}
+
+fn proxy_from_parts(
+    url: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> ProxyConfig {
+    let mut proxy = ProxyConfig::new(url);
+    if let (Some(username), Some(password)) = (username, password) {
+        proxy = proxy.with_auth(username, password);
+    }
+    proxy
 }
 
 /// 凭据配置（支持单对象或数组格式）
@@ -219,20 +235,104 @@ impl KiroCredentials {
     /// 获取有效的代理配置
     /// 优先级：凭据代理 > 全局代理 > 无代理
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
+    #[cfg(test)]
     pub fn effective_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
-        match self.proxy_url.as_deref() {
-            Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
-            Some(url) => {
-                let mut proxy = ProxyConfig::new(url);
-                if let (Some(username), Some(password)) =
-                    (&self.proxy_username, &self.proxy_password)
-                {
-                    proxy = proxy.with_auth(username, password);
-                }
-                Some(proxy)
-            }
-            None => global_proxy.cloned(),
+        self.effective_proxy_inner(None, global_proxy)
+    }
+
+    /// 获取带凭据分组的有效代理配置。
+    ///
+    /// 优先级：凭据代理/direct > 凭据分组代理/direct > 全局代理 > 无代理。
+    pub fn effective_proxy_with_group(
+        &self,
+        config: &Config,
+        global_proxy: Option<&ProxyConfig>,
+    ) -> Option<ProxyConfig> {
+        let group = self
+            .group
+            .as_deref()
+            .and_then(|id| config.credential_group(id));
+        self.effective_proxy_inner(group, global_proxy)
+    }
+
+    /// 当前凭据是否配置了显式出口路由（凭据级 proxy/direct 或有效分组）。
+    ///
+    /// provider 的 fallback proxy 只应该覆盖“没有显式出口”的凭据；否则分组出口会
+    /// 在重试阶段被 fallback 打散，失去“几张凭据固定一个出口”的意义。
+    pub fn has_explicit_proxy_route(&self, config: &Config) -> bool {
+        if self.proxy_url.is_some() {
+            return true;
         }
+        self.group
+            .as_deref()
+            .and_then(|id| config.credential_group(id))
+            .is_some()
+    }
+
+    /// 返回 admin 展示用的代理来源与 URL。
+    pub fn effective_proxy_display(
+        &self,
+        config: &Config,
+        global_proxy: Option<&ProxyConfig>,
+    ) -> (&'static str, Option<String>) {
+        match self.proxy_url.as_deref() {
+            Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => {
+                return ("credential_direct", None);
+            }
+            Some(url) => return ("credential", Some(url.to_string())),
+            None => {}
+        }
+
+        if let Some(group) = self
+            .group
+            .as_deref()
+            .and_then(|id| config.credential_group(id))
+        {
+            return match group.proxy_url.as_deref() {
+                Some(url) if !url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => {
+                    ("group", Some(url.to_string()))
+                }
+                _ => ("group_direct", None),
+            };
+        }
+
+        match global_proxy {
+            Some(proxy) => ("global", Some(proxy.url.clone())),
+            None => ("none", None),
+        }
+    }
+
+    fn effective_proxy_inner(
+        &self,
+        group: Option<&crate::model::config::CredentialGroupConfig>,
+        global_proxy: Option<&ProxyConfig>,
+    ) -> Option<ProxyConfig> {
+        match self.proxy_url.as_deref() {
+            Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => return None,
+            Some(url) => {
+                return Some(proxy_from_parts(
+                    url,
+                    self.proxy_username.as_deref(),
+                    self.proxy_password.as_deref(),
+                ));
+            }
+            None => {}
+        }
+
+        if let Some(group) = group {
+            return match group.proxy_url.as_deref() {
+                Some(url) if !url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => Some(
+                    proxy_from_parts(
+                        url,
+                        group.proxy_username.as_deref(),
+                        group.proxy_password.as_deref(),
+                    ),
+                ),
+                _ => None,
+            };
+        }
+
+        global_proxy.cloned()
     }
 
     pub fn canonicalize_auth_method(&mut self) {
@@ -343,6 +443,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            group: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
@@ -461,6 +562,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            group: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
@@ -492,6 +594,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            group: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
@@ -606,6 +709,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            group: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
@@ -872,5 +976,77 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_group_field_roundtrip() {
+        let json = r#"{"refreshToken":"test","group":"socks-a"}"#;
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.group.as_deref(), Some("socks-a"));
+
+        let serialized = creds.to_pretty_json().unwrap();
+        assert!(serialized.contains("\"group\""));
+        assert!(serialized.contains("socks-a"));
+    }
+
+    #[test]
+    fn test_group_proxy_is_used_before_global() {
+        let mut config = Config::default();
+        config.credential_groups = vec![crate::model::config::CredentialGroupConfig {
+            id: "g1".to_string(),
+            proxy_url: Some("socks5://group:1080".to_string()),
+            proxy_username: None,
+            proxy_password: None,
+        }];
+        let global = ProxyConfig::new("http://global:8080");
+        let mut creds = KiroCredentials::default();
+        creds.group = Some("g1".to_string());
+
+        let result = creds.effective_proxy_with_group(&config, Some(&global));
+        assert_eq!(result, Some(ProxyConfig::new("socks5://group:1080")));
+        assert!(creds.has_explicit_proxy_route(&config));
+        assert_eq!(
+            creds.effective_proxy_display(&config, Some(&global)),
+            ("group", Some("socks5://group:1080".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_group_direct_bypasses_global() {
+        let mut config = Config::default();
+        config.credential_groups = vec![crate::model::config::CredentialGroupConfig {
+            id: "direct-group".to_string(),
+            proxy_url: Some("direct".to_string()),
+            proxy_username: None,
+            proxy_password: None,
+        }];
+        let global = ProxyConfig::new("http://global:8080");
+        let mut creds = KiroCredentials::default();
+        creds.group = Some("direct-group".to_string());
+
+        let result = creds.effective_proxy_with_group(&config, Some(&global));
+        assert_eq!(result, None);
+        assert!(creds.has_explicit_proxy_route(&config));
+        assert_eq!(
+            creds.effective_proxy_display(&config, Some(&global)),
+            ("group_direct", None)
+        );
+    }
+
+    #[test]
+    fn test_credential_proxy_overrides_group() {
+        let mut config = Config::default();
+        config.credential_groups = vec![crate::model::config::CredentialGroupConfig {
+            id: "g1".to_string(),
+            proxy_url: Some("socks5://group:1080".to_string()),
+            proxy_username: None,
+            proxy_password: None,
+        }];
+        let mut creds = KiroCredentials::default();
+        creds.group = Some("g1".to_string());
+        creds.proxy_url = Some("socks5://credential:1080".to_string());
+
+        let result = creds.effective_proxy_with_group(&config, None);
+        assert_eq!(result, Some(ProxyConfig::new("socks5://credential:1080")));
     }
 }

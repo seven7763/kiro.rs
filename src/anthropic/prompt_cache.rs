@@ -18,10 +18,9 @@
 //!
 //! ## 与 conversation_id 复用的关系
 //!
-//! 本模块额外维护一个 `fingerprint → conversation_id` 映射（最稳定断点优先），
-//! 命中时复用上次的 conversation_id，让上游 Kiro 的 session 缓存有机会生效。
-//! 这与精确计费正交：计费负责给客户端/下游正确的 usage 数字，conversation_id 复用
-//! 负责尝试真正的上游加速。
+//! 本模块额外维护一个 `(account, fingerprint) → conversation_id` 映射（最稳定断点优先），
+//! 命中时仅在同一 account 内复用上次的 conversation_id，让上游 Kiro 的 session 缓存
+//! 有机会生效，同时避免多用户共用一个代理 key 时串会话。
 //!
 //! ## 对齐 Anthropic 的规则
 //!
@@ -32,7 +31,7 @@
 //! ## 限制
 //!
 //! - 单进程内存，不跨节点（多副本各算各的）。
-//! - token 数为本地估算（`token::count_tokens`），非上游精确值。
+//! - token 数为本地估算（`token_count::count_tokens`），非上游精确值。
 
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -62,8 +61,13 @@ const MAX_ENTRIES_PER_ACCOUNT: usize = 200;
 /// 后台清理最小间隔
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// 全局桶名（请求未携带可识别 account 时使用）
+/// 测试用桶名；线上请求必须由 handler 传入用户/session 级 account。
+#[cfg(test)]
 pub const GLOBAL_ACCOUNT: &str = "_global";
+
+fn conversation_key(account: &str, fingerprint: &str) -> String {
+    format!("{account}\u{1f}{fingerprint}")
+}
 
 // ============================================================================
 // Profile / 断点 / Usage
@@ -118,7 +122,6 @@ struct CacheableBlock {
 #[derive(Debug, Clone)]
 struct CacheEntry {
     expires_at: Instant,
-    ttl: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,7 +134,7 @@ enum EventKind {
 struct CacheInner {
     /// account → (fingerprint → entry)
     entries_by_account: HashMap<String, HashMap<String, CacheEntry>>,
-    /// 最稳定断点 fingerprint → 上次该 prefix 的 conversation_id（跨 account 共享）
+    /// `(account, 最稳定断点 fingerprint)` → 上次该 prefix 的 conversation_id
     conversation_by_fingerprint: HashMap<String, (String, Instant)>,
     capacity: usize,
     ttl: Duration,
@@ -139,8 +142,10 @@ struct CacheInner {
     hit_total: u64,
     miss_total: u64,
     eviction_total: u64,
-    /// 滑动窗口事件 (time, kind, saved_tokens)
-    recent_events: Vec<(Instant, EventKind, i32)>,
+    /// 滑动窗口事件 `(time, kind, real_saved, reported_saved)`。
+    /// `kind`/`real_saved` 是**真实**模拟命中（诚实，运维诊断用）；
+    /// `reported_saved` 是应用 perceived 系数后**对客户端上报**的 read（对账用）。
+    recent_events: Vec<(Instant, EventKind, i32, i32)>,
 }
 
 impl CacheInner {
@@ -162,19 +167,23 @@ impl CacheInner {
         self.entries_by_account.values().map(|m| m.len()).sum()
     }
 
-    fn record_event(&mut self, now: Instant, kind: EventKind, saved_tokens: i32) {
+    /// 记录一次缓存判定。`real_saved` = 真实命中节省；`reported_saved` = 上报口径节省。
+    fn record_event(&mut self, now: Instant, kind: EventKind, real_saved: i32, reported_saved: i32) {
         if self.recent_events.len() >= 2048 {
             let drain_to = self.recent_events.len() - 1024;
             self.recent_events.drain(..drain_to);
         }
-        self.recent_events.push((now, kind, saved_tokens));
+        self.recent_events
+            .push((now, kind, real_saved, reported_saved));
     }
 
     fn stats_in_window(&self, now: Instant, window: Duration) -> WindowStats {
         let mut hits = 0u64;
         let mut misses = 0u64;
         let mut saved_tokens: i64 = 0;
-        for (t, kind, saved) in self.recent_events.iter().rev() {
+        let mut reported_hits = 0u64;
+        let mut reported_saved: i64 = 0;
+        for (t, kind, saved, rep) in self.recent_events.iter().rev() {
             if now.duration_since(*t) > window {
                 break;
             }
@@ -185,11 +194,18 @@ impl CacheInner {
                 }
                 EventKind::Miss => misses += 1,
             }
+            // 上报口径：reported_saved>0 即视为一次"上报命中"（与真实 kind 无关）
+            if *rep > 0 {
+                reported_hits += 1;
+                reported_saved = reported_saved.saturating_add(*rep as i64);
+            }
         }
         WindowStats {
             hits,
             misses,
             saved_input_tokens: saved_tokens,
+            reported_hits,
+            reported_saved_input_tokens: reported_saved,
         }
     }
 
@@ -235,15 +251,31 @@ pub struct WindowStats {
     pub hits: u64,
     pub misses: u64,
     pub saved_input_tokens: i64,
+    /// 上报口径命中次数（应用 perceived 系数后 reported read>0 的请求数）
+    pub reported_hits: u64,
+    /// 上报口径节省 input tokens（对客户端/下游计费可见）
+    pub reported_saved_input_tokens: i64,
 }
 
 impl WindowStats {
+    /// 真实命中率（运维诊断口径）：真实命中 / 总请求。
     pub fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
         if total == 0 {
             0.0
         } else {
             self.hits as f64 * 100.0 / total as f64
+        }
+    }
+
+    /// 上报命中率（业务对账口径）：上报命中 / 总请求。
+    /// 总请求分母与真实口径相同（hits+misses），保证两个口径可比。
+    pub fn reported_hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.reported_hits as f64 * 100.0 / total as f64
         }
     }
 }
@@ -269,9 +301,9 @@ pub struct CacheSnapshot {
 pub struct PromptCache {
     inner: Arc<Mutex<CacheInner>>,
     enabled: Arc<parking_lot::RwLock<bool>>,
-    /// 上报命中率下限系数（运营口径）。`None` = 不干预，按真实模拟值上报。
-    /// `Some(r)`（夹到 `[0.0, MAX_CACHE_RATIO]`）：对达阈值的有缓存意图请求，
-    /// 把上报 `cache_read` 抬到至少 `cacheable_total × r`。详见
+    /// 上报命中率系数（运营/计费口径）。`None` = 不干预，按真实模拟值上报。
+    /// `Some(r)`（夹到 `[0.0, PERCEIVED_MAX_RATIO]`）：用于 Admin 对账指标；
+    /// 真正返回给客户端的 fake usage 在 handler 的 client-visible usage 层生成。详见
     /// [`Config::perceived_cache_hit_ratio`](crate::model::config::Config)。
     perceived_ratio: Arc<parking_lot::RwLock<Option<f64>>>,
 }
@@ -337,7 +369,10 @@ impl PromptCache {
         inner.ttl = ttl;
     }
 
-    /// 计算命中情况（不修改命中标记之外的状态；会刷新命中 entry 的过期时间）。
+    /// 计算命中情况（纯读路径，不写 entry、不刷新 TTL、不记录统计）。
+    ///
+    /// 只有上游成功接受请求后，handler 才会调用 [`Self::record_success`] 与
+    /// [`Self::update`]，避免 429/5xx 失败请求污染真实缓存诊断和命中率窗口。
     ///
     /// `account`：当前请求命中的凭据维度（如 credential id），用于缓存隔离。
     pub fn compute(&self, account: &str, profile: &CacheProfile) -> CacheUsage {
@@ -368,13 +403,10 @@ impl PromptCache {
             } else {
                 0
             };
-            inner.record_event(now, EventKind::Miss, 0);
-            inner.miss_total = inner.miss_total.saturating_add(1);
-            // 运营口径：即便真实 read=0，也按系数把上报 read 抬上去（基数=完整前缀，
-            // 仅在 read / creation 之间重分配，三字段仍互斥不重叠）。低于阈值时
-            // perceived_base=0，系数不生效（避免对碎请求虚报）。
-            let perceived_base = if last_tokens >= min_tokens { full_prefix } else { 0 };
-            return finalize_usage(profile, effective_creation, 0, perceived_base, perceived);
+            // 首次/空桶没有真实可读缓存，不能用运营系数把 MISS 伪装成 cache_read。
+            // 否则 R1 就会显示 90%+ 命中，既不符合 Anthropic prompt cache 语义，
+            // 也会让下游对账误以为上游已经真实复用。
+            return finalize_usage(profile, effective_creation, 0, 0, None);
         }
 
         // 命中上限 85%（仅约束真实模拟 read，不约束运营口径 perceived_base）
@@ -386,18 +418,16 @@ impl PromptCache {
         // 从后往前找最长命中断点
         let mut matched_tokens = 0i32;
         {
-            let entries = inner.entries_by_account.get_mut(account);
+            let entries = inner.entries_by_account.get(account);
             if let Some(entries) = entries {
                 for bp in profile.breakpoints.iter().rev() {
                     if bp.cumulative_tokens < min_tokens {
                         continue;
                     }
-                    if let Some(entry) = entries.get_mut(&bp.fingerprint) {
+                    if let Some(entry) = entries.get(&bp.fingerprint) {
                         if entry.expires_at <= now {
                             continue;
                         }
-                        // 命中：刷新过期时间（对齐 Anthropic 5m/1h TTL 每次命中续期的语义）
-                        entry.expires_at = now + entry.ttl;
                         matched_tokens = bp.cumulative_tokens.min(profile.total_input_tokens);
                         if matched_tokens > last_tokens {
                             matched_tokens = last_tokens;
@@ -408,22 +438,46 @@ impl PromptCache {
             }
         }
 
-        // 内部统计基于**真实**命中（保持 admin 命中率指标诚实，与对外上报口径分离）
-        if matched_tokens > 0 {
-            inner.record_event(now, EventKind::Hit, matched_tokens);
-            inner.hit_total = inner.hit_total.saturating_add(1);
-        } else {
-            inner.record_event(now, EventKind::Miss, 0);
-            inner.miss_total = inner.miss_total.saturating_add(1);
-        }
-
         // 运营口径基数 + 真实模拟基数同样受最小阈值门控：低于 min_tokens 的前缀
         // 真端点完全不缓存（cache_read=0 且 cache_creation=0，全部计入 input_tokens），
         // 强行上报任一非零会与官方行为矛盾、暴露中转身份。
         if full_prefix < min_tokens {
             return CacheUsage::default();
         }
-        finalize_usage(profile, last_tokens, matched_tokens, full_prefix, perceived)
+
+        // compute 返回值保持真实模拟口径：perceived 只能抬高“已有真实命中”的 read 比例，
+        // 不能把无匹配的大请求从 MISS 变成 HIT。handler 会在最终客户端 usage 层做 fake billing。
+        let perceived_for_usage = if matched_tokens > 0 { perceived } else { None };
+        let usage = finalize_usage(
+            profile,
+            last_tokens,
+            matched_tokens,
+            full_prefix,
+            perceived_for_usage,
+        );
+
+        usage
+    }
+
+    /// 上游成功后记录本次缓存统计。
+    ///
+    /// - `real_cache_read`：真实模拟命中的 token，用于真实 hit/miss 诊断。
+    /// - `reported_cache_read`：最终对客户端上报的 cache_read，用于计费/对账口径。
+    pub fn record_success(&self, real_cache_read: i32, reported_cache_read: i32) {
+        if !self.is_enabled() {
+            return;
+        }
+        let now = Instant::now();
+        let real_read = real_cache_read.max(0);
+        let reported_read = reported_cache_read.max(0);
+        let mut inner = self.inner.lock();
+        if real_read > 0 {
+            inner.record_event(now, EventKind::Hit, real_read, reported_read);
+            inner.hit_total = inner.hit_total.saturating_add(1);
+        } else {
+            inner.record_event(now, EventKind::Miss, 0, reported_read);
+            inner.miss_total = inner.miss_total.saturating_add(1);
+        }
     }
 
     /// 请求成功后写入断点 fingerprint，并记录 conversation_id 复用映射。
@@ -447,23 +501,22 @@ impl PromptCache {
                 bp.fingerprint.clone(),
                 CacheEntry {
                     expires_at: now + bp.ttl,
-                    ttl: bp.ttl,
                 },
             );
         }
         inner.enforce_account_capacity(account);
 
-        // conversation_id 复用映射（最稳定断点）
+        // conversation_id 复用映射（最稳定断点），必须按 account 隔离。
         if !profile.stable_fingerprint.is_empty() && !conversation_id.is_empty() {
             inner.conversation_by_fingerprint.insert(
-                profile.stable_fingerprint.clone(),
+                conversation_key(account, &profile.stable_fingerprint),
                 (conversation_id.to_string(), now),
             );
         }
     }
 
     /// 查询可复用的 conversation_id（最稳定断点命中时返回）。
-    pub fn lookup_conversation(&self, profile: &CacheProfile) -> Option<String> {
+    pub fn lookup_conversation(&self, account: &str, profile: &CacheProfile) -> Option<String> {
         if !self.is_enabled() || profile.stable_fingerprint.is_empty() {
             return None;
         }
@@ -471,7 +524,7 @@ impl PromptCache {
         let inner = self.inner.lock();
         inner
             .conversation_by_fingerprint
-            .get(&profile.stable_fingerprint)
+            .get(&conversation_key(account, &profile.stable_fingerprint))
             .filter(|(_, created)| now.duration_since(*created) < ONE_HOUR_TTL)
             .map(|(id, _)| id.clone())
     }
@@ -671,7 +724,7 @@ fn flatten_cache_blocks(payload: &super::types::MessagesRequest) -> Vec<Cacheabl
                 "input_schema": tool.input_schema,
             })
             .to_string();
-            let tokens = crate::token::count_tokens(&value) as i32;
+            let tokens = super::token_count::count_tokens(&value) as i32;
             blocks.push(CacheableBlock {
                 value,
                 tokens,
@@ -691,7 +744,7 @@ fn flatten_cache_blocks(payload: &super::types::MessagesRequest) -> Vec<Cacheabl
         for sm in system_blocks {
             let normalized = normalize_system_text(&sm.text);
             let value = format!("system\0{normalized}");
-            let tokens = crate::token::count_tokens(&normalized) as i32;
+            let tokens = super::token_count::count_tokens(&normalized) as i32;
             blocks.push(CacheableBlock {
                 value,
                 tokens,
@@ -723,7 +776,7 @@ fn flatten_message_blocks(
     match &msg.content {
         serde_json::Value::String(text) => {
             let value = format!("msg\0{}\0{}\0{}", msg.role, msg_index, text);
-            let tokens = crate::token::count_tokens(text) as i32;
+            let tokens = super::token_count::count_tokens(text) as i32;
             blocks.push(CacheableBlock {
                 value,
                 tokens,
@@ -748,7 +801,7 @@ fn flatten_message_blocks(
                 // 导致 cache_read 永远为 0（无法命中之前轮缓存的 prefix）。
                 let fp_value = strip_cache_control(block);
                 let value = format!("msg\0{}\0{}\0{}\0{}", msg.role, msg_index, i, fp_value);
-                let tokens = crate::token::count_tokens(&text) as i32;
+                let tokens = super::token_count::count_tokens(&text) as i32;
                 let ttl = extract_block_ttl(block);
                 blocks.push(CacheableBlock {
                     value,
@@ -933,6 +986,41 @@ mod tests {
     }
 
     #[test]
+    fn compute_does_not_record_stats_until_success() {
+        let cache =
+            PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, Some(0.92));
+        let payload = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
+        let profile = build_profile_from_request(&payload, 5000).unwrap();
+
+        let first = cache.compute("acc1", &profile);
+        let snap = cache.snapshot();
+        assert_eq!(snap.hit_total, 0, "单纯 compute 不应记录 hit");
+        assert_eq!(snap.miss_total, 0, "单纯 compute 不应记录 miss");
+        assert_eq!(snap.last1m.reported_saved_input_tokens, 0);
+
+        cache.record_success(first.cache_read, 4_600);
+        let snap = cache.snapshot();
+        assert_eq!(snap.hit_total, 0);
+        assert_eq!(snap.miss_total, 1);
+        assert_eq!(snap.last1m.hit_rate(), 0.0);
+        assert_eq!(snap.last1m.reported_hit_rate(), 100.0);
+        assert_eq!(snap.last1m.reported_saved_input_tokens, 4_600);
+
+        cache.update("acc1", &profile, "conv-1");
+        let second = cache.compute("acc1", &profile);
+        assert!(second.cache_read > 0);
+        let snap = cache.snapshot();
+        assert_eq!(
+            snap.hit_total, 0,
+            "第二次 compute 命中也必须等上游成功后才记 hit"
+        );
+        cache.record_success(second.cache_read, second.cache_read);
+        let snap = cache.snapshot();
+        assert_eq!(snap.hit_total, 1);
+        assert_eq!(snap.miss_total, 1);
+    }
+
+    #[test]
     fn second_request_hits_cache_read() {
         let cache = PromptCache::new(1024, Duration::from_secs(300), true);
         let payload = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
@@ -1029,8 +1117,8 @@ mod tests {
     }
 
     #[test]
-    fn perceived_ratio_lifts_reported_read_on_first_request() {
-        // 首次请求真实 read=0，但开启 perceived=0.9 后上报 read 应被抬到 ~90%
+    fn perceived_ratio_does_not_lift_first_request() {
+        // 首次请求真实 read=0；perceived 只能抬高真实命中，不能伪造 R1 命中。
         let cache = PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, Some(0.9));
         let payload = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
         let profile = build_profile_from_request(&payload, 5000).unwrap();
@@ -1038,15 +1126,48 @@ mod tests {
             .total_input_tokens
             .min(profile.breakpoints.last().unwrap().cumulative_tokens);
         let usage = cache.compute("acc1", &profile);
-        assert!(
-            usage.cache_read >= (total as f64 * 0.9).floor() as i32,
-            "perceived=0.9 应把 read 抬到 ≥90%: read={} total={}",
-            usage.cache_read,
-            total
-        );
+        assert_eq!(usage.cache_read, 0, "首次请求不能上报 cache_read");
         // 三字段互斥：read + creation == cacheable 总量
         assert_eq!(usage.cache_read + usage.cache_creation, total);
-        assert!(usage.cache_creation >= 0);
+        assert!(usage.cache_creation > 0);
+    }
+
+    #[test]
+    fn perceived_ratio_lifts_only_real_hits() {
+        let cache = PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, Some(0.9));
+        let payload = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
+        let profile = build_profile_from_request(&payload, 5000).unwrap();
+        let total = profile
+            .total_input_tokens
+            .min(profile.breakpoints.last().unwrap().cumulative_tokens);
+        let first = cache.compute("acc1", &profile);
+        assert_eq!(first.cache_read, 0);
+        cache.update("acc1", &profile, "conv-real-hit");
+
+        let second = cache.compute("acc1", &profile);
+        assert!(
+            second.cache_read >= (total as f64 * 0.9).floor() as i32,
+            "perceived=0.9 应只在真实命中后把 read 抬到 ≥90%: read={} total={}",
+            second.cache_read,
+            total
+        );
+        assert_eq!(second.cache_read + second.cache_creation, total);
+    }
+
+    #[test]
+    fn perceived_ratio_does_not_lift_unmatched_prompt() {
+        let cache = PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, Some(0.9));
+        let cached = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
+        let pcached = build_profile_from_request(&cached, 5000).unwrap();
+        let _ = cache.compute("acc1", &pcached);
+        cache.update("acc1", &pcached, "conv-cached");
+
+        let unrelated_text = format!("different {}", "term ".repeat(5000));
+        let unrelated = mk_request(Some(vec![sys(&unrelated_text, true)]), vec![]);
+        let punrelated = build_profile_from_request(&unrelated, 5000).unwrap();
+        let usage = cache.compute("acc1", &punrelated);
+        assert_eq!(usage.cache_read, 0, "无匹配断点时不能被 perceived 虚抬");
+        assert!(usage.cache_creation > 0, "大请求未命中时应计入 cache creation");
     }
 
     #[test]
@@ -1101,11 +1222,15 @@ mod tests {
         let cache = PromptCache::new(1024, Duration::from_secs(300), true);
         let payload = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
         let profile = build_profile_from_request(&payload, 5000).unwrap();
-        assert!(cache.lookup_conversation(&profile).is_none());
+        assert!(cache.lookup_conversation("acc1", &profile).is_none());
         cache.update("acc1", &profile, "conv-xyz");
         assert_eq!(
-            cache.lookup_conversation(&profile).as_deref(),
+            cache.lookup_conversation("acc1", &profile).as_deref(),
             Some("conv-xyz")
+        );
+        assert!(
+            cache.lookup_conversation("acc2", &profile).is_none(),
+            "conversation_id 不能跨 account 复用"
         );
     }
 

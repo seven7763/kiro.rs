@@ -58,6 +58,13 @@ pub struct PromptCacheStats {
     pub hit_rate_1m: f64,
     pub hit_rate_5m: f64,
     pub saved_input_tokens_5m: i64,
+    /// 上报口径命中率（应用 perceived 系数后对客户端可见，1min 窗口）
+    pub reported_hit_rate_1m: f64,
+    /// 上报口径 5min 节省 input tokens（对客户端/下游计费可见）
+    pub reported_saved_input_tokens_5m: i64,
+    /// 当前生效的 perceived 系数（null=未启用，按真实口径上报）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub perceived_cache_hit_ratio: Option<f64>,
 }
 
 /// 凭据池聚合
@@ -550,6 +557,51 @@ pub fn render_prometheus(resp: &AdminMetricsResponse) -> String {
             s,
             "kiro_prompt_cache_total{{event=\"eviction\"}} {}",
             pc.eviction_total
+        );
+        let _ = writeln!(
+            s,
+            "# HELP kiro_prompt_cache_hit_rate_percent Prompt cache hit rate by accounting view"
+        );
+        let _ = writeln!(s, "# TYPE kiro_prompt_cache_hit_rate_percent gauge");
+        let _ = writeln!(
+            s,
+            "kiro_prompt_cache_hit_rate_percent{{window=\"1m\",view=\"real\"}} {}",
+            pc.hit_rate_1m
+        );
+        let _ = writeln!(
+            s,
+            "kiro_prompt_cache_hit_rate_percent{{window=\"5m\",view=\"real\"}} {}",
+            pc.hit_rate_5m
+        );
+        let _ = writeln!(
+            s,
+            "kiro_prompt_cache_hit_rate_percent{{window=\"1m\",view=\"reported\"}} {}",
+            pc.reported_hit_rate_1m
+        );
+        let _ = writeln!(
+            s,
+            "# HELP kiro_prompt_cache_saved_input_tokens Prompt cache saved input tokens by accounting view"
+        );
+        let _ = writeln!(s, "# TYPE kiro_prompt_cache_saved_input_tokens gauge");
+        let _ = writeln!(
+            s,
+            "kiro_prompt_cache_saved_input_tokens{{window=\"5m\",view=\"real\"}} {}",
+            pc.saved_input_tokens_5m
+        );
+        let _ = writeln!(
+            s,
+            "kiro_prompt_cache_saved_input_tokens{{window=\"5m\",view=\"reported\"}} {}",
+            pc.reported_saved_input_tokens_5m
+        );
+        let _ = writeln!(
+            s,
+            "# HELP kiro_prompt_cache_perceived_ratio Configured reported cache hit ratio, 0 when disabled"
+        );
+        let _ = writeln!(s, "# TYPE kiro_prompt_cache_perceived_ratio gauge");
+        let _ = writeln!(
+            s,
+            "kiro_prompt_cache_perceived_ratio {}",
+            pc.perceived_cache_hit_ratio.unwrap_or(0.0)
         );
     }
 

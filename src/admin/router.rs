@@ -15,7 +15,8 @@ use super::{
         force_refresh_token, get_all_credentials, get_credential_balance, get_load_balancing_mode,
         get_metrics, get_metrics_prometheus, get_preset_content, get_prompt_cache_config,
         get_retry_config, get_system_prompt, list_presets, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        set_credential_disabled, set_credential_group, set_credential_priority,
+        set_load_balancing_mode,
         update_prompt_cache_config, update_retry_config, update_system_prompt, update_user_preset,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -68,6 +69,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
+        .route("/credentials/{id}/group", post(set_credential_group))
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))

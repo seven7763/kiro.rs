@@ -7,9 +7,7 @@
 //! - 西文字符：每个计 1 个字符单位
 //! - 4 个字符单位 = 1 token（四舍五入），再按 token 数量分档放大系数补偿
 
-use crate::anthropic::types::{
-    CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
-};
+use super::types::{CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 use std::sync::OnceLock;
@@ -42,6 +40,15 @@ pub fn init_config(config: CountTokensConfig) {
 /// 获取配置
 fn get_config() -> Option<&'static CountTokensConfig> {
     COUNT_TOKENS_CONFIG.get()
+}
+
+/// 安全将 `u64` token 计数转换为 `i32`，超出范围时饱和到 `i32::MAX`
+///
+/// [`count_all_tokens`] 返回 `u64`，但下游 SSE 协议、context window 计算和
+/// `CountTokensResponse` 都用 `i32`。直接 `as i32` 在极端大请求下会 wrap 成负数
+/// 或被截断。此函数保证结果始终在 `[0, i32::MAX]` 范围内。
+pub(crate) fn saturating_to_i32(n: u64) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
 }
 
 /// 判断字符是否为非西文字符
@@ -240,4 +247,33 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     }
 
     total.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saturating_to_i32_normal() {
+        assert_eq!(saturating_to_i32(0), 0);
+        assert_eq!(saturating_to_i32(100), 100);
+        assert_eq!(saturating_to_i32(1_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn saturating_to_i32_max_boundary() {
+        assert_eq!(saturating_to_i32(i32::MAX as u64), i32::MAX);
+        // 边界 +1 应饱和
+        assert_eq!(saturating_to_i32(i32::MAX as u64 + 1), i32::MAX);
+    }
+
+    #[test]
+    fn saturating_to_i32_overflow_saturates() {
+        // 之前的 `as i32` 会把 u64::MAX wrap 成 -1（i32 视图）
+        // saturating 版本应饱和到 i32::MAX，永不为负
+        assert_eq!(saturating_to_i32(u64::MAX), i32::MAX);
+        assert!(saturating_to_i32(u64::MAX) >= 0, "结果不应为负");
+        // 模拟大请求场景
+        assert_eq!(saturating_to_i32(5_000_000_000), i32::MAX);
+    }
 }

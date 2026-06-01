@@ -1,209 +1,42 @@
 //! Anthropic → Kiro 协议转换器
 //!
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
+//!
+//! 子模块拆分：
+//! - `model_map`：模型名映射与上下文窗口
+//! - `session`：会话 ID 提取、触发类型
+//! - `tools`：工具定义转换、tool_use/tool_result 配对
+//! - `content`：消息内容处理、tool_choice 指令
+//! - `history`：历史消息构建与合并
+
+mod content;
+mod history;
+mod model_map;
+mod session;
+mod tools;
 
 use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::kiro::model::requests::conversation::{
-    AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+use crate::kiro::model::requests::{ConversationState, CurrentMessage, UserInputMessage, UserInputMessageContext};
+
+use super::types::MessagesRequest;
+
+pub use model_map::{canonical_anthropic_model, get_context_window_size, map_model};
+pub(crate) use session::extract_session_id;
+
+use content::{build_tool_choice_directive, process_message_content};
+use history::build_history;
+use session::determine_chat_trigger_type;
+use tools::{
+    collect_history_tool_names, convert_tools, create_placeholder_tool, remove_orphaned_tool_uses,
+    validate_tool_pairing,
 };
-use crate::kiro::model::requests::tool::{
-    InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
-};
 
-use super::types::{ContentBlock, MessagesRequest};
+// CONVERTER_MOD_HEAD_END
 
-/// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
-///
-/// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
-/// 导致上游返回 400 "Improperly formed request"。
-fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
-    let serde_json::Value::Object(mut obj) = schema else {
-        return serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": true
-        });
-    };
-
-    // type（必须是字符串）
-    if obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .is_none_or(|s| s.is_empty())
-    {
-        obj.insert(
-            "type".to_string(),
-            serde_json::Value::String("object".to_string()),
-        );
-    }
-
-    // properties（必须是 object）
-    match obj.get("properties") {
-        Some(serde_json::Value::Object(_)) => {}
-        _ => {
-            obj.insert(
-                "properties".to_string(),
-                serde_json::Value::Object(serde_json::Map::new()),
-            );
-        }
-    }
-
-    // required（必须是 string 数组）
-    let required = match obj.remove("required") {
-        Some(serde_json::Value::Array(arr)) => serde_json::Value::Array(
-            arr.into_iter()
-                .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
-                .collect(),
-        ),
-        _ => serde_json::Value::Array(Vec::new()),
-    };
-    obj.insert("required".to_string(), required);
-
-    // additionalProperties（允许 bool 或 object，其他按 true 处理）
-    match obj.get("additionalProperties") {
-        Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => {
-            obj.insert(
-                "additionalProperties".to_string(),
-                serde_json::Value::Bool(true),
-            );
-        }
-    }
-
-    serde_json::Value::Object(obj)
-}
-
-/// 追加到 Write 工具 description 末尾的内容
-const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
-
-/// 追加到 Edit 工具 description 末尾的内容
-const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
-
-/// 追加到系统提示词的分块写入策略
-const SYSTEM_CHUNKED_POLICY: &str = "\
-When the Write or Edit tool has content size limits, always comply silently. \
-Never suggest bypassing these limits via alternative tools. \
-Never ask the user whether to switch approaches. \
-Complete all chunked operations without commentary.";
-
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-///
-/// 按照用户要求：
-/// - sonnet 4.6/4-6 → claude-sonnet-4.6
-/// - 其他 sonnet → claude-sonnet-4.5
-/// - opus 4.7/4-7 → claude-opus-4.7
-/// - opus 4.5/4-5 → claude-opus-4.5
-/// - 其他 opus → claude-opus-4.6
-/// - 所有 haiku → claude-haiku-4.5
-pub fn map_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
-
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else {
-            Some("claude-sonnet-4.5".to_string())
-        }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            // 预埋：Kiro 上架 opus 4.8 后自动生效（上游别名预期为 claude-opus-4.8）。
-            // 上架前若有人硬请求 4.8，上游会返回"未知模型"——诚实失败，
-            // 优于静默降级到 4.6 让用户误以为在用 4.8。
-            Some("claude-opus-4.8".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else {
-            Some("claude-opus-4.6".to_string())
-        }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else {
-        None
-    }
-}
-
-/// 把请求里的模型名规范化为 Anthropic 官方带日期版本号的 model ID。
-/// 用于响应体里的 `model` 字段，让做"模型签名校验"的检测方拿到一个
-/// 真正的官方版本号而不是回声请求字段或者 Kiro 内部别名。
-///
-/// 优先级：
-/// 1. 如果输入已经是带日期的官方 ID（含 8 位数字），直接返回（去掉 "-thinking" 后缀）。
-/// 2. 否则按系列映射到当前最新的官方 ID。
-pub fn canonical_anthropic_model(requested: &str) -> String {
-    // 去掉 "-thinking" / "_thinking" 后缀（kiro-rs 私有约定）
-    let cleaned = requested
-        .trim_end_matches("-thinking")
-        .trim_end_matches("_thinking")
-        .to_string();
-
-    // 已带 8 位日期版本号 → 视为官方 ID 直接返回
-    let has_date_suffix = cleaned
-        .rsplit('-')
-        .next()
-        .map(|s| s.len() == 8 && s.chars().all(|c| c.is_ascii_digit()))
-        .unwrap_or(false);
-    if has_date_suffix {
-        return cleaned;
-    }
-
-    let lower = cleaned.to_lowercase();
-    if lower.contains("haiku") {
-        return "claude-haiku-4-5-20251001".to_string();
-    }
-    if lower.contains("sonnet") {
-        if lower.contains("4-6") || lower.contains("4.6") {
-            return "claude-sonnet-4-6".to_string();
-        }
-        return "claude-sonnet-4-5-20250929".to_string();
-    }
-    if lower.contains("opus") {
-        if lower.contains("4-8") || lower.contains("4.8") {
-            return "claude-opus-4-8".to_string();
-        }
-        if lower.contains("4-7") || lower.contains("4.7") {
-            return "claude-opus-4-7".to_string();
-        }
-        if lower.contains("4-6") || lower.contains("4.6") {
-            return "claude-opus-4-6".to_string();
-        }
-        if lower.contains("4-5") || lower.contains("4.5") {
-            return "claude-opus-4-5-20251101".to_string();
-        }
-        return "claude-opus-4-6".to_string();
-    }
-    // 兜底：未识别就原样返回
-    cleaned
-}
-
-/// 根据模型名称返回对应的上下文窗口大小
-///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Opus 4.7 同样为 1M 上下文。
-pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8" =>
-        {
-            1_000_000
-        }
-        _ => 200_000,
-    }
-}
-
-/// 转换结果
-#[derive(Debug)]
 pub struct ConversionResult {
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
@@ -229,77 +62,6 @@ impl std::fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
-/// 从 metadata.user_id 中提取 session UUID
-///
-/// 支持两种格式:
-/// 1. 字符串格式: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
-/// 2. JSON 格式: {"device_id":"...","account_uuid":"...","session_id":"UUID"}
-///
-/// 提取 session UUID 作为 conversationId
-fn extract_session_id(user_id: &str) -> Option<String> {
-    // 先尝试 JSON 解析
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
-        if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {
-            if is_valid_uuid(session_id) {
-                return Some(session_id.to_string());
-            }
-        }
-    }
-
-    // 回退到字符串格式: 查找 "session_" 后面的内容
-    if let Some(pos) = user_id.find("session_") {
-        let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
-        if session_part.len() >= 36 {
-            let uuid_str = &session_part[..36];
-            if is_valid_uuid(uuid_str) {
-                return Some(uuid_str.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// 简单验证 UUID 格式（36 字符，包含 4 个连字符）
-fn is_valid_uuid(s: &str) -> bool {
-    s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
-}
-
-/// 收集历史消息中使用的所有工具名称
-fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
-    let mut tool_names = Vec::new();
-
-    for msg in history {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                for tool_use in tool_uses {
-                    if !tool_names.contains(&tool_use.name) {
-                        tool_names.push(tool_use.name.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    tool_names
-}
-
-/// 为历史中使用但不在 tools 列表中的工具创建占位符定义
-/// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
-fn create_placeholder_tool(name: &str) -> Tool {
-    Tool {
-        tool_specification: ToolSpecification {
-            name: name.to_string(),
-            description: "Tool used in conversation history".to_string(),
-            input_schema: InputSchema::from_json(serde_json::json!({
-                "$schema": "http://json-schema.org/draft-07/schema#",
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": true
-            })),
-        },
-    }
-}
 
 /// 将 Anthropic 请求转换为 Kiro 请求（保留兼容入口）
 #[allow(dead_code)] // 公共 API 表面，被外部 crate 或测试可能引用
@@ -447,681 +209,15 @@ pub fn convert_request_with_options(
         tool_name_map,
     })
 }
-
-/// 确定聊天触发类型
-/// "AUTO" 模式可能会导致 400 Bad Request 错误
-fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
-    "MANUAL".to_string()
-}
-
-/// 把 Anthropic `tool_choice` 字段翻译成给模型的自然语言指令。
-///
-/// Kiro 上游协议不支持 tool_choice。要让「结构化输出」类测试（强制 JSON）通过，
-/// 必须在 user message 头部塞一段强约束文本，告诉模型必须调用某个工具。
-///
-/// Anthropic 五种取值：
-/// - `{"type": "auto"}`             — 默认，模型自由决定（无需注入）
-/// - `{"type": "any"}`              — 必须调用任一工具
-/// - `{"type": "tool", "name": X}`  — 必须调用 X
-/// - `{"type": "none"}`             — 禁止调用工具
-/// - `{"type": "auto", "disable_parallel_tool_use": true}` — 仅做并行控制
-///
-/// 注意 `tool_name_map` 把超长工具名缩短了，注入指令时也要用映射后的名字。
-fn build_tool_choice_directive(
-    tool_choice: &Option<serde_json::Value>,
-    tool_name_map: &HashMap<String, String>,
-) -> Option<String> {
-    let value = tool_choice.as_ref()?;
-    let kind = value.get("type")?.as_str()?;
-
-    match kind {
-        "auto" => None,
-        "any" => Some(
-            "IMPORTANT: You MUST invoke exactly one of the provided tools. Do not respond with plain text."
-                .to_string(),
-        ),
-        "tool" => {
-            let name = value.get("name")?.as_str()?;
-            // 映射后的名字（map 是 short→original，所以反查一遍）
-            let mapped_name = tool_name_map
-                .iter()
-                .find_map(|(short, original)| (original == name).then(|| short.clone()))
-                .unwrap_or_else(|| name.to_string());
-            Some(format!(
-                "IMPORTANT: You MUST invoke the `{name}` tool to answer this request. Do not respond with plain text. Call the tool with arguments that match its input schema exactly.",
-                name = mapped_name
-            ))
-        }
-        "none" => Some(
-            "IMPORTANT: Do not invoke any tools for this request. Respond with plain text only."
-                .to_string(),
-        ),
-        _ => None,
-    }
-}
-
-/// 处理消息内容，提取文本、图片和工具结果
-fn process_message_content(
-    content: &serde_json::Value,
-) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
-    let mut text_parts = Vec::new();
-    let mut images = Vec::new();
-    let mut tool_results = Vec::new();
-
-    match content {
-        serde_json::Value::String(s) => {
-            text_parts.push(s.clone());
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
-                    match block.block_type.as_str() {
-                        "text" => {
-                            if let Some(text) = block.text {
-                                text_parts.push(text);
-                            }
-                        }
-                        "image" => {
-                            if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
-                                }
-                            }
-                        }
-                        "document" => {
-                            // Anthropic PDF / 文档块。Kiro 上游不接受此格式，
-                            // 这里把内容尽量解码成纯文本塞进 text_parts。
-                            if let Some(source) = block.source {
-                                let media_type = source.media_type.clone();
-                                let extracted = if media_type == "application/pdf" {
-                                    super::document::extract_pdf_text_from_base64(&source.data)
-                                } else if media_type.starts_with("text/") {
-                                    use base64::Engine;
-                                    base64::engine::general_purpose::STANDARD
-                                        .decode(source.data.as_bytes())
-                                        .ok()
-                                        .and_then(|b| String::from_utf8(b).ok())
-                                } else {
-                                    None
-                                };
-
-                                let approx_bytes = (source.data.len() / 4) * 3;
-                                let block_text = match extracted {
-                                    Some(text) if !text.trim().is_empty() => format!(
-                                        "[Document content extracted from {} ({} chars)]\n{}",
-                                        media_type,
-                                        text.len(),
-                                        text
-                                    ),
-                                    _ => super::document::document_placeholder(
-                                        &media_type,
-                                        approx_bytes,
-                                    ),
-                                };
-                                text_parts.push(block_text);
-                            }
-                        }
-                        "tool_result" => {
-                            if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content = extract_tool_result_content(&block.content);
-                                let is_error = block.is_error.unwrap_or(false);
-
-                                let mut result = if is_error {
-                                    ToolResult::error(&tool_use_id, result_content)
-                                } else {
-                                    ToolResult::success(&tool_use_id, result_content)
-                                };
-                                result.status =
-                                    Some(if is_error { "error" } else { "success" }.to_string());
-
-                                tool_results.push(result);
-                            }
-                        }
-                        "tool_use" => {
-                            // tool_use 在 assistant 消息中处理，这里忽略
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    Ok((text_parts.join("\n"), images, tool_results))
-}
-
-/// 从 media_type 获取图片格式
-fn get_image_format(media_type: &str) -> Option<String> {
-    match media_type {
-        "image/jpeg" => Some("jpeg".to_string()),
-        "image/png" => Some("png".to_string()),
-        "image/gif" => Some("gif".to_string()),
-        "image/webp" => Some("webp".to_string()),
-        _ => None,
-    }
-}
-
-/// 提取工具结果内容
-fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
-    match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(arr)) => {
-            let mut parts = Vec::new();
-            for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    parts.push(text.to_string());
-                }
-            }
-            parts.join("\n")
-        }
-        Some(v) => v.to_string(),
-        None => String::new(),
-    }
-}
-
-/// 验证并过滤 tool_use/tool_result 配对
-///
-/// 收集所有 tool_use_id，验证 tool_result 是否匹配
-/// 静默跳过孤立的 tool_use 和 tool_result，输出警告日志
-///
-/// # Arguments
-/// * `history` - 历史消息引用
-/// * `tool_results` - 当前消息中的 tool_result 列表
-///
-/// # Returns
-/// 元组：(经过验证和过滤后的 tool_result 列表, 孤立的 tool_use_id 集合)
-fn validate_tool_pairing(
-    history: &[Message],
-    tool_results: &[ToolResult],
-) -> (Vec<ToolResult>, std::collections::HashSet<String>) {
-    use std::collections::HashSet;
-
-    // 1. 收集所有历史中的 tool_use_id
-    let mut all_tool_use_ids: HashSet<String> = HashSet::new();
-    // 2. 收集历史中已经有 tool_result 的 tool_use_id
-    let mut history_tool_result_ids: HashSet<String> = HashSet::new();
-
-    for msg in history {
-        match msg {
-            Message::Assistant(assistant_msg) => {
-                if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                    for tool_use in tool_uses {
-                        all_tool_use_ids.insert(tool_use.tool_use_id.clone());
-                    }
-                }
-            }
-            Message::User(user_msg) => {
-                // 收集历史 user 消息中的 tool_results
-                for result in &user_msg
-                    .user_input_message
-                    .user_input_message_context
-                    .tool_results
-                {
-                    history_tool_result_ids.insert(result.tool_use_id.clone());
-                }
-            }
-        }
-    }
-
-    // 3. 计算真正未配对的 tool_use_ids（排除历史中已配对的）
-    let mut unpaired_tool_use_ids: HashSet<String> = all_tool_use_ids
-        .difference(&history_tool_result_ids)
-        .cloned()
-        .collect();
-
-    // 4. 过滤并验证当前消息的 tool_results
-    let mut filtered_results = Vec::new();
-
-    for result in tool_results {
-        if unpaired_tool_use_ids.contains(&result.tool_use_id) {
-            // 配对成功
-            filtered_results.push(result.clone());
-            unpaired_tool_use_ids.remove(&result.tool_use_id);
-        } else if all_tool_use_ids.contains(&result.tool_use_id) {
-            // tool_use 存在但已经在历史中配对过了，这是重复的 tool_result
-            tracing::warn!(
-                "跳过重复的 tool_result：该 tool_use 已在历史中配对，tool_use_id={}",
-                result.tool_use_id
-            );
-        } else {
-            // 孤立 tool_result - 找不到对应的 tool_use
-            tracing::warn!(
-                "跳过孤立的 tool_result：找不到对应的 tool_use，tool_use_id={}",
-                result.tool_use_id
-            );
-        }
-    }
-
-    // 5. 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
-    for orphaned_id in &unpaired_tool_use_ids {
-        tracing::warn!(
-            "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={}",
-            orphaned_id
-        );
-    }
-
-    (filtered_results, unpaired_tool_use_ids)
-}
-
-/// 从历史消息中移除孤立的 tool_use
-///
-/// Kiro API 要求每个 tool_use 必须有对应的 tool_result，否则返回 400 Bad Request。
-/// 此函数遍历历史中的 assistant 消息，移除没有对应 tool_result 的 tool_use。
-///
-/// # Arguments
-/// * `history` - 可变的历史消息列表
-/// * `orphaned_ids` - 需要移除的孤立 tool_use_id 集合
-fn remove_orphaned_tool_uses(
-    history: &mut [Message],
-    orphaned_ids: &std::collections::HashSet<String>,
-) {
-    if orphaned_ids.is_empty() {
-        return;
-    }
-
-    for msg in history.iter_mut() {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                let original_len = tool_uses.len();
-                tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
-
-                // 如果移除后为空，设置为 None
-                if tool_uses.is_empty() {
-                    assistant_msg.assistant_response_message.tool_uses = None;
-                } else if tool_uses.len() != original_len {
-                    tracing::debug!(
-                        "从 assistant 消息中移除了 {} 个孤立的 tool_use",
-                        original_len - tool_uses.len()
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// Kiro API 工具名称最大长度限制
-const TOOL_NAME_MAX_LEN: usize = 63;
-
-/// 生成确定性短名称：截断前缀 + "_" + 8 位 SHA256 hex
-fn shorten_tool_name(name: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(name.as_bytes());
-    let hash_hex = format!("{:x}", hasher.finalize());
-    let hash_suffix = &hash_hex[..8];
-    // 54 prefix + 1 underscore + 8 hash = 63
-    let prefix_max = TOOL_NAME_MAX_LEN - 1 - 8;
-    let prefix = match name.char_indices().nth(prefix_max) {
-        Some((idx, _)) => &name[..idx],
-        None => name,
-    };
-    format!("{}_{}", prefix, hash_suffix)
-}
-
-/// 如果名称超长则缩短，并记录映射（short → original）
-fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> String {
-    if name.len() <= TOOL_NAME_MAX_LEN {
-        return name.to_string();
-    }
-    let short = shorten_tool_name(name);
-    tool_name_map.insert(short.clone(), name.to_string());
-    short
-}
-
-/// 转换工具定义
-fn convert_tools(
-    tools: &Option<Vec<super::types::Tool>>,
-    tool_name_map: &mut HashMap<String, String>,
-) -> Vec<Tool> {
-    let Some(tools) = tools else {
-        return Vec::new();
-    };
-
-    tools
-        .iter()
-        .map(|t| {
-            let mut description = t.description.clone();
-
-            // 对 Write/Edit 工具追加自定义描述后缀
-            let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                _ => "",
-            };
-            if !suffix.is_empty() {
-                description.push('\n');
-                description.push_str(suffix);
-            }
-
-            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-            let description = match description.char_indices().nth(10000) {
-                Some((idx, _)) => description[..idx].to_string(),
-                None => description,
-            };
-
-            Tool {
-                tool_specification: ToolSpecification {
-                    name: map_tool_name(&t.name, tool_name_map),
-                    description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
-                        t.input_schema
-                    ))),
-                },
-            }
-        })
-        .collect()
-}
-
-/// 生成 thinking 标签前缀
-///
-/// Kiro 上游没有原生 `thinking_delta` event，全靠**文本协议**：在用户消息开头
-/// 注入 `<thinking_mode>` 等指令，让模型在响应里吐 `<thinking>...</thinking>`
-/// 包裹的内容，后端再从文本流中截取并转译为 Anthropic SSE thinking_delta。
-///
-/// Opus 4.7 特殊性：
-/// - 不支持 `type: "enabled"` —— 必须 `adaptive`（已在 handlers 自动降级）
-/// - 默认 `display: "omitted"` —— 不主动吐 thinking 文本，需显式声明 `summarized`
-/// - instruction-following 更严 —— 加额外明确指令兜底，确保始终使用 `<thinking>` 标签
-fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
-    let t = req.thinking.as_ref()?;
-    let model_lower = req.model.to_lowercase();
-    let is_opus_4_7 = model_lower.contains("opus")
-        && (model_lower.contains("4-7") || model_lower.contains("4.7"));
-
-    match t.thinking_type.as_str() {
-        "enabled" => Some(format!(
-            "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-            t.budget_tokens
-        )),
-        "adaptive" => {
-            let effort = req
-                .output_config
-                .as_ref()
-                .map(|c| c.effort.as_str())
-                .unwrap_or("high");
-            // 显式声明 display 让 Kiro 知道客户端要 thinking 文本
-            let display = t.effective_display();
-            let base = format!(
-                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort><thinking_display>{}</thinking_display>",
-                effort, display
-            );
-            // 4.7 上游对指令字面更敏感，加一条人话引导，强制用 <thinking> 包裹
-            if is_opus_4_7 && display == "summarized" {
-                Some(format!(
-                    "{}\nIMPORTANT: Wrap your full reasoning inside <thinking>...</thinking> tags BEFORE the final answer. This wrapping is required even when adaptive thinking decides the task is simple — always emit at least a brief <thinking>...</thinking> block.",
-                    base
-                ))
-            } else {
-                Some(base)
-            }
-        }
-        _ => None,
-    }
-}
-
-/// 检查内容是否已包含thinking标签
-fn has_thinking_tags(content: &str) -> bool {
-    content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
-}
-
-/// 构建历史消息
-///
-/// # Arguments
-/// * `req` - 原始请求，用于读取 `system`、`thinking` 等配置字段
-/// * `messages` - 经过 prefill 预处理的消息切片，末尾必定是 user 消息。
-///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
-///   调用方应始终使用此参数而非 `req.messages`。
-/// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(
-    req: &MessagesRequest,
-    messages: &[super::types::Message],
-    model_id: &str,
-    tool_name_map: &mut HashMap<String, String>,
-) -> Result<Vec<Message>, ConversionError> {
-    let mut history = Vec::new();
-
-    // 生成thinking前缀（如果需要）
-    let thinking_prefix = generate_thinking_prefix(req);
-
-    // 1. 处理系统消息
-    if let Some(ref system) = req.system {
-        let system_content: String = system
-            .iter()
-            .map(|s| s.text.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
-
-            // 注入thinking标签到系统消息最前面（如果需要且不存在）
-            let final_content = if let Some(ref prefix) = thinking_prefix {
-                if !has_thinking_tags(&system_content) {
-                    format!("{}\n{}", prefix, system_content)
-                } else {
-                    system_content
-                }
-            } else {
-                system_content
-            };
-
-            // 系统消息作为 user + assistant 配对
-            let user_msg = HistoryUserMessage::new(final_content, model_id);
-            history.push(Message::User(user_msg));
-
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-            history.push(Message::Assistant(assistant_msg));
-        }
-    } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
-        let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
-        history.push(Message::User(user_msg));
-
-        let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-        history.push(Message::Assistant(assistant_msg));
-    }
-
-    // 2. 处理常规消息历史
-    // 最后一条消息作为 currentMessage，不加入历史
-    // 经过 prefill 预处理后，messages 末尾必定是 user，故直接截掉最后一条即可
-    let history_end_index = messages.len().saturating_sub(1);
-
-    // 收集并配对消息
-    let mut user_buffer: Vec<&super::types::Message> = Vec::new();
-    let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
-
-    for msg in messages.iter().take(history_end_index) {
-        if msg.role == "user" {
-            // 先处理累积的 assistant 消息
-            if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
-                history.push(Message::Assistant(merged));
-                assistant_buffer.clear();
-            }
-            user_buffer.push(msg);
-        } else if msg.role == "assistant" {
-            // 先处理累积的 user 消息
-            if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
-                history.push(Message::User(merged_user));
-                user_buffer.clear();
-            }
-            // 累积 assistant 消息（支持连续多条）
-            assistant_buffer.push(msg);
-        }
-    }
-
-    // 处理末尾累积的 assistant 消息
-    if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
-        history.push(Message::Assistant(merged));
-    }
-
-    // 处理结尾的孤立 user 消息
-    if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
-        history.push(Message::User(merged_user));
-
-        // 自动配对一个 "OK" 的 assistant 响应
-        let auto_assistant = HistoryAssistantMessage::new("OK");
-        history.push(Message::Assistant(auto_assistant));
-    }
-
-    Ok(history)
-}
-
-/// 合并多个 user 消息
-fn merge_user_messages(
-    messages: &[&super::types::Message],
-    model_id: &str,
-) -> Result<HistoryUserMessage, ConversionError> {
-    let mut content_parts = Vec::new();
-    let mut all_images = Vec::new();
-    let mut all_tool_results = Vec::new();
-
-    for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
-        if !text.is_empty() {
-            content_parts.push(text);
-        }
-        all_images.extend(images);
-        all_tool_results.extend(tool_results);
-    }
-
-    let content = content_parts.join("\n");
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let mut user_msg = UserMessage::new(&content, model_id);
-
-    if !all_images.is_empty() {
-        user_msg = user_msg.with_images(all_images);
-    }
-
-    if !all_tool_results.is_empty() {
-        let mut ctx = UserInputMessageContext::new();
-        ctx = ctx.with_tool_results(all_tool_results);
-        user_msg = user_msg.with_context(ctx);
-    }
-
-    Ok(HistoryUserMessage {
-        user_input_message: user_msg,
-    })
-}
-
-/// 转换 assistant 消息
-fn convert_assistant_message(
-    msg: &super::types::Message,
-    tool_name_map: &mut HashMap<String, String>,
-) -> Result<HistoryAssistantMessage, ConversionError> {
-    let mut thinking_content = String::new();
-    let mut text_content = String::new();
-    let mut tool_uses = Vec::new();
-
-    match &msg.content {
-        serde_json::Value::String(s) => {
-            text_content = s.clone();
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
-                    match block.block_type.as_str() {
-                        "thinking" => {
-                            if let Some(thinking) = block.thinking {
-                                thinking_content.push_str(&thinking);
-                            }
-                        }
-                        "text" => {
-                            if let Some(text) = block.text {
-                                text_content.push_str(&text);
-                            }
-                        }
-                        "tool_use" => {
-                            if let (Some(id), Some(name)) = (block.id, block.name) {
-                                let input = block.input.unwrap_or(serde_json::json!({}));
-                                let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses
-                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    // 组合 thinking 和 text 内容
-    // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
-    let final_content = if !thinking_content.is_empty() {
-        if !text_content.is_empty() {
-            format!(
-                "<thinking>{}</thinking>\n\n{}",
-                thinking_content, text_content
-            )
-        } else {
-            format!("<thinking>{}</thinking>", thinking_content)
-        }
-    } else if text_content.is_empty() && !tool_uses.is_empty() {
-        " ".to_string()
-    } else {
-        text_content
-    };
-
-    let mut assistant = AssistantMessage::new(final_content);
-    if !tool_uses.is_empty() {
-        assistant = assistant.with_tool_uses(tool_uses);
-    }
-
-    Ok(HistoryAssistantMessage {
-        assistant_response_message: assistant,
-    })
-}
-
-/// 合并多个连续的 assistant 消息为一条
-/// 用于处理网络不稳定时产生的连续 assistant 消息（Issue #79）
-fn merge_assistant_messages(
-    messages: &[&super::types::Message],
-    tool_name_map: &mut HashMap<String, String>,
-) -> Result<HistoryAssistantMessage, ConversionError> {
-    assert!(!messages.is_empty());
-    if messages.len() == 1 {
-        return convert_assistant_message(messages[0], tool_name_map);
-    }
-
-    let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
-    let mut content_parts: Vec<String> = Vec::new();
-
-    for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map)?;
-        let am = converted.assistant_response_message;
-        if !am.content.trim().is_empty() {
-            content_parts.push(am.content);
-        }
-        if let Some(tus) = am.tool_uses {
-            all_tool_uses.extend(tus);
-        }
-    }
-
-    let content = if content_parts.is_empty() && !all_tool_uses.is_empty() {
-        " ".to_string()
-    } else {
-        content_parts.join("\n\n")
-    };
-
-    let mut assistant = AssistantMessage::new(content);
-    if !all_tool_uses.is_empty() {
-        assistant = assistant.with_tool_uses(all_tool_uses);
-    }
-    Ok(HistoryAssistantMessage {
-        assistant_response_message: assistant,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::history::{convert_assistant_message, merge_assistant_messages};
+    use super::tools::{TOOL_NAME_MAX_LEN, map_tool_name, shorten_tool_name};
+    use crate::kiro::model::requests::{
+        AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, ToolResult,
+        UserMessage,
+    };
 
     #[test]
     fn test_map_model_sonnet() {
@@ -1270,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_collect_history_tool_names() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::kiro::model::requests::ToolUseEntry;
 
         // 创建包含工具使用的历史消息
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
@@ -1661,7 +757,7 @@ mod tests {
 
     #[test]
     fn test_validate_tool_pairing_orphaned_use() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::kiro::model::requests::ToolUseEntry;
 
         // 测试孤立的 tool_use（有 tool_use 但没有对应的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
@@ -1693,7 +789,7 @@ mod tests {
 
     #[test]
     fn test_validate_tool_pairing_valid() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::kiro::model::requests::ToolUseEntry;
 
         // 测试正常配对的情况
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
@@ -1724,7 +820,7 @@ mod tests {
 
     #[test]
     fn test_validate_tool_pairing_mixed() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::kiro::model::requests::ToolUseEntry;
 
         // 测试混合情况：部分配对成功，部分孤立
         let mut assistant_msg = AssistantMessage::new("I'll use two tools.");
@@ -1757,7 +853,7 @@ mod tests {
 
     #[test]
     fn test_validate_tool_pairing_history_already_paired() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::kiro::model::requests::ToolUseEntry;
 
         // 测试历史中已配对的 tool_use 不应该被报告为孤立
         // 场景：多轮对话中，之前的 tool_use 已经在历史中有对应的 tool_result
@@ -1804,7 +900,7 @@ mod tests {
 
     #[test]
     fn test_validate_tool_pairing_duplicate_result() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::kiro::model::requests::ToolUseEntry;
 
         // 测试重复的 tool_result（历史中已配对，当前消息又发送了相同的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
@@ -1909,7 +1005,7 @@ mod tests {
 
     #[test]
     fn test_remove_orphaned_tool_uses() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::kiro::model::requests::ToolUseEntry;
 
         // 测试从历史中移除孤立的 tool_use
         let mut assistant_msg = AssistantMessage::new("I'll use multiple tools.");
@@ -1949,7 +1045,7 @@ mod tests {
 
     #[test]
     fn test_remove_orphaned_tool_uses_all_removed() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::kiro::model::requests::ToolUseEntry;
 
         // 测试移除所有 tool_use 后，tool_uses 变为 None
         let mut assistant_msg = AssistantMessage::new("I'll use a tool.");

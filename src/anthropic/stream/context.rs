@@ -1,658 +1,11 @@
-//! 流式响应处理模块
-//!
-//! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
-
-use std::collections::{BTreeMap, HashMap};
-use std::time::Instant;
-
-use base64::Engine;
-use serde_json::json;
-
-use crate::kiro::metrics::RecordHandle;
-use crate::kiro::model::events::Event;
-
-/// 生成符合 Anthropic 官方格式的 message ID
-///
-/// 格式: `msg_01` + 22 位 base62 字符（大小写字母 + 数字）
-pub(crate) fn generate_message_id() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let suffix: String = (0..22)
-        .map(|_| CHARSET[fastrand::usize(..CHARSET.len())] as char)
-        .collect();
-    format!("msg_01{}", suffix)
-}
-
-/// 生成格式正确的伪 signature（base64 编码的 Protobuf 结构）
-///
-/// 基于逆向官方 API 响应得到的精确 Protobuf 结构：
-/// ```text
-/// Outer: field 2 (LEN, inner_payload) + field 3 (varint, 1)
-/// Inner:
-///   field 1 (LEN, metadata):
-///     field 1 (varint): 14
-///     field 3 (varint): 2
-///     field 5 (bytes, 64): random nonce
-///     field 6 (string): model name
-///     field 7 (varint): 0
-///     field 8 (string): "thinking"
-///   field 2 (bytes, 12): random
-///   field 3 (bytes, 12): random
-///   field 4 (bytes, 48): random (HMAC?)
-///   field 5 (bytes, 130-210): random (crypto signature)
-/// ```
-pub(crate) fn generate_fake_signature_for_model(model: &str) -> String {
-    // --- 构建 metadata (inner field 1) ---
-    let model_bytes = model.as_bytes();
-    let block_type = b"thinking";
-
-    let mut metadata: Vec<u8> = Vec::with_capacity(128);
-    // field 1 (varint): 14
-    metadata.extend_from_slice(&[0x08, 0x0E]);
-    // field 3 (varint): 2
-    metadata.extend_from_slice(&[0x18, 0x02]);
-    // field 5 (bytes, 64): random nonce
-    metadata.push(0x2A); // tag: field 5, wire type 2
-    metadata.push(0x40); // length: 64
-    for _ in 0..64 {
-        metadata.push(fastrand::u8(..));
-    }
-    // field 6 (string): model name
-    metadata.push(0x32); // tag: field 6, wire type 2
-    metadata.push(model_bytes.len() as u8);
-    metadata.extend_from_slice(model_bytes);
-    // field 7 (varint): 0
-    metadata.extend_from_slice(&[0x38, 0x00]);
-    // field 8 (string): "thinking"
-    metadata.push(0x42); // tag: field 8, wire type 2
-    metadata.push(block_type.len() as u8);
-    metadata.extend_from_slice(block_type);
-
-    // --- 构建 inner payload ---
-    let sig_len = fastrand::usize(130..=200); // 官方范围 132-208
-    let mut inner: Vec<u8> = Vec::with_capacity(metadata.len() + 12 + 12 + 48 + sig_len + 10);
-
-    // field 1 (LEN): metadata
-    inner.push(0x0A); // tag: field 1, wire type 2
-    encode_varint(&mut inner, metadata.len() as u64);
-    inner.extend_from_slice(&metadata);
-
-    // field 2 (bytes, 12): random
-    inner.push(0x12); // tag: field 2, wire type 2
-    inner.push(0x0C); // length: 12
-    for _ in 0..12 {
-        inner.push(fastrand::u8(..));
-    }
-
-    // field 3 (bytes, 12): random
-    inner.push(0x1A); // tag: field 3, wire type 2
-    inner.push(0x0C); // length: 12
-    for _ in 0..12 {
-        inner.push(fastrand::u8(..));
-    }
-
-    // field 4 (bytes, 48): random
-    inner.push(0x22); // tag: field 4, wire type 2
-    inner.push(0x30); // length: 48
-    for _ in 0..48 {
-        inner.push(fastrand::u8(..));
-    }
-
-    // field 5 (bytes, variable): crypto signature
-    inner.push(0x2A); // tag: field 5, wire type 2
-    encode_varint(&mut inner, sig_len as u64);
-    for _ in 0..sig_len {
-        inner.push(fastrand::u8(..));
-    }
-
-    // --- 构建 outer ---
-    let mut buf: Vec<u8> = Vec::with_capacity(inner.len() + 6);
-    // outer field 2 (LEN): inner payload
-    buf.push(0x12); // tag: field 2, wire type 2
-    encode_varint(&mut buf, inner.len() as u64);
-    buf.extend_from_slice(&inner);
-    // outer field 3 (varint): 1
-    buf.extend_from_slice(&[0x18, 0x01]);
-
-    base64::engine::general_purpose::STANDARD.encode(&buf)
-}
-
-/// 向 buf 追加 varint 编码
-fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value == 0 {
-            buf.push(byte);
-            break;
-        } else {
-            buf.push(byte | 0x80);
-        }
-    }
-}
-
-/// 找到小于等于目标位置的最近有效UTF-8字符边界
-///
-/// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
-/// 这个函数从目标位置向前搜索，找到最近的有效字符边界。
-fn find_char_boundary(s: &str, target: usize) -> usize {
-    if target >= s.len() {
-        return s.len();
-    }
-    if target == 0 {
-        return 0;
-    }
-    // 从目标位置向前搜索有效的字符边界
-    let mut pos = target;
-    while pos > 0 && !s.is_char_boundary(pos) {
-        pos -= 1;
-    }
-    pos
-}
-
-/// 需要跳过的包裹字符
-///
-/// 当 thinking 标签被这些字符包裹时，认为是在引用标签而非真正的标签：
-/// - 反引号 (`)：行内代码
-/// - 双引号 (")：字符串
-/// - 单引号 (')：字符串
-const QUOTE_CHARS: &[u8] = b"`\"'\\#!@$%^&*()-_=+[]{};:<>,.?/";
-
-/// 检查指定位置的字符是否是引用字符
-fn is_quote_char(buffer: &str, pos: usize) -> bool {
-    buffer
-        .as_bytes()
-        .get(pos)
-        .map(|c| QUOTE_CHARS.contains(c))
-        .unwrap_or(false)
-}
-
-/// 查找真正的 thinking 结束标签（不被引用字符包裹，且后面有双换行符）
-///
-/// 当模型在思考过程中提到 `</thinking>` 时，通常会用反引号、引号等包裹，
-/// 或者在同一行有其他内容（如"关于 </thinking> 标签"）。
-/// 这个函数会跳过这些情况，只返回真正的结束标签位置。
-///
-/// 跳过的情况：
-/// - 被引用字符包裹（反引号、引号等）
-/// - 后面没有双换行符（真正的结束标签后面会有 `\n\n`）
-/// - 标签在缓冲区末尾（流式处理时需要等待更多内容）
-///
-/// # 参数
-/// - `buffer`: 要搜索的字符串
-///
-/// # 返回值
-/// - `Some(pos)`: 真正的结束标签的起始位置
-/// - `None`: 没有找到真正的结束标签
-fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
-    const TAG: &str = "</thinking>";
-    let mut search_start = 0;
-
-    while let Some(pos) = buffer[search_start..].find(TAG) {
-        let absolute_pos = search_start + pos;
-
-        // 检查前面是否有引用字符
-        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
-
-        // 检查后面是否有引用字符
-        let after_pos = absolute_pos + TAG.len();
-        let has_quote_after = is_quote_char(buffer, after_pos);
-
-        // 如果被引用字符包裹，跳过
-        if has_quote_before || has_quote_after {
-            search_start = absolute_pos + 1;
-            continue;
-        }
-
-        // 检查后面的内容
-        let after_content = &buffer[after_pos..];
-
-        // 如果标签后面内容不足以判断是否有双换行符，等待更多内容
-        if after_content.len() < 2 {
-            return None;
-        }
-
-        // 真正的 thinking 结束标签后面会有双换行符 `\n\n`
-        if after_content.starts_with("\n\n") {
-            return Some(absolute_pos);
-        }
-
-        // 不是双换行符，跳过继续搜索
-        search_start = absolute_pos + 1;
-    }
-
-    None
-}
-
-/// 查找缓冲区末尾的 thinking 结束标签（允许末尾只有空白字符）
-///
-/// 用于“边界事件”场景：例如 thinking 结束后立刻进入 tool_use，或流结束，
-/// 此时 `</thinking>` 后面可能没有 `\n\n`，但结束标签依然应被识别并过滤。
-///
-/// 约束：只有当 `</thinking>` 之后全部都是空白字符时才认为是结束标签，
-/// 以避免在 thinking 内容中提到 `</thinking>`（非结束标签）时误判。
-fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
-    const TAG: &str = "</thinking>";
-    let mut search_start = 0;
-
-    while let Some(pos) = buffer[search_start..].find(TAG) {
-        let absolute_pos = search_start + pos;
-
-        // 检查前面是否有引用字符
-        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
-
-        // 检查后面是否有引用字符
-        let after_pos = absolute_pos + TAG.len();
-        let has_quote_after = is_quote_char(buffer, after_pos);
-
-        if has_quote_before || has_quote_after {
-            search_start = absolute_pos + 1;
-            continue;
-        }
-
-        // 只有当标签后面全部是空白字符时才认定为结束标签
-        if buffer[after_pos..].trim().is_empty() {
-            return Some(absolute_pos);
-        }
-
-        search_start = absolute_pos + 1;
-    }
-
-    None
-}
-
-/// 查找真正的 thinking 开始标签（不被引用字符包裹）
-///
-/// 与 `find_real_thinking_end_tag` 类似，跳过被引用字符包裹的开始标签。
-fn find_real_thinking_start_tag(buffer: &str) -> Option<usize> {
-    const TAG: &str = "<thinking>";
-    let mut search_start = 0;
-
-    while let Some(pos) = buffer[search_start..].find(TAG) {
-        let absolute_pos = search_start + pos;
-
-        // 检查前面是否有引用字符
-        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
-
-        // 检查后面是否有引用字符
-        let after_pos = absolute_pos + TAG.len();
-        let has_quote_after = is_quote_char(buffer, after_pos);
-
-        // 如果不被引用字符包裹，则是真正的开始标签
-        if !has_quote_before && !has_quote_after {
-            return Some(absolute_pos);
-        }
-
-        // 继续搜索下一个匹配
-        search_start = absolute_pos + 1;
-    }
-
-    None
-}
-
-/// 从完整文本中提取 thinking 块（用于非流式响应）
-///
-/// 使用与流式处理相同的标签检测逻辑（引用字符过滤），确保一致性。
-/// 非流式场景下文本已完整，无需处理跨 chunk 分割问题。
-///
-/// # 返回值
-/// `(before_text, thinking_content, after_text)`：
-/// - `before_text` — `<thinking>` 之前的非空白正文（与流式一致地放在 thinking 块**之前**）；
-///   纯空白则为 `None`
-/// - `thinking_content` — 检测到的 thinking 内容；未检测到为 `None`
-/// - `after_text` — thinking 块之后的剩余文本
-///
-/// 未检测到有效 thinking 块时返回 `(None, None, original_text)`。
-pub(crate) fn extract_thinking_from_complete_text(
-    text: &str,
-) -> (Option<String>, Option<String>, String) {
-    let start_pos = match find_real_thinking_start_tag(text) {
-        Some(pos) => pos,
-        None => return (None, None, text.to_string()),
-    };
-
-    let before = &text[..start_pos];
-    let after_open = &text[start_pos + "<thinking>".len()..];
-
-    // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-        (
-            &after_open[..end_pos],
-            &after_open[end_pos + "</thinking>\n\n".len()..],
-        )
-    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-        let after_tag = end_pos + "</thinking>".len();
-        (&after_open[..end_pos], after_open[after_tag..].trim_start())
-    } else {
-        // 找不到有效的结束标签，不做提取
-        return (None, None, text.to_string());
-    };
-
-    // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
-    let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
-
-    // before 文本：跳过纯空白部分，放在 thinking 块之前（与流式 process_content_with_thinking 一致）
-    let before_text = if before.trim().is_empty() {
-        None
-    } else {
-        Some(before.to_string())
-    };
-
-    let thinking = if thinking_content.is_empty() {
-        None
-    } else {
-        Some(thinking_content.to_string())
-    };
-
-    (before_text, thinking, text_after.to_string())
-}
-
-/// SSE 事件
-#[derive(Debug, Clone)]
-pub struct SseEvent {
-    pub event: String,
-    pub data: serde_json::Value,
-}
-
-impl SseEvent {
-    pub fn new(event: impl Into<String>, data: serde_json::Value) -> Self {
-        Self {
-            event: event.into(),
-            data,
-        }
-    }
-
-    /// 格式化为 SSE 字符串
-    pub fn to_sse_string(&self) -> String {
-        format!(
-            "event: {}\ndata: {}\n\n",
-            self.event,
-            serde_json::to_string(&self.data).unwrap_or_default()
-        )
-    }
-}
-
-/// 内容块状态
-#[derive(Debug, Clone)]
-struct BlockState {
-    block_type: String,
-    started: bool,
-    stopped: bool,
-}
-
-impl BlockState {
-    fn new(block_type: impl Into<String>) -> Self {
-        Self {
-            block_type: block_type.into(),
-            started: false,
-            stopped: false,
-        }
-    }
-}
-
-/// SSE 状态管理器
-///
-/// 确保 SSE 事件序列符合 Claude API 规范：
-/// 1. message_start 只能出现一次
-/// 2. content_block 必须先 start 再 delta 再 stop
-/// 3. message_delta 只能出现一次，且在所有 content_block_stop 之后
-/// 4. message_stop 在最后
-#[derive(Debug)]
-pub struct SseStateManager {
-    /// message_start 是否已发送
-    message_started: bool,
-    /// message_delta 是否已发送
-    message_delta_sent: bool,
-    /// 活跃的内容块状态
-    ///
-    /// 用 `BTreeMap` 而非 `HashMap`：关闭多个块时按 index 升序迭代发送
-    /// `content_block_stop`，保证符合 Anthropic SSE 协议的块有序关闭要求
-    /// （严格客户端会因先收到 index:1 再收到 index:0 的 stop 而报错）。
-    active_blocks: BTreeMap<i32, BlockState>,
-    /// 消息是否已结束
-    message_ended: bool,
-    /// 下一个块索引
-    next_block_index: i32,
-    /// 当前 stop_reason
-    stop_reason: Option<String>,
-    /// 是否有工具调用
-    has_tool_use: bool,
-}
-
-impl Default for SseStateManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SseStateManager {
-    pub fn new() -> Self {
-        Self {
-            message_started: false,
-            message_delta_sent: false,
-            active_blocks: BTreeMap::new(),
-            message_ended: false,
-            next_block_index: 0,
-            stop_reason: None,
-            has_tool_use: false,
-        }
-    }
-
-    /// 判断指定块是否处于可接收 delta 的打开状态
-    fn is_block_open_of_type(&self, index: i32, expected_type: &str) -> bool {
-        self.active_blocks
-            .get(&index)
-            .is_some_and(|b| b.started && !b.stopped && b.block_type == expected_type)
-    }
-
-    /// 获取下一个块索引
-    pub fn next_block_index(&mut self) -> i32 {
-        let index = self.next_block_index;
-        self.next_block_index += 1;
-        index
-    }
-
-    /// 记录工具调用
-    pub fn set_has_tool_use(&mut self, has: bool) {
-        self.has_tool_use = has;
-    }
-
-    /// 设置 stop_reason
-    pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
-        self.stop_reason = Some(reason.into());
-    }
-
-    /// 检查是否存在非 thinking 类型的内容块（如 text 或 tool_use）
-    fn has_non_thinking_blocks(&self) -> bool {
-        self.active_blocks
-            .values()
-            .any(|b| b.block_type != "thinking")
-    }
-
-    /// 获取最终的 stop_reason
-    pub fn get_stop_reason(&self) -> String {
-        if let Some(ref reason) = self.stop_reason {
-            reason.clone()
-        } else if self.has_tool_use {
-            "tool_use".to_string()
-        } else {
-            "end_turn".to_string()
-        }
-    }
-
-    /// 处理 message_start 事件
-    pub fn handle_message_start(&mut self, event: serde_json::Value) -> Option<SseEvent> {
-        if self.message_started {
-            tracing::debug!("跳过重复的 message_start 事件");
-            return None;
-        }
-        self.message_started = true;
-        Some(SseEvent::new("message_start", event))
-    }
-
-    /// 处理 content_block_start 事件
-    pub fn handle_content_block_start(
-        &mut self,
-        index: i32,
-        block_type: &str,
-        data: serde_json::Value,
-    ) -> Vec<SseEvent> {
-        let mut events = Vec::new();
-
-        // 如果是 tool_use 块，先关闭之前的文本块
-        if block_type == "tool_use" {
-            self.has_tool_use = true;
-            for (block_index, block) in self.active_blocks.iter_mut() {
-                if block.block_type == "text" && block.started && !block.stopped {
-                    // 自动发送 content_block_stop 关闭文本块
-                    events.push(SseEvent::new(
-                        "content_block_stop",
-                        json!({
-                            "type": "content_block_stop",
-                            "index": block_index
-                        }),
-                    ));
-                    block.stopped = true;
-                }
-            }
-        }
-
-        // 检查块是否已存在
-        if let Some(block) = self.active_blocks.get_mut(&index) {
-            if block.started {
-                tracing::debug!("块 {} 已启动，跳过重复的 content_block_start", index);
-                return events;
-            }
-            block.started = true;
-        } else {
-            let mut block = BlockState::new(block_type);
-            block.started = true;
-            self.active_blocks.insert(index, block);
-        }
-
-        events.push(SseEvent::new("content_block_start", data));
-        events
-    }
-
-    /// 处理 content_block_delta 事件
-    pub fn handle_content_block_delta(
-        &mut self,
-        index: i32,
-        data: serde_json::Value,
-    ) -> Option<SseEvent> {
-        // 确保块已启动
-        if let Some(block) = self.active_blocks.get(&index) {
-            if !block.started || block.stopped {
-                tracing::warn!(
-                    "块 {} 状态异常: started={}, stopped={}",
-                    index,
-                    block.started,
-                    block.stopped
-                );
-                return None;
-            }
-        } else {
-            // 块不存在，可能需要先创建
-            tracing::warn!("收到未知块 {} 的 delta 事件", index);
-            return None;
-        }
-
-        Some(SseEvent::new("content_block_delta", data))
-    }
-
-    /// 处理 content_block_stop 事件
-    pub fn handle_content_block_stop(&mut self, index: i32) -> Option<SseEvent> {
-        if let Some(block) = self.active_blocks.get_mut(&index) {
-            if block.stopped {
-                tracing::debug!("块 {} 已停止，跳过重复的 content_block_stop", index);
-                return None;
-            }
-            block.stopped = true;
-            return Some(SseEvent::new(
-                "content_block_stop",
-                json!({
-                    "type": "content_block_stop",
-                    "index": index
-                }),
-            ));
-        }
-        None
-    }
-
-    /// 生成最终事件序列
-    pub fn generate_final_events(
-        &mut self,
-        input_tokens: i32,
-        output_tokens: i32,
-        cache_creation_input_tokens: i32,
-        cache_read_input_tokens: i32,
-    ) -> Vec<SseEvent> {
-        let mut events = Vec::new();
-
-        // 关闭所有未关闭的块
-        for (index, block) in self.active_blocks.iter_mut() {
-            if block.started && !block.stopped {
-                events.push(SseEvent::new(
-                    "content_block_stop",
-                    json!({
-                        "type": "content_block_stop",
-                        "index": index
-                    }),
-                ));
-                block.stopped = true;
-            }
-        }
-
-        // 发送 message_delta
-        if !self.message_delta_sent {
-            self.message_delta_sent = true;
-            // 字段对齐官方 API（jp.pincc.ai 实测）：delta.stop_details、usage.output_tokens_details、
-            // usage.iterations、顶层 context_management。message_delta.usage 不含 service_tier。
-            events.push(SseEvent::new(
-                "message_delta",
-                json!({
-                    "type": "message_delta",
-                    "delta": {
-                        "stop_reason": self.get_stop_reason(),
-                        "stop_sequence": null,
-                        "stop_details": null
-                    },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "cache_creation_input_tokens": cache_creation_input_tokens,
-                        "cache_read_input_tokens": cache_read_input_tokens,
-                        "output_tokens": output_tokens,
-                        "output_tokens_details": { "thinking_tokens": 0 },
-                        "iterations": [{
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens,
-                            "cache_read_input_tokens": cache_read_input_tokens,
-                            "cache_creation_input_tokens": cache_creation_input_tokens,
-                            "cache_creation": {
-                                "ephemeral_5m_input_tokens": cache_creation_input_tokens.max(0),
-                                "ephemeral_1h_input_tokens": 0
-                            },
-                            "type": "message"
-                        }]
-                    },
-                    "context_management": { "applied_edits": [] }
-                }),
-            ));
-        }
-
-        // 发送 message_stop
-        if !self.message_ended {
-            self.message_ended = true;
-            events.push(SseEvent::new(
-                "message_stop",
-                json!({ "type": "message_stop" }),
-            ));
-        }
-
-        events
-    }
-}
-
-use super::converter::get_context_window_size;
+//! 流式上下文 StreamContext（Kiro event → Anthropic SSE，热路径核心）
+
+use super::*;
+use super::thinking::{
+    find_char_boundary, find_real_thinking_end_tag, find_real_thinking_end_tag_at_buffer_end,
+    find_real_thinking_start_tag,
+};
+use crate::anthropic::converter::get_context_window_size;
 
 /// 流处理上下文
 pub struct StreamContext {
@@ -836,7 +189,7 @@ impl StreamContext {
         json!({
             "type": "message_start",
             "message": {
-                "model": super::converter::canonical_anthropic_model(&self.model),
+                "model": crate::anthropic::converter::canonical_anthropic_model(&self.model),
                 "id": self.message_id,
                 "type": "message",
                 "role": "assistant",
@@ -1556,283 +909,44 @@ impl StreamContext {
     }
 }
 
-/// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
-///
-/// 与 `StreamContext` 不同，此上下文会缓冲所有事件直到流结束，
-/// 然后用从 `contextUsageEvent` 计算的正确 `input_tokens` 更正 `message_start` 事件。
-///
-/// 工作流程：
-/// 1. 使用 `StreamContext` 正常处理所有 Kiro 事件
-/// 2. 把生成的 SSE 事件缓存起来（而不是立即发送）
-/// 3. 流结束时，找到 `message_start` 事件并更新其 `input_tokens`
-/// 4. 一次性返回所有事件
-pub struct BufferedStreamContext {
-    /// 内部流处理上下文（复用现有的事件处理逻辑）
-    inner: StreamContext,
-    /// 缓冲的所有事件（包括 message_start、content_block_start 等）
-    event_buffer: Vec<SseEvent>,
-    /// 估算的 input_tokens（用于回退）
-    estimated_input_tokens: i32,
-    /// 是否已经生成了初始事件
-    initial_events_generated: bool,
-    /// Prompt cache：首次创建（未命中）的 prefix tokens
-    /// 改这两个字段会自动同步到 inner StreamContext，调用方可直接 `ctx.cache_creation_input_tokens = X`
-    pub cache_creation_input_tokens: i32,
-    pub cache_read_input_tokens: i32,
-}
-
-impl BufferedStreamContext {
-    /// 创建缓冲流上下文
-    pub fn new(
-        model: impl Into<String>,
-        estimated_input_tokens: i32,
-        thinking_enabled: bool,
-        tool_name_map: HashMap<String, String>,
-    ) -> Self {
-        let inner = StreamContext::new_with_thinking(
-            model,
-            estimated_input_tokens,
-            thinking_enabled,
-            tool_name_map,
-        );
-        Self {
-            inner,
-            event_buffer: Vec::new(),
-            estimated_input_tokens,
-            initial_events_generated: false,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        }
-    }
-
-    /// 处理 Kiro 事件并缓冲结果
-    ///
-    /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
-    pub fn process_and_buffer(&mut self, event: &crate::kiro::model::events::Event) {
-        // 首次处理事件时，先生成初始事件（message_start 等）
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 处理事件并缓冲结果
-        let events = self.inner.process_kiro_event(event);
-        self.event_buffer.extend(events);
-    }
-
-    /// 完成流处理并返回所有事件
-    ///
-    /// 此方法会：
-    /// 1. 同步 cache_*_input_tokens 到 inner StreamContext（在事件生成前）
-    /// 2. 生成最终事件（message_delta, message_stop）
-    /// 3. 用正确的 input_tokens 更正 message_start 事件
-    /// 4. 返回所有缓冲的事件
-    pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
-        // 把外部设置的 cache tokens 同步进 inner（必须在生成初始/最终事件之前）
-        self.inner.cache_creation_input_tokens = self.cache_creation_input_tokens;
-        self.inner.cache_read_input_tokens = self.cache_read_input_tokens;
-
-        // 如果从未处理过事件，也要生成初始事件
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 生成最终事件
-        let final_events = self.inner.generate_final_events();
-        self.event_buffer.extend(final_events);
-
-        // 客户端可见的 input_tokens：用 estimated_input_tokens（注入前纯客户端口径，已扣 cache）。
-        // 不再用 context_input_tokens 反推（含 Kiro 自带 agent prompt + 注入开销，会虚高几千 token）。
-        let final_input_tokens = self.estimated_input_tokens.max(0);
-
-        // 更正 message_start 事件中的 usage 字段
-        for event in &mut self.event_buffer {
-            if event.event == "message_start" {
-                if let Some(message) = event.data.get_mut("message") {
-                    if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                        usage["cache_creation_input_tokens"] =
-                            serde_json::json!(self.cache_creation_input_tokens);
-                        usage["cache_read_input_tokens"] =
-                            serde_json::json!(self.cache_read_input_tokens);
-                    }
-                }
-            }
-        }
-
-        std::mem::take(&mut self.event_buffer)
-    }
-
-    /// 记录请求完成日志（缓冲流式，转发到 inner StreamContext）
-    pub fn log_completion(&self) {
-        self.inner.log_completion();
-    }
-
-    /// 设置 metrics 记录句柄（转发到 inner，log_completion 时回填 token）
-    pub fn set_record(&mut self, record: RecordHandle) {
-        self.inner.record = Some(record);
-    }
-
-    /// 设置客户端输出预算（转发到 inner StreamContext）
-    pub fn set_max_output_tokens(&mut self, max_tokens: i32) {
-        self.inner.set_max_output_tokens(max_tokens);
-    }
-
-    /// 输出预算是否已耗尽（转发自 inner）。缓冲流据此提前收尾并断开上游连接。
-    pub fn budget_exceeded(&self) -> bool {
-        self.inner.budget_exceeded
-    }
-}
-
-/// 判断字符是否属于 CJK 类（按 1.5 字符/token 估算）
-///
-/// 覆盖范围：
-/// - 平假名 `3040-309F`、片假名 `30A0-30FF`、片假名扩展 `31F0-31FF`
-/// - CJK 基本 `4E00-9FFF`
-/// - CJK 扩展 A `3400-4DBF`
-/// - CJK 兼容汉字 `F900-FAFF`
-/// - 韩文音节 `AC00-D7AF`
-/// - CJK 扩展 B-D `20000-2B81F`
-///
-/// 之前仅识别基本块（4E00-9FFF），日韩文本按英文计算，token 偏低约 2.5 倍。
-fn is_cjk_like(c: char) -> bool {
-    matches!(c,
-        '\u{3040}'..='\u{309F}'   // 平假名
-        | '\u{30A0}'..='\u{30FF}' // 片假名
-        | '\u{31F0}'..='\u{31FF}' // 片假名扩展
-        | '\u{3400}'..='\u{4DBF}' // CJK 扩展 A
-        | '\u{4E00}'..='\u{9FFF}' // CJK 基本
-        | '\u{AC00}'..='\u{D7AF}' // 韩文音节
-        | '\u{F900}'..='\u{FAFF}' // CJK 兼容
-        | '\u{20000}'..='\u{2A6DF}' // CJK 扩展 B
-        | '\u{2A700}'..='\u{2B73F}' // CJK 扩展 C
-        | '\u{2B740}'..='\u{2B81F}' // CJK 扩展 D
-    )
-}
-
-/// 把上游返回的 `context_usage_percentage` 限定到合法范围 `[0.0, 100.0]`
-///
-/// 防御性 clamp，避免上游 Kiro 偶发异常值导致 input_tokens 错乱：
-/// - `NaN` / `inf` → 0.0
-/// - 负数 → 0.0
-/// - `>100` → 100.0
-///
-/// 使用 `is_finite` 先过滤是因为 `f64::clamp(NaN, _, _)` 会传播 `NaN`。
-pub(super) fn clamp_context_percentage(pct: f64) -> f64 {
-    if !pct.is_finite() {
-        return 0.0;
-    }
-    pct.clamp(0.0, 100.0)
-}
-
-/// 简单的 token 估算
-pub(crate) fn estimate_tokens(text: &str) -> i32 {
-    let mut chinese_count = 0;
-    let mut other_count = 0;
-
-    for c in text.chars() {
-        if is_cjk_like(c) {
-            chinese_count += 1;
-        } else {
-            other_count += 1;
-        }
-    }
-
-    // CJK 约 1.5 字符/token，英文约 4 字符/token
-    let chinese_tokens = (chinese_count * 2 + 2) / 3;
-    let other_tokens = (other_count + 3) / 4;
-
-    (chinese_tokens + other_tokens).max(1)
-}
-
-/// 把文本按 token 预算截断（与 [`estimate_tokens`] 同口径：CJK≈1.5 字符/token，
-/// 其他≈4 字符/token）。逐字符累计 token，达到 `budget` 即在字符边界切断。
-///
-/// 用于输出预算到顶时截断当前 delta，保证发给客户端的内容不超过 max_tokens。
-/// `budget <= 0` 返回空串。
-pub(crate) fn truncate_text_to_token_budget(text: &str, budget: i32) -> String {
-    if budget <= 0 {
-        return String::new();
-    }
-
-    let mut chinese_count: i32 = 0;
-    let mut other_count: i32 = 0;
-    let mut byte_end = 0;
-
-    for (idx, c) in text.char_indices() {
-        let (next_cjk, next_other) = if is_cjk_like(c) {
-            (chinese_count + 1, other_count)
-        } else {
-            (chinese_count, other_count + 1)
-        };
-        // 与 estimate_tokens 完全一致的分段累计
-        let tokens = (next_cjk * 2 + 2) / 3 + (next_other + 3) / 4;
-        if tokens > budget {
-            break;
-        }
-        chinese_count = next_cjk;
-        other_count = next_other;
-        byte_end = idx + c.len_utf8();
-    }
-
-    text[..byte_end].to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::model::events::{Event, ReasoningContentEvent, ToolUseEvent};
 
-    #[test]
-    fn test_sse_event_format() {
-        let event = SseEvent::new("message_start", json!({"type": "message_start"}));
-        let sse_str = event.to_sse_string();
-
-        assert!(sse_str.starts_with("event: message_start\n"));
-        assert!(sse_str.contains("data: "));
-        assert!(sse_str.ends_with("\n\n"));
+    /// 辅助函数：从事件列表中提取所有 thinking_delta 的拼接内容
+    fn collect_thinking_content(events: &[SseEvent]) -> String {
+        events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta"
+            })
+            .map(|e| e.data["delta"]["thinking"].as_str().unwrap_or(""))
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 
-    #[test]
-    fn test_sse_state_manager_message_start() {
-        let mut manager = SseStateManager::new();
-
-        // 第一次应该成功
-        let event = manager.handle_message_start(json!({"type": "message_start"}));
-        assert!(event.is_some());
-
-        // 第二次应该被跳过
-        let event = manager.handle_message_start(json!({"type": "message_start"}));
-        assert!(event.is_none());
+    /// 辅助函数：从事件列表中提取所有 text_delta 的拼接内容
+    fn collect_text_content(events: &[SseEvent]) -> String {
+        events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
+            .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
+            .collect()
     }
 
-    #[test]
-    fn test_sse_state_manager_block_lifecycle() {
-        let mut manager = SseStateManager::new();
-
-        // 创建块
-        let events = manager.handle_content_block_start(0, "text", json!({}));
-        assert_eq!(events.len(), 1);
-
-        // delta
-        let event = manager.handle_content_block_delta(0, json!({}));
-        assert!(event.is_some());
-
-        // stop
-        let event = manager.handle_content_block_stop(0);
-        assert!(event.is_some());
-
-        // 重复 stop 应该被跳过
-        let event = manager.handle_content_block_stop(0);
-        assert!(event.is_none());
+    /// 辅助：从事件列表中找 thinking 类型 content_block_start 的数量
+    fn count_thinking_block_starts(events: &[SseEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
+            })
+            .count()
     }
 
     #[test]
     fn test_tool_name_reverse_mapping_in_stream() {
-        use crate::kiro::model::events::ToolUseEvent;
-
         let mut map = HashMap::new();
         map.insert(
             "short_abc12345".to_string(),
@@ -1880,7 +994,7 @@ mod tests {
             .expect("initial text block index should exist");
 
         // tool_use 开始会自动关闭现有 text block
-        let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+        let tool_events = ctx.process_tool_use(&ToolUseEvent {
             name: "test_tool".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
@@ -1942,7 +1056,7 @@ mod tests {
             "short prefix should still be buffered under thinking mode"
         );
 
-        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+        let events = ctx.process_tool_use(&ToolUseEvent {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
@@ -2002,167 +1116,6 @@ mod tests {
     }
 
     #[test]
-    fn test_estimate_tokens() {
-        assert!(estimate_tokens("Hello") > 0);
-        assert!(estimate_tokens("你好") > 0);
-        assert!(estimate_tokens("Hello 你好") > 0);
-    }
-
-    #[test]
-    fn test_find_real_thinking_start_tag_basic() {
-        // 基本情况：正常的开始标签
-        assert_eq!(find_real_thinking_start_tag("<thinking>"), Some(0));
-        assert_eq!(find_real_thinking_start_tag("prefix<thinking>"), Some(6));
-    }
-
-    #[test]
-    fn test_find_real_thinking_start_tag_with_backticks() {
-        // 被反引号包裹的应该被跳过
-        assert_eq!(find_real_thinking_start_tag("`<thinking>`"), None);
-        assert_eq!(find_real_thinking_start_tag("use `<thinking>` tag"), None);
-
-        // 先有被包裹的，后有真正的开始标签
-        assert_eq!(
-            find_real_thinking_start_tag("about `<thinking>` tag<thinking>content"),
-            Some(22)
-        );
-    }
-
-    #[test]
-    fn test_find_real_thinking_start_tag_with_quotes() {
-        // 被双引号包裹的应该被跳过
-        assert_eq!(find_real_thinking_start_tag("\"<thinking>\""), None);
-        assert_eq!(find_real_thinking_start_tag("the \"<thinking>\" tag"), None);
-
-        // 被单引号包裹的应该被跳过
-        assert_eq!(find_real_thinking_start_tag("'<thinking>'"), None);
-
-        // 混合情况
-        assert_eq!(
-            find_real_thinking_start_tag("about \"<thinking>\" and '<thinking>' then<thinking>"),
-            Some(40)
-        );
-    }
-
-    #[test]
-    fn test_extract_thinking_before_text_goes_before_thinking() {
-        // H2 回归：<thinking> 之前的正文应作为独立 before_text 返回（与流式块顺序一致），
-        // 而不是被拼到 thinking 之后的 remaining 里。
-        let input = "前置正文<thinking>\n推理内容</thinking>\n\n最终答案";
-        let (before, thinking, after) = extract_thinking_from_complete_text(input);
-        assert_eq!(before.as_deref(), Some("前置正文"), "before 应单独返回");
-        assert_eq!(thinking.as_deref(), Some("推理内容"));
-        assert_eq!(after, "最终答案");
-    }
-
-    #[test]
-    fn test_extract_thinking_blank_before_is_none() {
-        // 纯空白的 before（如 adaptive 模式的 \n\n）应为 None，不产生空 text 块
-        let input = "\n\n<thinking>\n推理</thinking>\n\n答案";
-        let (before, thinking, after) = extract_thinking_from_complete_text(input);
-        assert_eq!(before, None, "纯空白 before 应为 None");
-        assert_eq!(thinking.as_deref(), Some("推理"));
-        assert_eq!(after, "答案");
-    }
-
-    #[test]
-    fn test_extract_thinking_no_tag_returns_original() {
-        // 无 thinking 标签时原样返回，before/thinking 均为 None
-        let input = "纯文本没有思考标签";
-        let (before, thinking, after) = extract_thinking_from_complete_text(input);
-        assert_eq!(before, None);
-        assert_eq!(thinking, None);
-        assert_eq!(after, "纯文本没有思考标签");
-    }
-
-    #[test]
-    fn test_find_real_thinking_end_tag_basic() {
-        // 基本情况：正常的结束标签后面有双换行符
-        assert_eq!(find_real_thinking_end_tag("</thinking>\n\n"), Some(0));
-        assert_eq!(
-            find_real_thinking_end_tag("content</thinking>\n\n"),
-            Some(7)
-        );
-        assert_eq!(
-            find_real_thinking_end_tag("some text</thinking>\n\nmore text"),
-            Some(9)
-        );
-
-        // 没有双换行符的情况
-        assert_eq!(find_real_thinking_end_tag("</thinking>"), None);
-        assert_eq!(find_real_thinking_end_tag("</thinking>\n"), None);
-        assert_eq!(find_real_thinking_end_tag("</thinking> more"), None);
-    }
-
-    #[test]
-    fn test_find_real_thinking_end_tag_with_backticks() {
-        // 被反引号包裹的应该被跳过
-        assert_eq!(find_real_thinking_end_tag("`</thinking>`\n\n"), None);
-        assert_eq!(
-            find_real_thinking_end_tag("mention `</thinking>` in code\n\n"),
-            None
-        );
-
-        // 只有前面有反引号
-        assert_eq!(find_real_thinking_end_tag("`</thinking>\n\n"), None);
-
-        // 只有后面有反引号
-        assert_eq!(find_real_thinking_end_tag("</thinking>`\n\n"), None);
-    }
-
-    #[test]
-    fn test_find_real_thinking_end_tag_with_quotes() {
-        // 被双引号包裹的应该被跳过
-        assert_eq!(find_real_thinking_end_tag("\"</thinking>\"\n\n"), None);
-        assert_eq!(
-            find_real_thinking_end_tag("the string \"</thinking>\" is a tag\n\n"),
-            None
-        );
-
-        // 被单引号包裹的应该被跳过
-        assert_eq!(find_real_thinking_end_tag("'</thinking>'\n\n"), None);
-        assert_eq!(
-            find_real_thinking_end_tag("use '</thinking>' as marker\n\n"),
-            None
-        );
-
-        // 混合情况：双引号包裹后有真正的标签
-        assert_eq!(
-            find_real_thinking_end_tag("about \"</thinking>\" tag</thinking>\n\n"),
-            Some(23)
-        );
-
-        // 混合情况：单引号包裹后有真正的标签
-        assert_eq!(
-            find_real_thinking_end_tag("about '</thinking>' tag</thinking>\n\n"),
-            Some(23)
-        );
-    }
-
-    #[test]
-    fn test_find_real_thinking_end_tag_mixed() {
-        // 先有被包裹的，后有真正的结束标签
-        assert_eq!(
-            find_real_thinking_end_tag("discussing `</thinking>` tag</thinking>\n\n"),
-            Some(28)
-        );
-
-        // 多个被包裹的，最后一个是真正的
-        assert_eq!(
-            find_real_thinking_end_tag("`</thinking>` and `</thinking>` done</thinking>\n\n"),
-            Some(36)
-        );
-
-        // 多种引用字符混合
-        assert_eq!(
-            find_real_thinking_end_tag(
-                "`</thinking>` and \"</thinking>\" and '</thinking>' done</thinking>\n\n"
-            ),
-            Some(54)
-        );
-    }
-
-    #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
@@ -2172,7 +1125,7 @@ mod tests {
         // thinking 内容以 `</thinking>` 结尾，但后面没有 `\n\n`（模拟紧跟 tool_use 的场景）
         all_events.extend(ctx.process_assistant_response("<thinking>abc</thinking>"));
 
-        let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+        let tool_events = ctx.process_tool_use(&ToolUseEvent {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
@@ -2347,27 +1300,6 @@ mod tests {
             full_text
         );
         assert_eq!(full_text, "你好");
-    }
-
-    /// 辅助函数：从事件列表中提取所有 thinking_delta 的拼接内容
-    fn collect_thinking_content(events: &[SseEvent]) -> String {
-        events
-            .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta"
-            })
-            .map(|e| e.data["delta"]["thinking"].as_str().unwrap_or(""))
-            .filter(|s| !s.is_empty())
-            .collect()
-    }
-
-    /// 辅助函数：从事件列表中提取所有 text_delta 的拼接内容
-    fn collect_text_content(events: &[SseEvent]) -> String {
-        events
-            .iter()
-            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
-            .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
-            .collect()
     }
 
     #[test]
@@ -2557,14 +1489,12 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(
-            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-                name: "test_tool".to_string(),
-                tool_use_id: "tool_1".to_string(),
-                input: "{}".to_string(),
-                stop: true,
-            }),
-        );
+        all_events.extend(ctx.process_tool_use(&ToolUseEvent {
+            name: "test_tool".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{}".to_string(),
+            stop: true,
+        }));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -2579,16 +1509,6 @@ mod tests {
     }
 
     // === 任务 A: Opus 4.7 thinking 兜底注入 ===
-
-    /// 辅助：从事件列表中找 thinking 类型 content_block_start 的数量
-    fn count_thinking_block_starts(events: &[SseEvent]) -> usize {
-        events
-            .iter()
-            .filter(|e| {
-                e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
-            })
-            .count()
-    }
 
     #[test]
     fn thinking_enabled_no_block_injects_empty() {
@@ -2677,95 +1597,8 @@ mod tests {
         assert!(last_message_stop_idx.is_some(), "应有 message_stop 收尾");
     }
 
-    // === Bug 2: estimate_tokens 多语言覆盖 ===
-
-    #[test]
-    fn estimate_tokens_japanese_kana() {
-        // 5 个假名字符，按 CJK 算应约 (5*2+2)/3 = 4 token；不应像之前那样按英文算成 (5+3)/4 = 2 token
-        let tokens = estimate_tokens("こんにちは");
-        assert_eq!(tokens, 4, "5 个平假名应按 CJK 计算 ≈ 4 token");
-
-        let tokens_katakana = estimate_tokens("コンピューター");
-        assert!(tokens_katakana >= 4, "7 个片假名应按 CJK 计算");
-    }
-
-    #[test]
-    fn estimate_tokens_korean() {
-        // 5 个韩字音节，按 CJK 算应约 4 token
-        let tokens = estimate_tokens("안녕하세요");
-        assert_eq!(tokens, 4, "5 个韩字应按 CJK 计算 ≈ 4 token");
-    }
-
-    #[test]
-    fn estimate_tokens_extended_cjk() {
-        // CJK 扩展 A 字符（\u{3400}-\u{4DBF}）也应识别
-        let s = "\u{3400}\u{3401}\u{3402}\u{3403}\u{3404}\u{3405}"; // 6 个扩展 A 字符
-        let tokens = estimate_tokens(s);
-        // 6 个 CJK 字符: (6*2+2)/3 = 4 token
-        assert_eq!(tokens, 4, "CJK 扩展 A 字符应被识别");
-    }
-
-    #[test]
-    fn is_cjk_like_classification() {
-        // 正确识别
-        assert!(is_cjk_like('中'), "基本汉字");
-        assert!(is_cjk_like('あ'), "平假名");
-        assert!(is_cjk_like('ア'), "片假名");
-        assert!(is_cjk_like('한'), "韩字");
-        assert!(is_cjk_like('\u{3400}'), "CJK 扩展 A");
-        assert!(is_cjk_like('\u{F900}'), "CJK 兼容");
-
-        // 不应被识别
-        assert!(!is_cjk_like('a'), "英文小写");
-        assert!(!is_cjk_like('A'), "英文大写");
-        assert!(!is_cjk_like('1'), "数字");
-        assert!(!is_cjk_like(' '), "空格");
-        assert!(!is_cjk_like('é'), "拉丁扩展");
-        assert!(
-            !is_cjk_like('\u{3000}'),
-            "CJK 标点不算 CJK 字符（避免标点抬高估算）"
-        );
-    }
-
-    // === Bug 4: clamp_context_percentage 防上游异常 ===
-
-    #[test]
-    fn clamp_percentage_normal() {
-        assert_eq!(clamp_context_percentage(0.0), 0.0);
-        assert_eq!(clamp_context_percentage(50.0), 50.0);
-        assert_eq!(clamp_context_percentage(99.9), 99.9);
-        assert_eq!(clamp_context_percentage(100.0), 100.0);
-    }
-
-    #[test]
-    fn clamp_percentage_over_100() {
-        assert_eq!(clamp_context_percentage(100.001), 100.0);
-        assert_eq!(clamp_context_percentage(250.0), 100.0);
-        assert_eq!(clamp_context_percentage(1e9), 100.0);
-        assert_eq!(clamp_context_percentage(f64::MAX), 100.0);
-    }
-
-    #[test]
-    fn clamp_percentage_negative() {
-        assert_eq!(clamp_context_percentage(-0.0001), 0.0);
-        assert_eq!(clamp_context_percentage(-10.0), 0.0);
-        assert_eq!(clamp_context_percentage(-1e9), 0.0);
-        assert_eq!(clamp_context_percentage(f64::MIN), 0.0);
-    }
-
-    #[test]
-    fn clamp_percentage_nan_and_inf_safe() {
-        // NaN 应被 is_finite 过滤，回退到 0
-        assert_eq!(clamp_context_percentage(f64::NAN), 0.0);
-        // 正负 inf 同样处理
-        assert_eq!(clamp_context_percentage(f64::INFINITY), 0.0);
-        assert_eq!(clamp_context_percentage(f64::NEG_INFINITY), 0.0);
-    }
-
     #[test]
     fn test_reasoning_content_event_streaming() {
-        use crate::kiro::model::events::{Event, ReasoningContentEvent};
-
         let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
         let _ = ctx.generate_initial_events();
 
@@ -2805,34 +1638,7 @@ mod tests {
         assert!(!ctx.in_thinking_block);
     }
 
-    // === 输出预算（max_tokens）截断 ===
-
-    #[test]
-    fn truncate_to_budget_ascii() {
-        // estimate_tokens("aaaaaaaa") = (8+3)/4 = 2 tokens
-        assert_eq!(estimate_tokens("aaaaaaaa"), 2);
-        // 预算 1 token：截到 ≤1 token 的最长前缀（4 字符 → (4+3)/4=1）
-        let t = truncate_text_to_token_budget("aaaaaaaa", 1);
-        assert!(estimate_tokens(&t) <= 1, "截断后不应超预算: {:?}", t);
-        assert!(!t.is_empty(), "1 token 预算应能放下部分内容");
-    }
-
-    #[test]
-    fn truncate_to_budget_zero_is_empty() {
-        assert_eq!(truncate_text_to_token_budget("hello world", 0), "");
-        assert_eq!(truncate_text_to_token_budget("hello", -5), "");
-    }
-
-    #[test]
-    fn truncate_to_budget_respects_char_boundary() {
-        // CJK 多字节字符不应被切在字节中间
-        let s = "你好世界你好世界";
-        let t = truncate_text_to_token_budget(s, 3);
-        assert!(s.starts_with(&t), "截断结果应是原串前缀: {:?}", t);
-        assert!(estimate_tokens(&t) <= 3);
-        // 合法 UTF-8（能再 estimate 不 panic 即证明边界正确）
-        let _ = estimate_tokens(&t);
-    }
+    // === 输出预算（max_tokens）截断：StreamContext 集成部分 ===
 
     #[test]
     fn no_budget_means_no_truncation() {
@@ -2875,7 +1681,6 @@ mod tests {
 
     #[test]
     fn budget_shared_between_thinking_and_text() {
-        use crate::kiro::model::events::{Event, ReasoningContentEvent};
         let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
         let _ = ctx.generate_initial_events();
         ctx.set_max_output_tokens(2);
@@ -2938,25 +1743,5 @@ mod tests {
             .iter()
             .any(|e| e.event == "content_block_stop");
         assert!(has_stop, "thinking 块应有 content_block_stop");
-    }
-
-    #[test]
-    fn message_delta_usage_has_no_service_tier() {
-        let mut sm = SseStateManager::new();
-        let _ = sm.handle_message_start(json!({
-            "type": "message_start",
-            "message": { "usage": {} }
-        }));
-        let events = sm.generate_final_events(10, 5, 0, 0);
-        let md = events
-            .iter()
-            .find(|e| e.event == "message_delta")
-            .expect("应有 message_delta");
-        assert!(
-            md.data["usage"]["service_tier"].is_null(),
-            "message_delta.usage 不应含 service_tier"
-        );
-        // 但 output_tokens 仍在
-        assert_eq!(md.data["usage"]["output_tokens"], 5);
     }
 }

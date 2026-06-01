@@ -18,7 +18,9 @@ use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::metrics::{MetricsRecorder, RecordHandle, RequestKind, RequestRecord};
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::{MultiTokenManager, TransientFailureKind};
+use crate::kiro::token_manager::{
+    MultiTokenManager, TransientFailureKind, extract_suspicious_directory_key,
+};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -345,7 +347,8 @@ impl KiroProvider {
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let effective = credentials
+            .effective_proxy_with_group(self.token_manager.config(), self.global_proxy.as_ref());
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
@@ -368,8 +371,8 @@ impl KiroProvider {
         credentials: &KiroCredentials,
         attempt: usize,
     ) -> anyhow::Result<Client> {
-        // 1. 凭据有自定义 proxy_url → 走自己的（per-credential 优先级最高）
-        if credentials.proxy_url.is_some() {
+        // 1. 凭据/分组有显式出口 → 固定走自己的出口，不被 fallback proxy 覆盖。
+        if credentials.has_explicit_proxy_route(self.token_manager.config()) {
             return self.client_for(credentials);
         }
         // 2. 达到 fallback 阈值且全局 fallback 已配置 → 走 fallback proxy
@@ -847,11 +850,17 @@ impl KiroProvider {
                 } else {
                     TransientFailureKind::from_status(status.as_u16())
                 };
-                self.token_manager.report_transient_failure(
+                let directory_key = if matches!(kind, TransientFailureKind::SuspiciousActivity) {
+                    extract_suspicious_directory_key(&body)
+                } else {
+                    None
+                };
+                self.token_manager.report_transient_failure_with_directory(
                     ctx.id,
                     kind,
                     retry_after,
                     ctx.from_cooldown_fallback,
+                    directory_key.as_deref(),
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt + 1 < max_retries {
@@ -1124,11 +1133,17 @@ impl KiroProvider {
                 } else {
                     TransientFailureKind::from_status(status.as_u16())
                 };
-                self.token_manager.report_transient_failure(
+                let directory_key = if matches!(kind, TransientFailureKind::SuspiciousActivity) {
+                    extract_suspicious_directory_key(&body)
+                } else {
+                    None
+                };
+                self.token_manager.report_transient_failure_with_directory(
                     ctx.id,
                     kind,
                     retry_after,
                     ctx.from_cooldown_fallback,
+                    directory_key.as_deref(),
                 );
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",

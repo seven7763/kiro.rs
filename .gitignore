@@ -13,3 +13,5 @@
 /kiro_stats.json
 /.windsurf/
 /admin-ui/package-lock.json
+/.pentest/
+.DS_Store

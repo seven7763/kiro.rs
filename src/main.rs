@@ -10,7 +10,6 @@ mod common;
 mod http_client;
 mod kiro;
 mod model;
-pub mod token;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -166,7 +165,7 @@ async fn main() {
     );
 
     // 初始化 count_tokens 配置
-    token::init_config(token::CountTokensConfig {
+    anthropic::token_count::init_config(anthropic::token_count::CountTokensConfig {
         api_url: config.count_tokens_api_url.clone(),
         api_key: config.count_tokens_api_key.clone(),
         auth_type: config.count_tokens_auth_type.clone(),

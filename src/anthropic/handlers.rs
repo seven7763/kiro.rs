@@ -5,12 +5,8 @@
 use std::convert::Infallible;
 
 use crate::kiro::model::events::Event;
-use crate::kiro::model::requests::kiro::KiroRequest;
+use crate::kiro::model::requests::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::model::config::SystemPromptPosition;
-use crate::model::runtime::SharedPromptConfig;
-use crate::token;
-use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -24,253 +20,24 @@ use serde_json::json;
 use std::time::Duration;
 use tokio::time::interval;
 
-use super::converter::{ConversionError, canonical_anthropic_model, convert_request_with_options};
+use super::cache_accounting::{
+    CacheDecision, client_visible_usage, estimate_incremental_input_tokens, lookup_prompt_cache,
+    record_cache_outcome, record_cache_report_only,
+};
+use super::converter::{
+    ConversionError, canonical_anthropic_model, convert_request_with_options,
+};
+use super::error_map::map_provider_error;
 use super::middleware::AppState;
-use super::prompt_cache::{CacheProfile, GLOBAL_ACCOUNT, PromptCache, build_profile_from_request};
+use super::models::{models_from_upstream, static_models};
+use super::preprocess::{inject_system_prompt, override_thinking_from_model_name};
+use super::prompt_cache::PromptCache;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::token_count::{self as token, saturating_to_i32};
 use super::types::{
-    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
-    OutputConfig, SystemMessage, Thinking,
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, ModelsResponse,
 };
 use super::websearch;
-
-/// 中转层 Prompt cache 决定结果
-///
-/// 决定本次请求要使用哪个 conversation_id，以及向客户端上报的 cache_*_input_tokens。
-///
-/// **多断点精确计费**：基于 [`super::prompt_cache`] 的多断点 + 最长前缀匹配算法，
-/// `cache_creation` / `cache_read` 都是真实值（不再恒 0）。客户端 UI 和下游计费
-/// 系统（sub2api）据此看到正确的命中分解。
-///
-/// **`skipped` 状态**：客户端没打任何 `cache_control: ephemeral` 标记时，整个 cache
-/// 模块跳过——不查询、不回写、不上报，行为回到"无 cache"基线。
-#[derive(Debug, Clone)]
-pub(crate) struct CacheDecision {
-    /// 命中时强制用此 conversation_id（让上游 session 缓存复用）
-    pub forced_conversation_id: Option<String>,
-    /// cache_read_input_tokens：命中前缀的累积 token（向客户端上报）
-    pub cache_read_input_tokens: i32,
-    /// cache_creation_input_tokens：本次新增写入的 token（向客户端上报）
-    pub cache_creation_input_tokens: i32,
-    /// 本次请求的 profile（请求成功后用于 update 回写）；skipped 时为 None
-    pub profile: Option<CacheProfile>,
-    /// 是否跳过 cache（客户端没显式启用）
-    pub skipped: bool,
-}
-
-impl CacheDecision {
-    /// 跳过 cache 的默认决定：所有 cache 字段归零，conversation_id 走默认逻辑
-    fn skipped() -> Self {
-        Self {
-            forced_conversation_id: None,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            profile: None,
-            skipped: true,
-        }
-    }
-}
-
-/// 计算 prompt cache 决定（命中查询 + usage 计算，但**不**回写——回写在请求成功后做）
-///
-/// `total_input_tokens`：本次请求的全量 input tokens（用于 85% 上限与 TTL 分桶）。
-fn lookup_prompt_cache(
-    cache: &PromptCache,
-    payload: &MessagesRequest,
-    total_input_tokens: i32,
-) -> CacheDecision {
-    // 没有任何 cache_control 标记 → 跳过，行为与"无 cache"基线一致
-    let Some(profile) = build_profile_from_request(payload, total_input_tokens) else {
-        tracing::trace!("prompt_cache: skipped (no cache_control marker on client request)");
-        return CacheDecision::skipped();
-    };
-
-    let usage = cache.compute(GLOBAL_ACCOUNT, &profile);
-    let forced_conversation_id = cache.lookup_conversation(&profile);
-
-    tracing::debug!(
-        "prompt_cache: creation={} read={} (5m={} 1h={}) breakpoints={} conv_reuse={}",
-        usage.cache_creation,
-        usage.cache_read,
-        usage.creation_5m,
-        usage.creation_1h,
-        profile.breakpoints.len(),
-        forced_conversation_id.is_some(),
-    );
-
-    CacheDecision {
-        forced_conversation_id,
-        cache_read_input_tokens: usage.cache_read,
-        cache_creation_input_tokens: usage.cache_creation,
-        profile: Some(profile),
-        skipped: false,
-    }
-}
-
-/// 请求成功后回写 cache：写入断点 fingerprint + conversation_id 复用映射
-fn record_cache_outcome(
-    cache: &PromptCache,
-    decision: &CacheDecision,
-    actual_conversation_id: &str,
-) {
-    if decision.skipped {
-        return;
-    }
-    if let Some(profile) = decision.profile.as_ref() {
-        cache.update(GLOBAL_ACCOUNT, profile, actual_conversation_id);
-    }
-}
-
-/// 安全将 `u64` token 计数转换为 `i32`，超出范围时饱和到 `i32::MAX`
-///
-/// `count_all_tokens` 返回 `u64`，但下游 SSE 协议、context window 计算和
-/// `CountTokensResponse` 都用 `i32`。直接 `as i32` 在极端大请求下会 wrap 成负数
-/// 或被截断。此函数保证结果始终在 `[0, i32::MAX]` 范围内。
-fn saturating_to_i32(n: u64) -> i32 {
-    i32::try_from(n).unwrap_or(i32::MAX)
-}
-
-/// 将 KiroProvider 错误映射为符合 Anthropic 错误协议的 HTTP 响应
-///
-/// **Claude Code 客户端 retry 行为关键路径**：
-///
-/// Claude Code（Anthropic SDK）见到非 200 响应时按错误类型决定 retry 间隔：
-/// - `429` + `Retry-After` → 严格按 header 等待（最理想）
-/// - `429` 无 header → 指数退避 0.5/1/2/4/8s（但仍 retry）
-/// - `5xx` → 立即 retry（短间隔），雪上加霜
-///
-/// 因此当上游 18 次 retry 全失败时，把内部"上游 429 风暴"信息透传成
-/// `429 + Retry-After: 30s`，让客户端理解"现在是限频，等 30s 再来"，
-/// 而不是用 502 让客户端立刻 retry 火上浇油。
-///
-/// Retry-After 取值依据：
-/// - 上游 cooldown 默认 30s（见 `cooldown_seconds`）
-/// - 给 30s 让号池有恢复窗口
-/// - OVERAGE 限额是月度/小时窗口，给 60s 更稳
-fn map_provider_error(err: Error) -> Response {
-    let err_str = err.to_string();
-
-    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
-    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
-        )
-            .into_response();
-    }
-
-    // 单次输入太长（请求体本身超出上游限制）
-    if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
-            )),
-        )
-            .into_response();
-    }
-
-    // 客户端请求总超时（CF 524 防御触发，详见 provider::REQUEST_TOTAL_TIMEOUT_SECS）
-    // 内部 retry 90s 仍未拿到响应——号池打废，让客户端等 60s 让 cooldown 恢复
-    if err_str.contains(crate::kiro::provider::REQUEST_TIMEOUT_MARKER) {
-        tracing::error!(error = %err, "客户端请求总超时（CF 524 防御）：返回 503 + Retry-After: 60");
-        return build_retryable_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "overloaded_error",
-            "Service is currently overloaded with retries. Please retry after the cooldown window.",
-            60,
-        );
-    }
-
-    // 上游限频/账户风控（"suspicious activity" / "Too Many Requests"）
-    // 这是当前最常见的失败模式：18 次 retry 全 429 后兜底到此分支
-    let is_rate_limit = err_str.contains("429")
-        || err_str.contains("Too Many Requests")
-        || err_str.contains("suspicious activity")
-        || err_str.contains("rate limit");
-
-    // 上游月度/小时 overage 限额耗尽
-    let is_overage = err_str.contains("OVERAGE_REQUEST_LIMIT_EXCEEDED")
-        || err_str.contains("limit for overages");
-
-    if is_overage {
-        tracing::error!(error = %err, "上游限额耗尽（OVERAGE）：返回 429 + Retry-After: 60");
-        return build_retryable_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limit_error",
-            "Upstream account hit overage limit. Please retry after the rate limit window resets.",
-            60,
-        );
-    }
-
-    if is_rate_limit {
-        tracing::error!(error = %err, "上游限频（429 风暴）：返回 429 + Retry-After: 120");
-        return build_retryable_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limit_error",
-            "Upstream rate limit reached after multiple retries. Please retry shortly.",
-            // 30 → 120：directory 维度被严风控时，30s 客户端 retry 还是同一波号→进一步加严。
-            // 拉到 120s 让客户端 backoff 久点，给 directory 真正喘息恢复的窗口。
-            120,
-        );
-    }
-
-    // 凭据问题（401/403）：上游 token 失效但强制刷新失败
-    if err_str.contains("401") || err_str.contains("403") {
-        tracing::error!(error = %err, "上游认证失败：返回 503 + Retry-After: 60");
-        return build_retryable_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "overloaded_error",
-            "Upstream credential authentication failed. Service temporarily unavailable.",
-            60,
-        );
-    }
-
-    // 其他错误（网络/未知）：保守返回 503 + Retry-After: 30
-    // 比 502 更友好——Anthropic SDK 处理 503 时按 Retry-After 间隔，避免立刻 retry
-    tracing::error!(error = %err, "上游未知错误：返回 503 + Retry-After: 30");
-    build_retryable_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "overloaded_error",
-        "Upstream API temporarily unavailable. Please retry shortly.",
-        30,
-    )
-}
-
-/// 构造带 Retry-After header 的 Anthropic 标准错误响应
-///
-/// 客户端见到 `Retry-After` 会按指定秒数等待再 retry，避免短间隔 retry 风暴
-/// 进一步压垮上游。
-fn build_retryable_error(
-    status: StatusCode,
-    error_type: &str,
-    message: &str,
-    retry_after_secs: u64,
-) -> Response {
-    let body = serde_json::to_vec(&ErrorResponse::new(error_type, message)).unwrap_or_else(|_| {
-        br#"{"error":{"type":"api_error","message":"serialization failed"}}"#.to_vec()
-    });
-
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::RETRY_AFTER, retry_after_secs.to_string())
-        .body(Body::from(body))
-        .unwrap_or_else(|_| {
-            // 极度退化路径：builder 不会失败但保留兜底
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new("api_error", "internal error")),
-            )
-                .into_response()
-        })
-}
 
 /// GET /v1/models
 ///
@@ -305,166 +72,6 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
-/// 用上游真实元数据直接构造 `/v1/models` 列表。
-///
-/// 上游 [`UpstreamModel`] 已带 `modelId`/`modelName`/`maxOutputTokens`，直接映射为
-/// Anthropic 格式的 [`Model`]。对支持 thinking 的 Claude 系模型额外追加 `-thinking` 变体
-/// （沿用 kiro-rs 私有约定）。`max_tokens` 用上游 `maxOutputTokens` 真值（如 Opus 4.7 = 128000），
-/// 缺失时回退 64000。
-fn models_from_upstream(upstream: &[crate::kiro::provider::UpstreamModel]) -> Vec<Model> {
-    // 上游已逝时间戳无意义，统一用一个固定 created（不影响客户端使用）
-    const CREATED: i64 = 1778400000;
-    let mut out = Vec::with_capacity(upstream.len() * 2);
-    for m in upstream {
-        // `auto` 是路由别名，不作为可选模型对外暴露
-        if m.model_id == "auto" {
-            continue;
-        }
-        let max_tokens = m.max_output_tokens.unwrap_or(64000);
-        let is_claude = m.model_id.starts_with("claude");
-        out.push(Model {
-            id: m.model_id.clone(),
-            object: "model".to_string(),
-            created: CREATED,
-            owned_by: if is_claude {
-                "anthropic".to_string()
-            } else {
-                "kiro".to_string()
-            },
-            display_name: m.model_name.clone(),
-            model_type: "chat".to_string(),
-            max_tokens,
-        });
-        // Claude 系支持 thinking：追加 -thinking 变体
-        if is_claude {
-            out.push(Model {
-                id: format!("{}-thinking", m.model_id),
-                object: "model".to_string(),
-                created: CREATED,
-                owned_by: "anthropic".to_string(),
-                display_name: format!("{} (Thinking)", m.model_name),
-                model_type: "chat".to_string(),
-                max_tokens,
-            });
-        }
-    }
-    if out.is_empty() { static_models() } else { out }
-}
-
-/// 内置静态模型列表（上游获取失败时的回退，也是过滤的元数据来源）。
-fn static_models() -> Vec<Model> {
-    vec![
-        Model {
-            id: "claude-opus-4-7".to_string(),
-            object: "model".to_string(),
-            created: 1778400000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1778400000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-    ]
-}
-
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
@@ -489,6 +96,7 @@ pub async fn post_messages(
         payload.messages.clone(),
         payload.tools.clone(),
     ));
+    let incremental_input_tokens = estimate_incremental_input_tokens(&payload, client_input_tokens);
 
     // 注入自定义系统提示词
     inject_system_prompt(&mut payload, &state.prompt_config);
@@ -516,15 +124,42 @@ pub async fn post_messages(
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
-        // 估算输入 tokens
+        // 估算上游全量 tokens 供 prompt cache 判定；客户端可见 usage 仍使用注入前预算。
         let input_tokens = saturating_to_i32(token::count_all_tokens(
             payload.model.clone(),
             payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
         ));
+        let cache_decision = lookup_prompt_cache(&state.prompt_cache, &payload, input_tokens);
+        let (
+            input_tokens_for_client,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        ) = client_visible_usage(
+            &state.prompt_cache,
+            &cache_decision,
+            &payload.model,
+            client_input_tokens,
+            incremental_input_tokens,
+        );
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let response = websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens_for_client,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        )
+        .await;
+        if response.status().is_success() {
+            record_cache_report_only(
+                &state.prompt_cache,
+                &cache_decision,
+                cache_read_input_tokens,
+            );
+        }
+        return response;
     }
 
     // 估算输入 tokens（发给 Kiro 上游的"全量" input tokens；也用于 prompt cache 的
@@ -562,12 +197,8 @@ pub async fn post_messages(
             }
         };
 
-    // 请求转换成功后回写 cache：写入断点 fingerprint + conversation_id 复用映射
-    record_cache_outcome(
-        &state.prompt_cache,
-        &cache_decision,
-        &conversion_result.conversation_state.conversation_id,
-    );
+    // cache entry 只能在上游成功接受请求后回写；否则 429/5xx 会污染真实缓存诊断。
+    let actual_conversation_id = conversion_result.conversation_state.conversation_id.clone();
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -592,17 +223,20 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 客户端可见的 input_tokens 应该剔除 cache_read + cache_creation 两部分
-    // —— Anthropic 协议规定 input_tokens / cache_creation_input_tokens / cache_read_input_tokens
-    // 三字段互斥不重叠。下游计费系统（如 sub2api）会按三者独立计价相加，重叠会导致溢价。
-    //
-    // 基数用 client_input_tokens（注入前的纯客户端口径），而非 input_tokens（含注入的
-    // pentest preset）。这样客户端看到的 input + cache 三字段和 = 它实际发送的内容，
-    // 不暴露中转层注入开销，与 cctest 等检测工具的预期一致。
-    let input_tokens_for_client = (client_input_tokens
-        - cache_decision.cache_read_input_tokens
-        - cache_decision.cache_creation_input_tokens)
-        .max(0);
+    // 客户端可见 usage 必须以注入前的 client_input_tokens 为总预算。
+    // fake cache 开启时也只在这个预算内重分配，避免把中转层 system/preset 注入
+    // 算进客户账单，或让 cache_creation 每轮写入造成溢价。
+    let (
+        input_tokens_for_client,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+    ) = client_visible_usage(
+        &state.prompt_cache,
+        &cache_decision,
+        &payload.model,
+        client_input_tokens,
+        incremental_input_tokens,
+    );
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -622,9 +256,12 @@ pub async fn post_messages(
             input_tokens_for_client,
             thinking_enabled,
             tool_name_map,
-            cache_decision.cache_creation_input_tokens,
-            cache_decision.cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
             payload.max_tokens,
+            state.prompt_cache.clone(),
+            cache_decision,
+            actual_conversation_id,
         )
         .await
     } else {
@@ -637,9 +274,12 @@ pub async fn post_messages(
             input_tokens_for_client,
             extract_thinking,
             tool_name_map,
-            cache_decision.cache_creation_input_tokens,
-            cache_decision.cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
             payload.max_tokens,
+            state.prompt_cache.clone(),
+            cache_decision,
+            actual_conversation_id,
         )
         .await
     }
@@ -656,12 +296,21 @@ async fn handle_stream_request(
     cache_creation_input_tokens: i32,
     cache_read_input_tokens: i32,
     max_output_tokens: i32,
+    cache: PromptCache,
+    cache_decision: CacheDecision,
+    actual_conversation_id: String,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, record) = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    record_cache_outcome(
+        &cache,
+        &cache_decision,
+        &actual_conversation_id,
+        cache_read_input_tokens,
+    );
 
     // 创建流处理上下文
     let mut ctx =
@@ -822,6 +471,9 @@ async fn handle_non_stream_request(
     cache_creation_input_tokens: i32,
     cache_read_input_tokens: i32,
     max_output_tokens: i32,
+    cache: PromptCache,
+    cache_decision: CacheDecision,
+    actual_conversation_id: String,
 ) -> Response {
     let start_time = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
@@ -847,6 +499,12 @@ async fn handle_non_stream_request(
                 .into_response();
         }
     };
+    record_cache_outcome(
+        &cache,
+        &cache_decision,
+        &actual_conversation_id,
+        cache_read_input_tokens,
+    );
 
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
@@ -1126,137 +784,6 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
-/// 注入自定义系统提示词 & 剥离限制
-///
-/// 两个独立动作：
-/// 1. 若 `strip_system_restrictions` 为 true，先剥离客户端 system prompt 中的限制片段
-/// 2. 若总开关 `enabled`，调 `build_injection_text` 拼接 preset + custom，按 `position` 插入
-fn inject_system_prompt(payload: &mut MessagesRequest, shared: &SharedPromptConfig) {
-    // 取一次快照，立即释放读锁
-    let (injection, position, strip_restrictions) = {
-        let cfg = shared.read();
-        (
-            cfg.build_injection_text(),
-            cfg.position,
-            cfg.strip_system_restrictions,
-        )
-    };
-
-    // 1. 剥离限制
-    if strip_restrictions {
-        if let Some(ref mut system) = payload.system {
-            for msg in system.iter_mut() {
-                let stripped = super::prompt_filter::strip_restrictions(&msg.text);
-                if stripped.len() != msg.text.len() {
-                    tracing::info!(
-                        "剥离系统提示词限制: {} → {} bytes",
-                        msg.text.len(),
-                        stripped.len()
-                    );
-                    msg.text = stripped;
-                }
-            }
-        }
-    }
-
-    // 2. 注入
-    let Some(text) = injection else {
-        return;
-    };
-    let injected = SystemMessage {
-        text,
-        cache_control: None,
-    };
-
-    match &mut payload.system {
-        Some(existing) => match position {
-            SystemPromptPosition::Prepend => existing.insert(0, injected),
-            SystemPromptPosition::Append => existing.push(injected),
-        },
-        None => {
-            payload.system = Some(vec![injected]);
-        }
-    }
-}
-
-/// 模型名 / Thinking 配置规范化
-///
-/// 处理两类情况：
-///
-/// 1. **Opus 4.7 thinking 兼容性修正**（无论 model 名是否带 "thinking" 后缀）：
-///    Opus 4.7 在 Kiro/Bedrock 上**不支持** `thinking.type = "enabled"`，
-///    必须使用 `"adaptive"`（参考: AWS Bedrock Opus 4.7 文档）。
-///    如果客户端传了 `enabled`，自动降级为 `adaptive` 并补一个默认 `effort`。
-///
-/// 2. **`*-thinking` 后缀 → 强制启用 thinking**（原行为）：
-///    - Opus 4.6/4.7 → `adaptive`（带 `effort: high`）
-///    - 其他模型 → `enabled`，budget_tokens=20000
-fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
-    let model_lower = payload.model.to_lowercase();
-    let is_opus = model_lower.contains("opus");
-    let is_opus_4_7 = is_opus && (model_lower.contains("4-7") || model_lower.contains("4.7"));
-    let is_opus_4_6 = is_opus && (model_lower.contains("4-6") || model_lower.contains("4.6"));
-    let is_opus_4_6_or_newer = is_opus_4_6 || is_opus_4_7;
-    let has_thinking_suffix = model_lower.contains("thinking");
-
-    // Case 1: Opus 4.7 强制 adaptive — 不论是否带 thinking 后缀
-    if is_opus_4_7 {
-        if let Some(ref mut t) = payload.thinking {
-            if t.thinking_type == "enabled" {
-                tracing::info!(
-                    model = %payload.model,
-                    "Opus 4.7 不支持 thinking.type=\"enabled\"，自动降级为 \"adaptive\""
-                );
-                t.thinking_type = "adaptive".to_string();
-            }
-            // 4.7 上游默认 display=omitted，强制设 summarized 让 Kiro 吐 thinking 文本
-            if t.display.is_none() {
-                t.display = Some("summarized".to_string());
-            }
-            // adaptive 需要 output_config.effort，缺省补 "high"
-            if payload.output_config.is_none() {
-                payload.output_config = Some(OutputConfig {
-                    effort: "high".to_string(),
-                });
-            }
-        }
-    }
-
-    // Case 2: model 名带 "*-thinking" 后缀 → 强制开启 thinking
-    if !has_thinking_suffix {
-        return;
-    }
-
-    let thinking_type = if is_opus_4_6_or_newer {
-        "adaptive"
-    } else {
-        "enabled"
-    };
-
-    tracing::info!(
-        model = %payload.model,
-        thinking_type = thinking_type,
-        "模型名包含 thinking 后缀，覆写 thinking 配置"
-    );
-
-    payload.thinking = Some(Thinking {
-        thinking_type: thinking_type.to_string(),
-        budget_tokens: 20000,
-        // adaptive 模式（4.6/4.7）默认 summarized 让 Kiro 吐 thinking 文本
-        display: if thinking_type == "adaptive" {
-            Some("summarized".to_string())
-        } else {
-            None
-        },
-    });
-
-    if is_opus_4_6_or_newer {
-        payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
-        });
-    }
-}
-
 /// POST /v1/messages/count_tokens
 ///
 /// 计算消息的 token 数量
@@ -1298,6 +825,15 @@ pub async fn post_messages_cc(
         "Received POST /cc/v1/messages request"
     );
 
+    // /cc/v1 也使用客户端原始输入作为 usage 总预算；注入的系统提示词是中转层实现细节。
+    let client_input_tokens = saturating_to_i32(token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ));
+    let incremental_input_tokens = estimate_incremental_input_tokens(&payload, client_input_tokens);
+
     // 注入自定义系统提示词
     inject_system_prompt(&mut payload, &state.prompt_config);
 
@@ -1324,15 +860,42 @@ pub async fn post_messages_cc(
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
-        // 估算输入 tokens
+        // 估算上游全量 tokens 供 prompt cache 判定；客户端可见 usage 仍使用注入前预算。
         let input_tokens = saturating_to_i32(token::count_all_tokens(
             payload.model.clone(),
             payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
         ));
+        let cache_decision = lookup_prompt_cache(&state.prompt_cache, &payload, input_tokens);
+        let (
+            input_tokens_for_client,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        ) = client_visible_usage(
+            &state.prompt_cache,
+            &cache_decision,
+            &payload.model,
+            client_input_tokens,
+            incremental_input_tokens,
+        );
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let response = websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens_for_client,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        )
+        .await;
+        if response.status().is_success() {
+            record_cache_report_only(
+                &state.prompt_cache,
+                &cache_decision,
+                cache_read_input_tokens,
+            );
+        }
+        return response;
     }
 
     // 估算输入 tokens（全量；也用于 prompt cache 的 85% 上限与 TTL 分桶）
@@ -1369,11 +932,8 @@ pub async fn post_messages_cc(
             }
         };
 
-    record_cache_outcome(
-        &state.prompt_cache,
-        &cache_decision,
-        &conversion_result.conversation_state.conversation_id,
-    );
+    // cache entry 只能在上游成功接受请求后回写；否则 429/5xx 会污染真实缓存诊断。
+    let actual_conversation_id = conversion_result.conversation_state.conversation_id.clone();
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -1398,11 +958,17 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 客户端可见的 input_tokens 应该剔除 cache_read + cache_creation 两部分（Anthropic 协议三字段互斥）
-    let input_tokens_for_client = (input_tokens
-        - cache_decision.cache_read_input_tokens
-        - cache_decision.cache_creation_input_tokens)
-        .max(0);
+    let (
+        input_tokens_for_client,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+    ) = client_visible_usage(
+        &state.prompt_cache,
+        &cache_decision,
+        &payload.model,
+        client_input_tokens,
+        incremental_input_tokens,
+    );
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -1422,9 +988,12 @@ pub async fn post_messages_cc(
             input_tokens_for_client,
             thinking_enabled,
             tool_name_map,
-            cache_decision.cache_creation_input_tokens,
-            cache_decision.cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
             payload.max_tokens,
+            state.prompt_cache.clone(),
+            cache_decision,
+            actual_conversation_id,
         )
         .await
     } else {
@@ -1437,9 +1006,12 @@ pub async fn post_messages_cc(
             input_tokens_for_client,
             extract_thinking,
             tool_name_map,
-            cache_decision.cache_creation_input_tokens,
-            cache_decision.cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
             payload.max_tokens,
+            state.prompt_cache.clone(),
+            cache_decision,
+            actual_conversation_id,
         )
         .await
     }
@@ -1459,12 +1031,21 @@ async fn handle_stream_request_buffered(
     cache_creation_input_tokens: i32,
     cache_read_input_tokens: i32,
     max_output_tokens: i32,
+    cache: PromptCache,
+    cache_decision: CacheDecision,
+    actual_conversation_id: String,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, record) = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    record_cache_outcome(
+        &cache,
+        &cache_decision,
+        &actual_conversation_id,
+        cache_read_input_tokens,
+    );
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(
@@ -1597,218 +1178,4 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn upstream_models_map_to_anthropic_format() {
-        use crate::kiro::provider::UpstreamModel;
-        let mk = |id: &str, name: &str, max_out: Option<i32>| UpstreamModel {
-            model_id: id.to_string(),
-            model_name: name.to_string(),
-            max_output_tokens: max_out,
-        };
-        let upstream = vec![
-            mk("auto", "Auto", Some(64000)),
-            mk("claude-opus-4.7", "Claude Opus 4.7", Some(128000)),
-            mk("deepseek-3.2", "Deepseek v3.2", Some(64000)),
-        ];
-        let models = models_from_upstream(&upstream);
-        // auto 被剔除；claude 有 thinking 变体；deepseek 无 thinking
-        assert!(!models.iter().any(|m| m.id == "auto"));
-        let opus = models.iter().find(|m| m.id == "claude-opus-4.7").unwrap();
-        assert_eq!(opus.max_tokens, 128000, "用上游 maxOutputTokens 真值");
-        assert_eq!(opus.owned_by, "anthropic");
-        assert!(
-            models.iter().any(|m| m.id == "claude-opus-4.7-thinking"),
-            "claude 应有 thinking 变体"
-        );
-        let ds = models.iter().find(|m| m.id == "deepseek-3.2").unwrap();
-        assert_eq!(ds.owned_by, "kiro");
-        assert!(
-            !models.iter().any(|m| m.id == "deepseek-3.2-thinking"),
-            "非 claude 不应有 thinking 变体"
-        );
-    }
-
-    #[test]
-    fn upstream_empty_falls_back_to_static() {
-        let models = models_from_upstream(&[]);
-        assert_eq!(models.len(), static_models().len());
-    }
-
-    /// 构造最小可用的 MessagesRequest，便于 thinking 覆写逻辑测试
-    fn make_req(model: &str, thinking: Option<Thinking>) -> MessagesRequest {
-        // 借 serde_json 绕过 MessagesRequest 字段非 Default 的限制
-        let mut payload: MessagesRequest = serde_json::from_value(serde_json::json!({
-            "model": model,
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "hi"}],
-        }))
-        .expect("构造 MessagesRequest 应成功");
-        payload.thinking = thinking;
-        payload
-    }
-
-    fn thinking(thinking_type: &str, display: Option<&str>) -> Thinking {
-        Thinking {
-            thinking_type: thinking_type.to_string(),
-            budget_tokens: 5000,
-            display: display.map(String::from),
-        }
-    }
-
-    // === Case 1: Opus 4.7 强制 adaptive ===
-
-    #[test]
-    fn opus_4_7_enabled_downgrades_to_adaptive() {
-        let mut req = make_req("claude-opus-4-7", Some(thinking("enabled", None)));
-        override_thinking_from_model_name(&mut req);
-
-        let t = req.thinking.as_ref().expect("应保留 thinking");
-        assert_eq!(t.thinking_type, "adaptive", "enabled 应被降级");
-        assert_eq!(t.display.as_deref(), Some("summarized"), "应补 display");
-        let oc = req.output_config.as_ref().expect("应补 output_config");
-        assert_eq!(oc.effort, "high");
-    }
-
-    #[test]
-    fn opus_4_7_dot_form_also_downgrades() {
-        // claude-opus-4.7（点形式）也应触发
-        let mut req = make_req("claude-opus-4.7", Some(thinking("enabled", None)));
-        override_thinking_from_model_name(&mut req);
-        assert_eq!(req.thinking.as_ref().unwrap().thinking_type, "adaptive");
-    }
-
-    #[test]
-    fn opus_4_7_adaptive_keeps_existing_display() {
-        let mut req = make_req(
-            "claude-opus-4-7",
-            Some(thinking("adaptive", Some("omitted"))),
-        );
-        override_thinking_from_model_name(&mut req);
-
-        let t = req.thinking.as_ref().unwrap();
-        assert_eq!(t.thinking_type, "adaptive");
-        assert_eq!(
-            t.display.as_deref(),
-            Some("omitted"),
-            "已有 display 不应被覆盖"
-        );
-    }
-
-    #[test]
-    fn opus_4_7_without_thinking_field_is_noop() {
-        let mut req = make_req("claude-opus-4-7", None);
-        override_thinking_from_model_name(&mut req);
-        assert!(req.thinking.is_none(), "无 thinking 字段应保持无");
-        assert!(req.output_config.is_none(), "也不应主动注入 output_config");
-    }
-
-    // === Case 2: 模型名带 -thinking 后缀 ===
-
-    #[test]
-    fn opus_4_7_thinking_suffix_sets_adaptive() {
-        let mut req = make_req("claude-opus-4-7-thinking", None);
-        override_thinking_from_model_name(&mut req);
-
-        let t = req.thinking.as_ref().expect("后缀应注入 thinking");
-        assert_eq!(t.thinking_type, "adaptive");
-        assert_eq!(t.display.as_deref(), Some("summarized"));
-        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
-    }
-
-    #[test]
-    fn opus_4_6_thinking_suffix_sets_adaptive() {
-        let mut req = make_req("claude-opus-4-6-thinking", None);
-        override_thinking_from_model_name(&mut req);
-
-        let t = req.thinking.as_ref().unwrap();
-        assert_eq!(t.thinking_type, "adaptive", "4.6 也走 adaptive");
-        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
-    }
-
-    #[test]
-    fn sonnet_thinking_suffix_sets_enabled() {
-        let mut req = make_req("claude-sonnet-4-5-thinking", None);
-        override_thinking_from_model_name(&mut req);
-
-        let t = req.thinking.as_ref().unwrap();
-        assert_eq!(t.thinking_type, "enabled", "非 opus 4.6+ 应保留 enabled");
-        assert_eq!(t.budget_tokens, 20000);
-        assert!(req.output_config.is_none(), "enabled 不需要 output_config");
-    }
-
-    // === Anti-regression: 普通模型不应被改写 ===
-
-    #[test]
-    fn plain_model_without_suffix_is_noop() {
-        let mut req = make_req("claude-sonnet-4-5", Some(thinking("enabled", None)));
-        override_thinking_from_model_name(&mut req);
-
-        let t = req.thinking.as_ref().unwrap();
-        assert_eq!(t.thinking_type, "enabled", "普通模型 enabled 不应被改");
-        assert_eq!(t.display, None);
-    }
-
-    // === Thinking.display 反序列化校验 ===
-
-    #[test]
-    fn display_accepts_valid_values() {
-        for v in ["summarized", "omitted"] {
-            let t: Thinking = serde_json::from_value(serde_json::json!({
-                "type": "adaptive",
-                "display": v,
-            }))
-            .expect("有效值应解析成功");
-            assert_eq!(t.display.as_deref(), Some(v));
-        }
-    }
-
-    #[test]
-    fn display_rejects_invalid_value_silently() {
-        let t: Thinking = serde_json::from_value(serde_json::json!({
-            "type": "adaptive",
-            "display": "raw",
-        }))
-        .expect("无效值不应导致解析失败");
-        assert_eq!(t.display, None, "脏值应被降级为 None");
-    }
-
-    #[test]
-    fn effective_display_fallback() {
-        let t = thinking("adaptive", None);
-        assert_eq!(t.effective_display(), "summarized");
-        let t = thinking("adaptive", Some("omitted"));
-        assert_eq!(t.effective_display(), "omitted");
-    }
-
-    // === Bug 3: saturating_to_i32 防 u64 → i32 wrap ===
-
-    #[test]
-    fn saturating_to_i32_normal() {
-        assert_eq!(saturating_to_i32(0), 0);
-        assert_eq!(saturating_to_i32(100), 100);
-        assert_eq!(saturating_to_i32(1_000_000), 1_000_000);
-    }
-
-    #[test]
-    fn saturating_to_i32_max_boundary() {
-        assert_eq!(saturating_to_i32(i32::MAX as u64), i32::MAX);
-        // 边界 +1 应饱和
-        assert_eq!(saturating_to_i32(i32::MAX as u64 + 1), i32::MAX);
-    }
-
-    #[test]
-    fn saturating_to_i32_overflow_saturates() {
-        // 之前的 `as i32` 会把 u64::MAX wrap 成 -1（i32 视图）
-        // saturating 版本应饱和到 i32::MAX，永不为负
-        assert_eq!(saturating_to_i32(u64::MAX), i32::MAX);
-        assert!(saturating_to_i32(u64::MAX) >= 0, "结果不应为负");
-        // 模拟大请求场景
-        assert_eq!(saturating_to_i32(5_000_000_000), i32::MAX);
-    }
 }

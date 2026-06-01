@@ -19,10 +19,10 @@ use super::error::AdminServiceError;
 use super::metrics::{AdminMetricsResponse, PromptCacheStats, compute_admin_metrics};
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CreateUserPresetRequest,
-    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
-    PresetCatalogResponse, PresetContentResponse, PresetMetaResponse, PromptCacheConfigPayload,
-    RetryConfigPayload, SetLoadBalancingModeRequest, SystemPromptConfigResponse,
-    UpdateSystemPromptRequest, UpdateUserPresetRequest,
+    CredentialGroupStatusItem, CredentialStatusItem, CredentialsStatusResponse,
+    LoadBalancingModeResponse, PresetCatalogResponse, PresetContentResponse, PresetMetaResponse,
+    PromptCacheConfigPayload, RetryConfigPayload, SetLoadBalancingModeRequest,
+    SystemPromptConfigResponse, UpdateSystemPromptRequest, UpdateUserPresetRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -102,6 +102,8 @@ impl AdminService {
             hit_rate_1m: Some(snap.last1m.hit_rate()),
             hit_rate_5m: Some(snap.last5m.hit_rate()),
             saved_input_tokens_5m: Some(snap.last5m.saved_input_tokens),
+            reported_hit_rate_1m: Some(snap.last1m.reported_hit_rate()),
+            reported_saved_input_tokens_5m: Some(snap.last5m.reported_saved_input_tokens),
         }
     }
 
@@ -177,6 +179,9 @@ impl AdminService {
             hit_rate_1m: snap.last1m.hit_rate(),
             hit_rate_5m: snap.last5m.hit_rate(),
             saved_input_tokens_5m: snap.last5m.saved_input_tokens,
+            reported_hit_rate_1m: snap.last1m.reported_hit_rate(),
+            reported_saved_input_tokens_5m: snap.last5m.reported_saved_input_tokens,
+            perceived_cache_hit_ratio: self.prompt_cache.perceived_ratio(),
         });
         resp
     }
@@ -317,6 +322,8 @@ impl AdminService {
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
+                group: entry.group,
+                proxy_source: entry.proxy_source,
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
@@ -330,10 +337,30 @@ impl AdminService {
         // 按优先级排序（数字越小优先级越高）
         credentials.sort_by_key(|c| c.priority);
 
+        let credential_groups = self
+            .token_manager
+            .config()
+            .credential_groups
+            .iter()
+            .map(|group| {
+                let proxy_url = group
+                    .proxy_url
+                    .as_ref()
+                    .filter(|url| !url.eq_ignore_ascii_case("direct"))
+                    .cloned();
+                CredentialGroupStatusItem {
+                    id: group.id.clone(),
+                    has_proxy: proxy_url.is_some(),
+                    proxy_url,
+                }
+            })
+            .collect();
+
         CredentialsStatusResponse {
             total: snapshot.total,
             available: snapshot.available,
             current_id: snapshot.current_id,
+            credential_groups,
             credentials,
         }
     }
@@ -359,6 +386,16 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据分组
+    pub fn set_group(&self, id: u64, group: Option<String>) -> Result<(), AdminServiceError> {
+        if let Some(ref group) = group {
+            self.validate_credential_group(group)?;
+        }
+        self.token_manager
+            .set_group(id, group)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -447,6 +484,9 @@ impl AdminService {
                 )));
             }
         }
+        if let Some(ref group) = req.group {
+            self.validate_credential_group(group)?;
+        }
 
         // 构建凭据对象
         let email = req.email.clone();
@@ -469,6 +509,7 @@ impl AdminService {
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
+            group: req.group,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
@@ -863,6 +904,29 @@ impl AdminService {
             }
             Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
         }
+    }
+
+    fn validate_credential_group(&self, group: &str) -> Result<(), AdminServiceError> {
+        let group = group.trim();
+        if group.is_empty() {
+            return Ok(());
+        }
+        if self.token_manager.config().credential_group(group).is_some() {
+            return Ok(());
+        }
+
+        let mut known: Vec<&str> = self
+            .token_manager
+            .config()
+            .credential_groups
+            .iter()
+            .map(|g| g.id.as_str())
+            .collect();
+        known.sort();
+        Err(AdminServiceError::InvalidCredential(format!(
+            "未知凭据分组 \"{}\"，已配置分组: {:?}",
+            group, known
+        )))
     }
 
     // ============ 错误分类 ============
