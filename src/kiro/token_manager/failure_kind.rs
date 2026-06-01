@@ -4,10 +4,10 @@
 //! provider 把上游 HTTP 响应分类成 [`TransientFailureKind`] 后上报，token_manager 据此
 //! 选择 cooldown 时长。[`extract_suspicious_directory_key`] 供 directory 级风控分组使用。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// 上游瞬态错误分类（用于 cooldown 时长选择 + 观测）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransientFailureKind {
     /// HTTP 429 Too Many Requests（限流）

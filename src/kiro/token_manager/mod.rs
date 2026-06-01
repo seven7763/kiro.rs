@@ -124,6 +124,13 @@ struct StatsEntry {
     /// 最近一次瞬态错误时间（v2 新增，旧文件 default = None）
     #[serde(default)]
     last_transient_failure_at: Option<String>,
+    /// cooldown 到期墙钟时间 RFC3339（v3 新增）。`Instant` 跨进程无意义，故落盘绝对
+    /// 时间；启动时只恢复仍在未来的 cooldown，过期的丢弃。旧文件 default = None。
+    #[serde(default)]
+    cooldown_until_rfc3339: Option<String>,
+    /// cooldown 原因（v3 新增，与 `cooldown_until_rfc3339` 配对恢复）。旧文件 default = None。
+    #[serde(default)]
+    cooldown_reason: Option<TransientFailureKind>,
 }
 
 // ============================================================================
@@ -1546,6 +1553,108 @@ mod tests {
             "缺失新字段应 serde default = 0"
         );
         assert!(e.last_transient_failure_at.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 回归（审计 P1）：cooldown 跨重启持久化。
+    /// 设置 cooldown → save_stats 落盘 → 新 manager 从同一目录 load → cooldown 应被恢复
+    /// （仅未过期的）。
+    #[test]
+    fn test_cooldown_persists_across_restart() {
+        use std::fs;
+        let dir =
+            std::env::temp_dir().join(format!("kiro-cooldown-persist-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let creds_path = dir.join("credentials.json");
+
+        // 第一个 manager：给凭据 #1 设一个较长的 cooldown(rate_limit, retry_after=300s)
+        {
+            let config = Config::default();
+            let mut cred = KiroCredentials::default();
+            cred.id = Some(1);
+            let manager =
+                MultiTokenManager::new(config, vec![cred], None, Some(creds_path.clone()), true)
+                    .unwrap();
+            manager.report_transient_failure(
+                1,
+                TransientFailureKind::RateLimit,
+                Some(StdDuration::from_secs(300)),
+                false,
+            );
+            // 确认进了 cooldown
+            let snap = manager.snapshot();
+            let e = snap.entries.iter().find(|x| x.id == 1).unwrap();
+            assert!(
+                e.cooldown_remaining_seconds > 0,
+                "第一个 manager 应处于 cooldown"
+            );
+            // 显式落盘(report 走 debounce,首次会立即 flush;这里再保险 save 一次)
+            manager.save_stats();
+        }
+
+        // 第二个 manager：同目录加载,cooldown 应被恢复(仍未过期)
+        {
+            let config = Config::default();
+            let mut cred = KiroCredentials::default();
+            cred.id = Some(1);
+            let manager =
+                MultiTokenManager::new(config, vec![cred], None, Some(creds_path), true).unwrap();
+            let snap = manager.snapshot();
+            let e = snap.entries.iter().find(|x| x.id == 1).unwrap();
+            assert!(
+                e.cooldown_remaining_seconds > 0,
+                "重启后未过期的 cooldown 应被恢复,实际 remaining={}",
+                e.cooldown_remaining_seconds
+            );
+            assert!(
+                e.cooldown_remaining_seconds <= 300,
+                "恢复的 cooldown 不应超过原时长"
+            );
+            assert_eq!(
+                e.cooldown_reason.as_deref(),
+                Some("rate_limit"),
+                "cooldown 原因也应被恢复"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 已过期的 cooldown 落盘后重启不应被恢复（只恢复未来的）。
+    #[test]
+    fn test_expired_cooldown_not_restored() {
+        use std::fs;
+        let dir =
+            std::env::temp_dir().join(format!("kiro-cooldown-expired-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let creds_path = dir.join("credentials.json");
+        // 手写一条已过期的 cooldown stats
+        let stats_path = dir.join("kiro_stats.json");
+        let past = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        fs::write(
+            &stats_path,
+            format!(
+                r#"{{"1":{{"success_count":1,"last_used_at":null,"cooldown_until_rfc3339":"{past}","cooldown_reason":"rate_limit"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        let manager =
+            MultiTokenManager::new(config, vec![cred], None, Some(creds_path), true).unwrap();
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|x| x.id == 1).unwrap();
+        assert_eq!(
+            e.cooldown_remaining_seconds, 0,
+            "已过期的 cooldown 不应被恢复"
+        );
+        assert!(
+            e.cooldown_reason.is_none(),
+            "过期 cooldown 的原因也不应恢复"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

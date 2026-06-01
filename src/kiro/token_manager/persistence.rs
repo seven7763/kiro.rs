@@ -88,17 +88,38 @@ impl MultiTokenManager {
         };
 
         let mut entries = self.entries.lock();
+        let now_instant = Instant::now();
+        let now_wall = chrono::Utc::now();
+        let mut restored_cooldowns = 0usize;
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
                 entry.last_used_at = s.last_used_at.clone();
                 entry.transient_failure_count = s.transient_failure_count;
                 entry.last_transient_failure_at = s.last_transient_failure_at.clone();
+                // 恢复 cooldown：仅当落盘的到期墙钟仍在未来。把"墙钟剩余"换算回 Instant：
+                // cooldown_until = now_instant + (到期墙钟 - now_wall)。过期/解析失败则忽略。
+                if let Some(rfc) = s.cooldown_until_rfc3339.as_deref() {
+                    if let Ok(until_wall) = chrono::DateTime::parse_from_rfc3339(rfc) {
+                        let until_utc = until_wall.with_timezone(&chrono::Utc);
+                        if until_utc > now_wall {
+                            if let Ok(remaining) = (until_utc - now_wall).to_std() {
+                                entry.cooldown_until = Some(now_instant + remaining);
+                                entry.cooldown_reason = s.cooldown_reason;
+                                restored_cooldowns += 1;
+                            }
+                        }
+                    }
+                }
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
         self.stats_dirty.store(false, Ordering::Relaxed);
-        tracing::info!("已从缓存加载 {} 条统计数据", stats.len());
+        tracing::info!(
+            "已从缓存加载 {} 条统计数据（恢复 {} 个未过期 cooldown）",
+            stats.len(),
+            restored_cooldowns
+        );
     }
 
     /// 将当前统计数据持久化到磁盘
@@ -109,10 +130,25 @@ impl MultiTokenManager {
         };
 
         let stats: HashMap<String, StatsEntry> = {
+            let now_instant = Instant::now();
+            let now_wall = chrono::Utc::now();
             let entries = self.entries.lock();
             entries
                 .iter()
                 .map(|e| {
+                    // cooldown_until 是 Instant（进程内），落盘前换算成墙钟绝对时间：
+                    // 剩余时长 = cooldown_until - now_instant，到期墙钟 = now_wall + 剩余。
+                    // 已过期（<= now）的不落盘。
+                    let cooldown_until_rfc3339 = e.cooldown_until.and_then(|until| {
+                        let remaining = until.saturating_duration_since(now_instant);
+                        if remaining.is_zero() {
+                            None
+                        } else {
+                            chrono::Duration::from_std(remaining)
+                                .ok()
+                                .map(|d| (now_wall + d).to_rfc3339())
+                        }
+                    });
                     (
                         e.id.to_string(),
                         StatsEntry {
@@ -120,6 +156,8 @@ impl MultiTokenManager {
                             last_used_at: e.last_used_at.clone(),
                             transient_failure_count: e.transient_failure_count,
                             last_transient_failure_at: e.last_transient_failure_at.clone(),
+                            cooldown_reason: cooldown_until_rfc3339.as_ref().and(e.cooldown_reason),
+                            cooldown_until_rfc3339,
                         },
                     )
                 })
