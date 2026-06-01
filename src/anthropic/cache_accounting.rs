@@ -16,6 +16,17 @@ use super::prompt_cache::{CacheProfile, PromptCache, build_profile_from_request}
 use super::token_count::{self as token, saturating_to_i32};
 use super::types::MessagesRequest;
 
+/// 构造 Anthropic usage 中的 `cache_creation` 明细对象。
+///
+/// 5m/1h 分桶：本地只模拟 5m（ephemeral）写入，1h 恒 0。多处 message_start /
+/// message_delta / 非流式响应共用此结构，集中一处避免字段漂移。
+pub(crate) fn cache_creation_breakdown(cache_creation_input_tokens: i32) -> Value {
+    serde_json::json!({
+        "ephemeral_5m_input_tokens": cache_creation_input_tokens.max(0),
+        "ephemeral_1h_input_tokens": 0
+    })
+}
+
 /// 中转层 Prompt cache 决定结果
 ///
 /// 决定本次请求要使用哪个 conversation_id，以及向客户端上报的 cache_*_input_tokens。

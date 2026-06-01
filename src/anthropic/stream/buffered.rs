@@ -104,10 +104,10 @@ impl BufferedStreamContext {
                             serde_json::json!(self.cache_creation_input_tokens);
                         usage["cache_read_input_tokens"] =
                             serde_json::json!(self.cache_read_input_tokens);
-                        usage["cache_creation"] = serde_json::json!({
-                            "ephemeral_5m_input_tokens": self.cache_creation_input_tokens.max(0),
-                            "ephemeral_1h_input_tokens": 0
-                        });
+                        usage["cache_creation"] =
+                            crate::anthropic::cache_accounting::cache_creation_breakdown(
+                                self.cache_creation_input_tokens,
+                            );
                     }
                 }
             }

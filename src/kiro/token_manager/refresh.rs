@@ -27,10 +27,7 @@ pub(crate) fn is_token_expiring_soon(credentials: &KiroCredentials) -> bool {
 }
 
 pub(crate) fn sha256_hex(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let result = hasher.finalize();
-    format!("{:x}", result)
+    crate::common::hash::sha256_hex(input)
 }
 
 /// 生成 API Key 脱敏展示(前 4 + ... + 后 4,长度不足或非 ASCII 回退 ***)

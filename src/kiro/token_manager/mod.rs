@@ -7,7 +7,6 @@ use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 

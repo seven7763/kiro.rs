@@ -283,10 +283,7 @@ impl SseStateManager {
                             "output_tokens": output_tokens,
                             "cache_read_input_tokens": cache_read_input_tokens,
                             "cache_creation_input_tokens": cache_creation_input_tokens,
-                            "cache_creation": {
-                                "ephemeral_5m_input_tokens": cache_creation_input_tokens.max(0),
-                                "ephemeral_1h_input_tokens": 0
-                            },
+                            "cache_creation": crate::anthropic::cache_accounting::cache_creation_breakdown(cache_creation_input_tokens),
                             "type": "message"
                         }]
                     },

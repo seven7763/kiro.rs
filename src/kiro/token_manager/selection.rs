@@ -3,82 +3,9 @@
 use super::*;
 
 impl MultiTokenManager {
-    /// 根据负载均衡模式选择下一个凭据
-    ///
-    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
-    ///
-    /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    #[allow(dead_code)] // 历史选号入口，保留供后续 strategy 切换或测试覆盖
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
-        let entries = self.entries.lock();
-
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
-
-        let now = Instant::now();
-
-        // 过滤未禁用 + 模型适配的凭据（不含 cooldown 过滤）
-        let candidates: Vec<&CredentialEntry> = entries
-            .iter()
-            .filter(|e| {
-                if e.disabled {
-                    return false;
-                }
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                true
-            })
-            .collect();
-
-        if candidates.is_empty() {
-            return None;
-        }
-
-        // 第一遍：跳过冷却中的凭据；第二遍 fallback：所有候选都在冷却时
-        // 选 cooldown 最早过期的（"最快恢复"），保证不返回 None 让上层 503
-        let live: Vec<&CredentialEntry> = candidates
-            .iter()
-            .copied()
-            .filter(|e| !is_in_cooldown(e, now))
-            .collect();
-
-        let pool: &[&CredentialEntry] = if !live.is_empty() { &live } else { &candidates };
-
-        let mode = self.load_balancing_mode.lock().clone();
-        let mode = mode.as_str();
-
-        match mode {
-            "balanced" => {
-                // In-Flight 优先 + Least-Used 次之：先选当前并发最少的凭据，
-                // 这样 N 个并发请求会被分散到 N 个不同的号上。
-                // 平局（同 inflight）时按累计成功数最少（历史均衡），再按 priority。
-                // 末尾追加随机数，防止全平局时永远选 Vec 的第一项（导致流量倾斜）。
-                let entry = pool.iter().min_by_key(|e| {
-                    (
-                        e.inflight,
-                        e.success_count,
-                        e.credentials.priority,
-                        fastrand::u32(..),
-                    )
-                })?;
-                Some((entry.id, entry.credentials.clone()))
-            }
-            _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let entry = pool.iter().min_by_key(|e| e.credentials.priority)?;
-                Some((entry.id, entry.credentials.clone()))
-            }
-        }
-    }
-
     /// 选择一个可用凭据并原子地占用 inflight 槽位
     ///
-    /// 与 `select_next_credential` 的区别：在持有 entries 锁的同时把 `inflight += 1`，
+    /// 在持有 entries 锁的同时把 `inflight += 1`，
     /// 这样并发调用会立刻看到该号 inflight 升高，下一个调用自然分发到其他号。
     ///
     /// 调用方拿到 `(id, credentials)` 后，**必须**通过 `release_inflight(id)`（或

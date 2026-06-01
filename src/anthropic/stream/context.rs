@@ -185,7 +185,6 @@ impl StreamContext {
     pub fn create_message_start_event(&self) -> serde_json::Value {
         // 字段对齐官方 API（jp.pincc.ai 实测）：含 stop_details、usage.cache_creation 嵌套、
         // inference_geo，否则结构完整性校验会因字段缺失扣分。
-        let ephemeral_5m = self.cache_creation_input_tokens.max(0);
         json!({
             "type": "message_start",
             "message": {
@@ -201,10 +200,9 @@ impl StreamContext {
                     "input_tokens": self.input_tokens,
                     "cache_creation_input_tokens": self.cache_creation_input_tokens,
                     "cache_read_input_tokens": self.cache_read_input_tokens,
-                    "cache_creation": {
-                        "ephemeral_5m_input_tokens": ephemeral_5m,
-                        "ephemeral_1h_input_tokens": 0
-                    },
+                    "cache_creation": crate::anthropic::cache_accounting::cache_creation_breakdown(
+                        self.cache_creation_input_tokens,
+                    ),
                     "output_tokens": 1,
                     "service_tier": "standard",
                     "inference_geo": "not_available"

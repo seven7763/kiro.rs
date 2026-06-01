@@ -739,19 +739,13 @@ async fn handle_non_stream_request(
             "input_tokens": final_input_tokens,
             "cache_creation_input_tokens": cache_creation_input_tokens,
             "cache_read_input_tokens": cache_read_input_tokens,
-            "cache_creation": {
-                "ephemeral_5m_input_tokens": cache_creation_input_tokens.max(0),
-                "ephemeral_1h_input_tokens": 0
-            },
+            "cache_creation": super::cache_accounting::cache_creation_breakdown(cache_creation_input_tokens),
             "iterations": [{
                 "input_tokens": final_input_tokens,
                 "output_tokens": output_tokens,
                 "cache_read_input_tokens": cache_read_input_tokens,
                 "cache_creation_input_tokens": cache_creation_input_tokens,
-                "cache_creation": {
-                    "ephemeral_5m_input_tokens": cache_creation_input_tokens.max(0),
-                    "ephemeral_1h_input_tokens": 0
-                },
+                "cache_creation": super::cache_accounting::cache_creation_breakdown(cache_creation_input_tokens),
                 "type": "message"
             }],
             "output_tokens": output_tokens,

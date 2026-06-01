@@ -448,15 +448,13 @@ impl PromptCache {
         // compute 返回值保持真实模拟口径：perceived 只能抬高“已有真实命中”的 read 比例，
         // 不能把无匹配的大请求从 MISS 变成 HIT。handler 会在最终客户端 usage 层做 fake billing。
         let perceived_for_usage = if matched_tokens > 0 { perceived } else { None };
-        let usage = finalize_usage(
+        finalize_usage(
             profile,
             last_tokens,
             matched_tokens,
             full_prefix,
             perceived_for_usage,
-        );
-
-        usage
+        )
     }
 
     /// 上游成功后记录本次缓存统计。

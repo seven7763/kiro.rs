@@ -252,10 +252,8 @@ fn generate_websearch_events(
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
-    let cache_creation = json!({
-        "ephemeral_5m_input_tokens": cache_creation_input_tokens.max(0),
-        "ephemeral_1h_input_tokens": 0
-    });
+    let cache_creation =
+        super::cache_accounting::cache_creation_breakdown(cache_creation_input_tokens);
 
     // 1. message_start
     events.push(SseEvent::new(

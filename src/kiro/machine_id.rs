@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::common::hash::sha256_hex;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
@@ -106,14 +106,6 @@ fn fallback_machine_id(credentials: &KiroCredentials) -> String {
     );
     map.insert(credentials.id, derived.clone());
     derived
-}
-
-/// SHA256 哈希实现（返回十六进制字符串）
-fn sha256_hex(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let result = hasher.finalize();
-    hex::encode(result)
 }
 
 #[cfg(test)]
