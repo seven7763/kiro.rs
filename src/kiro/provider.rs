@@ -1019,6 +1019,64 @@ impl KiroProvider {
     }
 }
 
+/// 上游 Provider 抽象：anthropic 层通过此 trait 调用上游,不再硬依赖具体的
+/// [`KiroProvider`],便于测试 mock 与未来替换上游实现。
+///
+/// 方法为 `dyn`-兼容的装箱 future 形式（避免引入 async-trait 依赖）；
+/// 实现转发到 [`KiroProvider`] 的同名 inherent 方法。
+pub trait UpstreamProvider: Send + Sync {
+    /// 非流式 API 调用（见 [`KiroProvider::call_api`]）
+    fn call_api<'a>(
+        &'a self,
+        request_body: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<(reqwest::Response, RecordHandle)>>;
+
+    /// 流式 API 调用（见 [`KiroProvider::call_api_stream`]）
+    fn call_api_stream<'a>(
+        &'a self,
+        request_body: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<(reqwest::Response, RecordHandle)>>;
+
+    /// MCP 工具调用（见 [`KiroProvider::call_mcp`]）
+    fn call_mcp<'a>(
+        &'a self,
+        request_body: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<reqwest::Response>>;
+
+    /// 拉取上游可用模型列表（见 [`KiroProvider::list_upstream_models`]）
+    fn list_upstream_models<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<Vec<UpstreamModel>>>;
+}
+
+/// `dyn`-兼容的装箱 future 别名（trait 方法返回类型）。
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+impl UpstreamProvider for KiroProvider {
+    fn call_api<'a>(
+        &'a self,
+        request_body: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<(reqwest::Response, RecordHandle)>> {
+        Box::pin(KiroProvider::call_api(self, request_body))
+    }
+
+    fn call_api_stream<'a>(
+        &'a self,
+        request_body: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<(reqwest::Response, RecordHandle)>> {
+        Box::pin(KiroProvider::call_api_stream(self, request_body))
+    }
+
+    fn call_mcp<'a>(
+        &'a self,
+        request_body: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<reqwest::Response>> {
+        Box::pin(KiroProvider::call_mcp(self, request_body))
+    }
+
+    fn list_upstream_models<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<Vec<UpstreamModel>>> {
+        Box::pin(KiroProvider::list_upstream_models(self))
+    }
+}
+
 /// retry 触发原因，决定是否需要 backoff
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetryReason {

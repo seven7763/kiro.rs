@@ -279,7 +279,7 @@ pub async fn post_messages(
 
 /// 处理流式请求
 async fn handle_stream_request(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: std::sync::Arc<dyn crate::kiro::provider::UpstreamProvider>,
     request_body: &str,
     model: &str,
     input_tokens: i32,
@@ -454,7 +454,7 @@ use super::converter::get_context_window_size;
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: std::sync::Arc<dyn crate::kiro::provider::UpstreamProvider>,
     request_body: &str,
     model: &str,
     input_tokens: i32,
@@ -1002,7 +1002,7 @@ pub async fn post_messages_cc(
 /// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
 /// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
 async fn handle_stream_request_buffered(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: std::sync::Arc<dyn crate::kiro::provider::UpstreamProvider>,
     request_body: &str,
     model: &str,
     estimated_input_tokens: i32,

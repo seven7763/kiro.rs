@@ -11,7 +11,7 @@ use axum::{
 };
 
 use crate::common::auth;
-use crate::kiro::provider::KiroProvider;
+use crate::kiro::provider::{KiroProvider, UpstreamProvider};
 use crate::model::runtime::SharedPromptConfig;
 
 use super::prompt_cache::PromptCache;
@@ -22,9 +22,10 @@ use super::types::ErrorResponse;
 pub struct AppState {
     /// API 密钥
     pub api_key: String,
-    /// Kiro Provider（可选，用于实际 API 调用）
-    /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
-    pub kiro_provider: Option<Arc<KiroProvider>>,
+    /// 上游 Provider（可选，用于实际 API 调用）。
+    /// 通过 [`UpstreamProvider`] trait 解耦——不再硬依赖具体的 `KiroProvider`，
+    /// 便于测试 mock 与替换上游实现。
+    pub kiro_provider: Option<Arc<dyn UpstreamProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
     /// 共享 Prompt 注入配置（可由 Admin API 热更新）
@@ -49,7 +50,7 @@ impl AppState {
         }
     }
 
-    /// 设置 KiroProvider
+    /// 设置上游 Provider（接受具体 [`KiroProvider`]，内部装箱为 trait 对象）
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
         self

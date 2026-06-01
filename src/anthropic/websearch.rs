@@ -491,7 +491,7 @@ fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> S
 
 /// 处理 WebSearch 请求
 pub async fn handle_websearch_request(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: std::sync::Arc<dyn crate::kiro::provider::UpstreamProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
     cache_creation_input_tokens: i32,
@@ -518,7 +518,7 @@ pub async fn handle_websearch_request(
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
-    let search_results = match call_mcp_api(&provider, &mcp_request).await {
+    let search_results = match call_mcp_api(provider.as_ref(), &mcp_request).await {
         Ok(response) => parse_search_results(&response),
         Err(e) => {
             tracing::warn!("MCP API 调用失败: {}", e);
@@ -549,7 +549,7 @@ pub async fn handle_websearch_request(
 
 /// 调用 Kiro MCP API
 async fn call_mcp_api(
-    provider: &crate::kiro::provider::KiroProvider,
+    provider: &dyn crate::kiro::provider::UpstreamProvider,
     request: &McpRequest,
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
