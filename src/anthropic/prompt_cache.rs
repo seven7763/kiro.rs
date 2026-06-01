@@ -656,6 +656,18 @@ pub fn build_profile_from_request(
     let mut cumulative_tokens = 0i32;
     let mut stable_fingerprint = String::new();
 
+    // 请求前导（prelude）：先把改变上游 prefix-cache 身份的请求级字段混入指纹，
+    // 再叠加内容块。否则同一段 system+history 在不同 model / tool_choice 下会共用
+    // 同一指纹，导致跨模型误命中（cache_read 虚高）并可能复用错误的 conversation_id。
+    // 不计入断点（无 cumulative_tokens / ttl），只影响后续所有断点的指纹值。
+    let tool_choice_repr = payload
+        .tool_choice
+        .as_ref()
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    hash_chunk(&mut hasher, &format!("prelude\0model={}", payload.model));
+    hash_chunk(&mut hasher, &format!("tool_choice={tool_choice_repr}"));
+
     // 全局缓存意图 TTL：请求里任意 cache_control 的 TTL（取首个出现的）。
     // 只要请求存在 cache_control，就把**每个 message 边界**都设为隐式断点 ——
     // 对齐 Anthropic「一个 cache_control 缓存整个 prefix、下一轮命中最长公共 prefix」的语义。
@@ -1354,6 +1366,70 @@ mod tests {
             "R2 应命中 R1 缓存的 prefix（cache_read>0），实际 read={} creation={}",
             u2.cache_read,
             u2.cache_creation
+        );
+    }
+
+    /// 回归（审计 P1）：指纹包含请求前导 model/tool_choice。
+    /// 同一段可缓存 prefix 在不同 model 下指纹必须不同，避免跨模型误命中。
+    #[test]
+    fn fingerprint_differs_by_model() {
+        let mut pa = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
+        let mut pb = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
+        pa.model = "claude-opus-4-5".to_string();
+        pb.model = "claude-sonnet-4-5".to_string();
+
+        let fa = build_profile_from_request(&pa, 5000).unwrap();
+        let fb = build_profile_from_request(&pb, 5000).unwrap();
+        assert_ne!(
+            fa.stable_fingerprint, fb.stable_fingerprint,
+            "不同 model 的相同 prefix 必须有不同 stable_fingerprint"
+        );
+        assert_ne!(
+            fa.breakpoints[0].fingerprint, fb.breakpoints[0].fingerprint,
+            "不同 model 的断点指纹也必须不同"
+        );
+    }
+
+    /// 跨模型不应在同一 account 桶里互相命中（指纹隔离的端到端验证）。
+    #[test]
+    fn no_cross_model_cache_hit() {
+        let cache = PromptCache::new(1024, Duration::from_secs(300), true);
+        let mut opus = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
+        opus.model = "claude-opus-4-5".to_string();
+
+        // opus 先写入缓存
+        let p_opus = build_profile_from_request(&opus, 5000).unwrap();
+        let _ = cache.compute("acc1", &p_opus);
+        cache.update("acc1", &p_opus, "conv-opus");
+
+        // 同 account、同 prefix，但模型换成 sonnet：不应命中 opus 的缓存
+        let mut sonnet = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
+        sonnet.model = "claude-sonnet-4-5".to_string();
+        let p_sonnet = build_profile_from_request(&sonnet, 5000).unwrap();
+        let usage = cache.compute("acc1", &p_sonnet);
+        assert_eq!(
+            usage.cache_read, 0,
+            "不同模型不应命中对方缓存桶，read 应为 0"
+        );
+        assert!(
+            cache.lookup_conversation("acc1", &p_sonnet).is_none(),
+            "不同模型不应复用对方的 conversation_id"
+        );
+    }
+
+    /// 不同 tool_choice 也应区分指纹（防止工具决策语义不同的请求误命中）。
+    #[test]
+    fn fingerprint_differs_by_tool_choice() {
+        let mut none_tc = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
+        let mut auto_tc = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
+        none_tc.tool_choice = None;
+        auto_tc.tool_choice = Some(serde_json::json!({"type": "auto"}));
+
+        let fa = build_profile_from_request(&none_tc, 5000).unwrap();
+        let fb = build_profile_from_request(&auto_tc, 5000).unwrap();
+        assert_ne!(
+            fa.stable_fingerprint, fb.stable_fingerprint,
+            "不同 tool_choice 的相同 prefix 应有不同指纹"
         );
     }
 }
