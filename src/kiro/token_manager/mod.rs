@@ -359,11 +359,11 @@ mod selection;
 
 pub use failure_kind::{TransientFailureKind, extract_suspicious_directory_key};
 // refresh.rs 持有无状态刷新 HTTP 函数 + 调度层；这些自由函数被多个子模块经 `super::*` 引用
+pub(crate) use refresh::RefreshTokenInvalidError;
 use refresh::{
     get_usage_limits, is_token_expired, is_token_expiring_soon, mask_api_key, refresh_token,
     sha256_hex, validate_refresh_token,
 };
-pub(crate) use refresh::RefreshTokenInvalidError;
 
 impl MultiTokenManager {
     /// 创建多凭据 Token 管理器
@@ -543,7 +543,6 @@ impl MultiTokenManager {
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
     }
-
 }
 
 impl Drop for MultiTokenManager {
@@ -1383,12 +1382,18 @@ mod tests {
         let e3 = snap.entries.iter().find(|x| x.id == 3).unwrap();
 
         assert!(e1.cooldown_remaining_seconds > 0);
-        assert!(e2.cooldown_remaining_seconds > 0, "同 directory 凭据应一起冷却");
+        assert!(
+            e2.cooldown_remaining_seconds > 0,
+            "同 directory 凭据应一起冷却"
+        );
         assert_eq!(
             e2.transient_failure_count, 1,
             "peer 冷却不应重复增加瞬态失败计数"
         );
-        assert_eq!(e3.cooldown_remaining_seconds, 0, "不同 directory 不应被冷却");
+        assert_eq!(
+            e3.cooldown_remaining_seconds, 0,
+            "不同 directory 不应被冷却"
+        );
         assert_eq!(e1.directory_key.as_deref(), Some("d-shared"));
         assert_eq!(e2.directory_key.as_deref(), Some("d-shared"));
         assert_eq!(e3.directory_key.as_deref(), Some("d-other"));

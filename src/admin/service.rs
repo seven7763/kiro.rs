@@ -911,7 +911,12 @@ impl AdminService {
         if group.is_empty() {
             return Ok(());
         }
-        if self.token_manager.config().credential_group(group).is_some() {
+        if self
+            .token_manager
+            .config()
+            .credential_group(group)
+            .is_some()
+        {
             return Ok(());
         }
 

@@ -16,8 +16,8 @@ use super::{
         get_metrics, get_metrics_prometheus, get_preset_content, get_prompt_cache_config,
         get_retry_config, get_system_prompt, list_presets, reset_failure_count,
         set_credential_disabled, set_credential_group, set_credential_priority,
-        set_load_balancing_mode,
-        update_prompt_cache_config, update_retry_config, update_system_prompt, update_user_preset,
+        set_load_balancing_mode, update_prompt_cache_config, update_retry_config,
+        update_system_prompt, update_user_preset,
     },
     middleware::{AdminState, admin_auth_middleware},
 };

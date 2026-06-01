@@ -20,7 +20,9 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::kiro::model::requests::{ConversationState, CurrentMessage, UserInputMessage, UserInputMessageContext};
+use crate::kiro::model::requests::{
+    ConversationState, CurrentMessage, UserInputMessage, UserInputMessageContext,
+};
 
 use super::types::MessagesRequest;
 
@@ -61,7 +63,6 @@ impl std::fmt::Display for ConversionError {
 }
 
 impl std::error::Error for ConversionError {}
-
 
 /// 将 Anthropic 请求转换为 Kiro 请求（保留兼容入口）
 #[allow(dead_code)] // 公共 API 表面，被外部 crate 或测试可能引用
@@ -211,9 +212,9 @@ pub fn convert_request_with_options(
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::history::{convert_assistant_message, merge_assistant_messages};
     use super::tools::{TOOL_NAME_MAX_LEN, map_tool_name, shorten_tool_name};
+    use super::*;
     use crate::kiro::model::requests::{
         AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, ToolResult,
         UserMessage,

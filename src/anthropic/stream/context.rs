@@ -1,10 +1,10 @@
 //! 流式上下文 StreamContext（Kiro event → Anthropic SSE，热路径核心）
 
-use super::*;
 use super::thinking::{
     find_char_boundary, find_real_thinking_end_tag, find_real_thinking_end_tag_at_buffer_end,
     find_real_thinking_start_tag,
 };
+use super::*;
 use crate::anthropic::converter::get_context_window_size;
 
 /// 流处理上下文
@@ -552,7 +552,9 @@ impl StreamContext {
                 // 且与 text 块重叠（违反 SSE 块串行 + thinking 在前的协议）。
                 // 故直接丢弃这个孤立 signature，产出干净的 text-only 响应。
                 self.thinking_extracted = true;
-                tracing::debug!("reasoning 仅含 signature 且无 thinking 内容（模型未思考），丢弃以对齐官方 text-only 结构");
+                tracing::debug!(
+                    "reasoning 仅含 signature 且无 thinking 内容（模型未思考），丢弃以对齐官方 text-only 结构"
+                );
                 let _ = signature;
             } else if self.in_thinking_block {
                 // 正常路径：thinking 块已开启，发 signature 关闭它
@@ -1597,7 +1599,8 @@ mod tests {
 
     #[test]
     fn test_reasoning_content_event_streaming() {
-        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
         let _ = ctx.generate_initial_events();
 
         // 首次 text delta 应开启 thinking 块
@@ -1640,7 +1643,8 @@ mod tests {
 
     #[test]
     fn no_budget_means_no_truncation() {
-        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 100, false, HashMap::new());
         // 未设预算
         assert!(ctx.max_output_tokens.is_none());
         let out = ctx.apply_output_budget("hello world this is a long text");
@@ -1650,7 +1654,8 @@ mod tests {
 
     #[test]
     fn budget_truncates_and_sets_stop_reason() {
-        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 100, false, HashMap::new());
         ctx.set_max_output_tokens(2); // 预算 2 token
 
         // 第一段刚好 2 token：放行，到顶
@@ -1667,7 +1672,8 @@ mod tests {
 
     #[test]
     fn budget_partial_truncation_midway() {
-        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 100, false, HashMap::new());
         ctx.set_max_output_tokens(3);
         // 一段超预算文本：应截断到 3 token 并置位
         let out = ctx.apply_output_budget("aaaaaaaaaaaaaaaaaaaa"); // 20 字符 = 5 token
@@ -1679,7 +1685,8 @@ mod tests {
 
     #[test]
     fn budget_shared_between_thinking_and_text() {
-        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
         let _ = ctx.generate_initial_events();
         ctx.set_max_output_tokens(2);
 
@@ -1708,14 +1715,16 @@ mod tests {
 
     #[test]
     fn thinking_content_block_start_has_signature_field() {
-        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
         let _ = ctx.generate_initial_events();
         // 触发 <thinking> 文本协议路径开块
         let events = ctx.process_assistant_response("<thinking>reasoning");
         let start = events
             .iter()
-            .find(|e| e.event == "content_block_start"
-                && e.data["content_block"]["type"] == "thinking")
+            .find(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
+            })
             .expect("应有 thinking content_block_start");
         assert_eq!(
             start.data["content_block"]["signature"], "",
@@ -1725,7 +1734,8 @@ mod tests {
 
     #[test]
     fn thinking_block_closes_with_signature_delta() {
-        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 100, true, HashMap::new());
         let _ = ctx.generate_initial_events();
         // 完整 thinking 块 + 正文：</thinking>\n\n 在同一 chunk，关闭发生在 process_assistant_response
         let mut all_events = ctx.process_assistant_response("<thinking>think</thinking>\n\nanswer");
@@ -1737,9 +1747,7 @@ mod tests {
             .any(|e| e.data["delta"]["type"] == "signature_delta");
         assert!(has_sig, "thinking 块应以 signature_delta 收尾");
         // 且 thinking 块必须有对应的 content_block_stop
-        let has_stop = all_events
-            .iter()
-            .any(|e| e.event == "content_block_stop");
+        let has_stop = all_events.iter().any(|e| e.event == "content_block_stop");
         assert!(has_stop, "thinking 块应有 content_block_stop");
     }
 }

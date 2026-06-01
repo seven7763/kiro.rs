@@ -130,11 +130,7 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
     }
 }
 
-fn proxy_from_parts(
-    url: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-) -> ProxyConfig {
+fn proxy_from_parts(url: &str, username: Option<&str>, password: Option<&str>) -> ProxyConfig {
     let mut proxy = ProxyConfig::new(url);
     if let (Some(username), Some(password)) = (username, password) {
         proxy = proxy.with_auth(username, password);
@@ -321,13 +317,13 @@ impl KiroCredentials {
 
         if let Some(group) = group {
             return match group.proxy_url.as_deref() {
-                Some(url) if !url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => Some(
-                    proxy_from_parts(
+                Some(url) if !url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => {
+                    Some(proxy_from_parts(
                         url,
                         group.proxy_username.as_deref(),
                         group.proxy_password.as_deref(),
-                    ),
-                ),
+                    ))
+                }
                 _ => None,
             };
         }

@@ -168,7 +168,13 @@ impl CacheInner {
     }
 
     /// 记录一次缓存判定。`real_saved` = 真实命中节省；`reported_saved` = 上报口径节省。
-    fn record_event(&mut self, now: Instant, kind: EventKind, real_saved: i32, reported_saved: i32) {
+    fn record_event(
+        &mut self,
+        now: Instant,
+        kind: EventKind,
+        real_saved: i32,
+        reported_saved: i32,
+    ) {
         if self.recent_events.len() >= 2048 {
             let drain_to = self.recent_events.len() - 1024;
             self.recent_events.drain(..drain_to);
@@ -1129,7 +1135,8 @@ mod tests {
     #[test]
     fn perceived_ratio_does_not_lift_first_request() {
         // 首次请求真实 read=0；perceived 只能抬高真实命中，不能伪造 R1 命中。
-        let cache = PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, Some(0.9));
+        let cache =
+            PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, Some(0.9));
         let payload = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
         let profile = build_profile_from_request(&payload, 5000).unwrap();
         let total = profile
@@ -1144,7 +1151,8 @@ mod tests {
 
     #[test]
     fn perceived_ratio_lifts_only_real_hits() {
-        let cache = PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, Some(0.9));
+        let cache =
+            PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, Some(0.9));
         let payload = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
         let profile = build_profile_from_request(&payload, 5000).unwrap();
         let total = profile
@@ -1166,7 +1174,8 @@ mod tests {
 
     #[test]
     fn perceived_ratio_does_not_lift_unmatched_prompt() {
-        let cache = PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, Some(0.9));
+        let cache =
+            PromptCache::new_with_perceived(1024, Duration::from_secs(300), true, Some(0.9));
         let cached = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
         let pcached = build_profile_from_request(&cached, 5000).unwrap();
         let _ = cache.compute("acc1", &pcached);
@@ -1177,7 +1186,10 @@ mod tests {
         let punrelated = build_profile_from_request(&unrelated, 5000).unwrap();
         let usage = cache.compute("acc1", &punrelated);
         assert_eq!(usage.cache_read, 0, "无匹配断点时不能被 perceived 虚抬");
-        assert!(usage.cache_creation > 0, "大请求未命中时应计入 cache creation");
+        assert!(
+            usage.cache_creation > 0,
+            "大请求未命中时应计入 cache creation"
+        );
     }
 
     #[test]
@@ -1334,7 +1346,10 @@ mod tests {
         let p1 = build_profile_from_request(&r1, 6000).unwrap();
         let u1 = cache.compute(GLOBAL_ACCOUNT, &p1);
         cache.update(GLOBAL_ACCOUNT, &p1, "conv-1");
-        assert!(u1.cache_creation > 0 && u1.cache_read == 0, "R1 首次全 creation");
+        assert!(
+            u1.cache_creation > 0 && u1.cache_read == 0,
+            "R1 首次全 creation"
+        );
 
         // R2: 历史 message 内容完全相同，但 cache_control 已“滑”到新的 user message。
         // 第一条 user message 现在**不带** cache_control。

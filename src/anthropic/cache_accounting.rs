@@ -434,9 +434,13 @@ mod tests {
 
         for round in 1..=7 {
             history.push(serde_json::json!({"role": "user", "content": "1"}));
-            let payload = cctest_like_payload(session_id, serde_json::Value::Array(history.clone()));
+            let payload =
+                cctest_like_payload(session_id, serde_json::Value::Array(history.clone()));
             let total = client_total_tokens(&payload);
-            assert!(total > 10_000, "测试数据需要模拟长上下文，当前 total={total}");
+            assert!(
+                total > 10_000,
+                "测试数据需要模拟长上下文，当前 total={total}"
+            );
 
             let decision = lookup_prompt_cache(&cache, &payload, total);
             assert!(
@@ -457,7 +461,10 @@ mod tests {
         }
 
         let snap = cache.snapshot();
-        assert_eq!(snap.entries, 0, "fake cache 不应写入真实 prompt cache entry");
+        assert_eq!(
+            snap.entries, 0,
+            "fake cache 不应写入真实 prompt cache entry"
+        );
     }
 
     #[test]
@@ -470,10 +477,7 @@ mod tests {
         );
         let messages = serde_json::json!([{"role": "user", "content": "1"}]);
 
-        let user_a = cctest_like_payload(
-            "8bb5523b-ec7c-4540-a9ca-beb6d79f1552",
-            messages.clone(),
-        );
+        let user_a = cctest_like_payload("8bb5523b-ec7c-4540-a9ca-beb6d79f1552", messages.clone());
         let total_a = client_total_tokens(&user_a);
         let decision_a = lookup_prompt_cache(&cache, &user_a, total_a);
         let (_, _, read_a) = client_visible_usage(
@@ -485,10 +489,7 @@ mod tests {
         );
         record_cache_outcome(&cache, &decision_a, "conv-user-a", read_a);
 
-        let user_b = cctest_like_payload(
-            "9cc5523b-ec7c-4540-a9ca-beb6d79f1552",
-            messages.clone(),
-        );
+        let user_b = cctest_like_payload("9cc5523b-ec7c-4540-a9ca-beb6d79f1552", messages.clone());
         assert_ne!(prompt_cache_account(&user_a), prompt_cache_account(&user_b));
         let total_b = client_total_tokens(&user_b);
         let decision_b = lookup_prompt_cache(&cache, &user_b, total_b);
@@ -572,7 +573,10 @@ mod tests {
         record_cache_report_only(&cache, &decision, read);
 
         let snap = cache.snapshot();
-        assert_eq!(snap.entries, 0, "WebSearch 只记对账统计，不写 conversation 缓存");
+        assert_eq!(
+            snap.entries, 0,
+            "WebSearch 只记对账统计，不写 conversation 缓存"
+        );
         assert_eq!(snap.miss_total, 1);
         assert_eq!(snap.last1m.reported_hit_rate(), 100.0);
         assert!(snap.last1m.reported_saved_input_tokens > 0);

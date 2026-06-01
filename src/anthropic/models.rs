@@ -11,7 +11,9 @@ use super::types::Model;
 /// 直接映射为 Anthropic 格式的 [`Model`]。对支持 thinking 的 Claude 系模型额外追加 `-thinking`
 /// 变体（沿用 kiro-rs 私有约定）。`max_tokens` 用上游 `maxOutputTokens` 真值（如 Opus 4.7 =
 /// 128000），缺失时回退 64000。
-pub(crate) fn models_from_upstream(upstream: &[crate::kiro::provider::UpstreamModel]) -> Vec<Model> {
+pub(crate) fn models_from_upstream(
+    upstream: &[crate::kiro::provider::UpstreamModel],
+) -> Vec<Model> {
     // 上游已逝时间戳无意义，统一用一个固定 created（不影响客户端使用）
     const CREATED: i64 = 1778400000;
     let mut out = Vec::with_capacity(upstream.len() * 2);

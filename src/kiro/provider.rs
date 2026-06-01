@@ -629,9 +629,7 @@ impl KiroProvider {
             };
 
             // ListAvailableModels 是 GET，沿用 decorate_mcp 的鉴权头（含 profileArn）
-            let base = client
-                .get(&url)
-                .header("content-type", "application/json");
+            let base = client.get(&url).header("content-type", "application/json");
             let request = endpoint.decorate_mcp(base, &rctx);
 
             let response = match request.send().await {
@@ -858,8 +856,7 @@ impl KiroProvider {
                         body
                     );
                     // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                    if endpoint.is_bearer_token_invalid(&body)
-                        && !force_refreshed.contains(&ctx.id)
+                    if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id)
                     {
                         force_refreshed.insert(ctx.id);
                         tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
@@ -943,7 +940,11 @@ impl KiroProvider {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!("{} 请求失败：已达到最大重试次数（{}次）", label, max_retries)
+            anyhow::anyhow!(
+                "{} 请求失败：已达到最大重试次数（{}次）",
+                label,
+                max_retries
+            )
         }))
     }
 

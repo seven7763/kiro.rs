@@ -4,9 +4,7 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
-use crate::kiro::model::requests::{
-    InputSchema, Message, Tool, ToolResult, ToolSpecification,
-};
+use crate::kiro::model::requests::{InputSchema, Message, Tool, ToolResult, ToolSpecification};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///

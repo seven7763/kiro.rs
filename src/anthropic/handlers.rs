@@ -24,9 +24,7 @@ use super::cache_accounting::{
     CacheDecision, client_visible_usage, estimate_incremental_input_tokens, lookup_prompt_cache,
     record_cache_outcome, record_cache_report_only,
 };
-use super::converter::{
-    ConversionError, canonical_anthropic_model, convert_request_with_options,
-};
+use super::converter::{ConversionError, canonical_anthropic_model, convert_request_with_options};
 use super::error_map::map_provider_error;
 use super::middleware::AppState;
 use super::models::{models_from_upstream, static_models};
@@ -132,17 +130,14 @@ pub async fn post_messages(
             payload.tools.clone(),
         ));
         let cache_decision = lookup_prompt_cache(&state.prompt_cache, &payload, input_tokens);
-        let (
-            input_tokens_for_client,
-            cache_creation_input_tokens,
-            cache_read_input_tokens,
-        ) = client_visible_usage(
-            &state.prompt_cache,
-            &cache_decision,
-            &payload.model,
-            client_input_tokens,
-            incremental_input_tokens,
-        );
+        let (input_tokens_for_client, cache_creation_input_tokens, cache_read_input_tokens) =
+            client_visible_usage(
+                &state.prompt_cache,
+                &cache_decision,
+                &payload.model,
+                client_input_tokens,
+                incremental_input_tokens,
+            );
 
         let response = websearch::handle_websearch_request(
             provider,
@@ -226,17 +221,14 @@ pub async fn post_messages(
     // 客户端可见 usage 必须以注入前的 client_input_tokens 为总预算。
     // fake cache 开启时也只在这个预算内重分配，避免把中转层 system/preset 注入
     // 算进客户账单，或让 cache_creation 每轮写入造成溢价。
-    let (
-        input_tokens_for_client,
-        cache_creation_input_tokens,
-        cache_read_input_tokens,
-    ) = client_visible_usage(
-        &state.prompt_cache,
-        &cache_decision,
-        &payload.model,
-        client_input_tokens,
-        incremental_input_tokens,
-    );
+    let (input_tokens_for_client, cache_creation_input_tokens, cache_read_input_tokens) =
+        client_visible_usage(
+            &state.prompt_cache,
+            &cache_decision,
+            &payload.model,
+            client_input_tokens,
+            incremental_input_tokens,
+        );
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -862,17 +854,14 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ));
         let cache_decision = lookup_prompt_cache(&state.prompt_cache, &payload, input_tokens);
-        let (
-            input_tokens_for_client,
-            cache_creation_input_tokens,
-            cache_read_input_tokens,
-        ) = client_visible_usage(
-            &state.prompt_cache,
-            &cache_decision,
-            &payload.model,
-            client_input_tokens,
-            incremental_input_tokens,
-        );
+        let (input_tokens_for_client, cache_creation_input_tokens, cache_read_input_tokens) =
+            client_visible_usage(
+                &state.prompt_cache,
+                &cache_decision,
+                &payload.model,
+                client_input_tokens,
+                incremental_input_tokens,
+            );
 
         let response = websearch::handle_websearch_request(
             provider,
@@ -952,17 +941,14 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    let (
-        input_tokens_for_client,
-        cache_creation_input_tokens,
-        cache_read_input_tokens,
-    ) = client_visible_usage(
-        &state.prompt_cache,
-        &cache_decision,
-        &payload.model,
-        client_input_tokens,
-        incremental_input_tokens,
-    );
+    let (input_tokens_for_client, cache_creation_input_tokens, cache_read_input_tokens) =
+        client_visible_usage(
+            &state.prompt_cache,
+            &cache_decision,
+            &payload.model,
+            client_input_tokens,
+            incremental_input_tokens,
+        );
 
     // 检查是否启用了thinking
     let thinking_enabled = payload

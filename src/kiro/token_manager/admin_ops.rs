@@ -14,9 +14,9 @@ impl MultiTokenManager {
             entries: entries
                 .iter()
                 .map(|e| {
-                    let (proxy_source, effective_proxy_url) =
-                        e.credentials
-                            .effective_proxy_display(&self.config, self.proxy.as_ref());
+                    let (proxy_source, effective_proxy_url) = e
+                        .credentials
+                        .effective_proxy_display(&self.config, self.proxy.as_ref());
                     CredentialEntrySnapshot {
                         id: e.id,
                         priority: e.credentials.priority,

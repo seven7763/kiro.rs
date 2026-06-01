@@ -87,7 +87,9 @@ pub(super) fn process_message_content(
                             if let Some(source) = block.source {
                                 let media_type = source.media_type.clone();
                                 let extracted = if media_type == "application/pdf" {
-                                    crate::anthropic::document::extract_pdf_text_from_base64(&source.data)
+                                    crate::anthropic::document::extract_pdf_text_from_base64(
+                                        &source.data,
+                                    )
                                 } else if media_type.starts_with("text/") {
                                     use base64::Engine;
                                     base64::engine::general_purpose::STANDARD

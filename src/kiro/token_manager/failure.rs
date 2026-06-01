@@ -101,8 +101,7 @@ impl MultiTokenManager {
                 let effective_directory_key = {
                     let entry = &mut entries[idx];
                     entry.inflight = entry.inflight.saturating_sub(1);
-                    entry.transient_failure_count =
-                        entry.transient_failure_count.saturating_add(1);
+                    entry.transient_failure_count = entry.transient_failure_count.saturating_add(1);
                     entry.last_transient_failure_at = Some(now_rfc);
                     entry.last_transient_at_instant = Some(now_instant);
 

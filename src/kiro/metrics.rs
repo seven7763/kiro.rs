@@ -213,7 +213,9 @@ impl MetricsRecorder {
         output: Option<u32>,
         cache_read: Option<u32>,
     ) {
-        self.buf.lock().update_tokens(seq, input, output, cache_read);
+        self.buf
+            .lock()
+            .update_tokens(seq, input, output, cache_read);
     }
 
     /// 当前缓冲已记录的请求总数（被环形覆盖前）
@@ -687,7 +689,10 @@ mod tests {
         rb_recorder.update_tokens(s0, Some(999), Some(999), Some(999));
         let slot0 = &rb_recorder.snapshot()[0];
         assert_eq!(slot0.seq, 2);
-        assert!(slot0.input_tokens.is_none(), "迟到 seq 不应污染已覆盖的 slot");
+        assert!(
+            slot0.input_tokens.is_none(),
+            "迟到 seq 不应污染已覆盖的 slot"
+        );
 
         // 当前 s2 的回填正常生效
         rb_recorder.update_tokens(s2, Some(50), Some(20), Some(0));
@@ -729,7 +734,7 @@ mod tests {
             make(10, 100, RequestKind::Success, false, false),
             make(40, 200, RequestKind::Success, false, false),
             make(120, 300, RequestKind::Success, false, false),
-        ];        // 过去 60s 窗口：只 10s 和 40s 这两条进
+        ]; // 过去 60s 窗口：只 10s 和 40s 这两条进
         let stats = compute_window_stats(&recs, Instant::now(), Duration::from_secs(60));
         assert_eq!(stats.count, 2);
         assert_eq!(stats.success, 2);

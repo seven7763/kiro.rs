@@ -143,12 +143,7 @@ mod tests {
 
     #[test]
     fn buffered_stream_updates_nested_cache_creation_usage() {
-        let mut ctx = BufferedStreamContext::new(
-            "claude-sonnet-4-5",
-            42,
-            false,
-            HashMap::new(),
-        );
+        let mut ctx = BufferedStreamContext::new("claude-sonnet-4-5", 42, false, HashMap::new());
         ctx.cache_creation_input_tokens = 123;
         ctx.cache_read_input_tokens = 456;
 
