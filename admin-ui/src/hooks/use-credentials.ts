@@ -3,6 +3,7 @@ import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialGroup,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -50,6 +51,18 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置分组
+export function useSetCredentialGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, group }: { id: number; group: string | null }) =>
+      setCredentialGroup(id, group),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

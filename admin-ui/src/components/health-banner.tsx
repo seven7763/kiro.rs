@@ -46,6 +46,16 @@ export function HealthBanner() {
   const l1 = data?.latency.last1m
   const cd = data?.cooldown
   const pc = data?.promptCache
+  const pcReportedMode =
+    pc?.perceivedCacheHitRatio !== undefined && pc.perceivedCacheHitRatio !== null
+  const pcDisplayHitRate =
+    pcReportedMode && pc?.reportedHitRate1m !== undefined
+      ? pc.reportedHitRate1m
+      : pc?.hitRate1m
+  const pcDisplaySavedTokens =
+    pcReportedMode && pc?.reportedSavedInputTokens5m !== undefined
+      ? pc.reportedSavedInputTokens5m
+      : pc?.savedInputTokens5m
 
   const formatSavedTokens = (v: number | undefined) => {
     if (v === undefined) return '—'
@@ -194,16 +204,29 @@ export function HealthBanner() {
           <div
             className={`text-2xl font-bold leading-none ${
               pc && pc.enabled
-                ? pc.hitRate1m >= 30
+                ? (pcDisplayHitRate ?? 0) >= 30
                   ? 'text-green-600'
                   : 'text-foreground'
                 : 'text-muted-foreground'
             }`}
           >
-            {pc?.enabled ? `${pc.hitRate1m.toFixed(0)}%` : '禁用'}
+            {pc?.enabled && pcDisplayHitRate !== undefined
+              ? `${pcDisplayHitRate.toFixed(0)}%`
+              : pc?.enabled
+                ? '—'
+                : '禁用'}
           </div>
           <div className="text-xs text-muted-foreground mt-1.5">
-            5min 节省 <b>{formatSavedTokens(pc?.savedInputTokens5m)}</b> tok
+            {pcReportedMode ? (
+              <>
+                计费节省 <b>{formatSavedTokens(pcDisplaySavedTokens)}</b> tok · 真实{' '}
+                <b>{formatPercent(pc?.hitRate1m)}</b>
+              </>
+            ) : (
+              <>
+                5min 节省 <b>{formatSavedTokens(pcDisplaySavedTokens)}</b> tok
+              </>
+            )}
           </div>
         </CardContent>
       </Card>

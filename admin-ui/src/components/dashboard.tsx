@@ -783,6 +783,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <CredentialCard
                     key={credential.id}
                     credential={credential}
+                    credentialGroups={data?.credentialGroups ?? []}
                     onViewBalance={handleViewBalance}
                     selected={selectedIds.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
@@ -834,6 +835,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <AddCredentialDialog
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
+        credentialGroups={data?.credentialGroups ?? []}
       />
 
       {/* 批量导入对话框 */}

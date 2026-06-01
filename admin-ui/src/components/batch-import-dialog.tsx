@@ -30,6 +30,10 @@ interface CredentialInput {
   kiroApiKey?: string
   authMethod?: string
   endpoint?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  group?: string
 }
 
 interface VerificationResult {
@@ -233,6 +237,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
+              proxyUrl: cred.proxyUrl?.trim() || undefined,
+              proxyUsername: cred.proxyUsername?.trim() || undefined,
+              proxyPassword: cred.proxyPassword?.trim() || undefined,
+              group: cred.group?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
             })
 
@@ -282,6 +290,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             clientSecret,
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
+            proxyUrl: cred.proxyUrl?.trim() || undefined,
+            proxyUsername: cred.proxyUsername?.trim() || undefined,
+            proxyPassword: cred.proxyPassword?.trim() || undefined,
+            group: cred.group?.trim() || undefined,
             endpoint: cred.endpoint?.trim() || undefined,
           })
 
@@ -422,7 +434,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"...","group":"socks-a"}]\nAPI Key: [{"kiroApiKey":"ksk_xxx","group":"direct"}]\n\n支持 region 字段自动映射为 authRegion，也支持 proxyUrl / group'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

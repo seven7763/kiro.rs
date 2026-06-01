@@ -110,6 +110,9 @@ export interface AdminMetricsResponse {
     hitRate1m: number
     hitRate5m: number
     savedInputTokens5m: number
+    reportedHitRate1m?: number
+    reportedSavedInputTokens5m?: number
+    perceivedCacheHitRatio?: number | null
   }
   /** 1 小时窗口按 model 切片（新增于 v2026.3.x，旧版本可能缺失） */
   byModel1h?: DimensionBreakdown[]
@@ -136,6 +139,12 @@ export interface PromptCacheConfigPayload {
   hitRate1m?: number
   hitRate5m?: number
   savedInputTokens5m?: number
+  /** 上报/计费口径系数；null/undefined 表示不干预 */
+  perceivedCacheHitRatio?: number | null
+  /** 1 分钟窗口上报/计费口径命中率（百分比，0~100） */
+  reportedHitRate1m?: number
+  /** 5 分钟内上报/计费口径节省 input tokens */
+  reportedSavedInputTokens5m?: number
 }
 
 // ===== Retry 运行时配置 =====
@@ -160,7 +169,14 @@ export interface CredentialsStatusResponse {
   total: number
   available: number
   currentId: number
+  credentialGroups: CredentialGroupStatusItem[]
   credentials: CredentialStatusItem[]
+}
+
+export interface CredentialGroupStatusItem {
+  id: string
+  proxyUrl?: string
+  hasProxy: boolean
 }
 
 // 单个凭据状态
@@ -181,6 +197,8 @@ export interface CredentialStatusItem {
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string
+  group?: string
+  proxySource?: 'credential' | 'credential_direct' | 'group' | 'group_direct' | 'global' | 'none'
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
@@ -190,8 +208,10 @@ export interface CredentialStatusItem {
   lastTransientFailureAt?: string | null
   /** 当前冷却剩余秒数（0 或缺失表示不在冷却中） */
   cooldownRemainingSeconds?: number
-  /** 当前冷却原因（"rate_limit" / "timeout" / "upstream_error"，不在冷却时为 undefined） */
+  /** 当前冷却原因（"rate_limit" / "timeout" / "upstream_error" / "suspicious_activity"） */
   cooldownReason?: string
+  /** 从 suspicious activity 响应体学习到的 directory key */
+  directoryKey?: string
 }
 
 // 余额响应
@@ -228,6 +248,10 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+export interface SetCredentialGroupRequest {
+  group?: string | null
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
@@ -241,6 +265,7 @@ export interface AddCredentialRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  group?: string
   kiroApiKey?: string
   endpoint?: string
 }

@@ -30,8 +30,16 @@ interface KamAccount {
     region?: string
     authMethod?: string
     startUrl?: string
+    group?: string
+    proxyUrl?: string
+    proxyUsername?: string
+    proxyPassword?: string
   }
   machineId?: string
+  group?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
   status?: string
 }
 
@@ -65,6 +73,10 @@ function normalizeKamAccount(item: unknown): unknown {
           : undefined
     const status = typeof obj.status === 'string' ? obj.status : undefined
     const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
+    const group = typeof obj.group === 'string' ? obj.group : undefined
+    const proxyUrl = typeof obj.proxyUrl === 'string' ? obj.proxyUrl : undefined
+    const proxyUsername = typeof obj.proxyUsername === 'string' ? obj.proxyUsername : undefined
+    const proxyPassword = typeof obj.proxyPassword === 'string' ? obj.proxyPassword : undefined
     const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
     const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
     const region = typeof obj.region === 'string' ? obj.region : undefined
@@ -77,6 +89,10 @@ function normalizeKamAccount(item: unknown): unknown {
       nickname,
       status,
       machineId,
+      group,
+      proxyUrl,
+      proxyUsername,
+      proxyPassword,
       credentials: {
         refreshToken: obj.refreshToken,
         clientId,
@@ -84,6 +100,10 @@ function normalizeKamAccount(item: unknown): unknown {
         region,
         authMethod,
         startUrl,
+        group,
+        proxyUrl,
+        proxyUsername,
+        proxyPassword,
       },
     }
   }
@@ -281,6 +301,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,
+            proxyUrl: account.proxyUrl?.trim() || cred.proxyUrl?.trim() || undefined,
+            proxyUsername: account.proxyUsername?.trim() || cred.proxyUsername?.trim() || undefined,
+            proxyPassword: account.proxyPassword?.trim() || cred.proxyPassword?.trim() || undefined,
+            group: account.group?.trim() || cred.group?.trim() || undefined,
           })
 
           addedCredId = addedCred.credentialId

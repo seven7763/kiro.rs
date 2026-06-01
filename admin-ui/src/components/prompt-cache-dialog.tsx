@@ -41,12 +41,18 @@ export function PromptCacheDialog({ open, onOpenChange }: PromptCacheDialogProps
   const [enabled, setEnabled] = useState(true)
   const [capacity, setCapacity] = useState('1024')
   const [ttlSecs, setTtlSecs] = useState('300')
+  const [perceivedRatio, setPerceivedRatio] = useState('')
 
   useEffect(() => {
     if (open && data) {
       setEnabled(data.enabled)
       setCapacity(data.capacity.toString())
       setTtlSecs(data.ttlSecs.toString())
+      setPerceivedRatio(
+        data.perceivedCacheHitRatio === null || data.perceivedCacheHitRatio === undefined
+          ? ''
+          : data.perceivedCacheHitRatio.toString()
+      )
     }
   }, [open, data])
 
@@ -68,12 +74,22 @@ export function PromptCacheDialog({ open, onOpenChange }: PromptCacheDialogProps
       toast.error('ttlSecs 必须在 [10, 86400] 秒范围内')
       return
     }
+    const ratioText = perceivedRatio.trim()
+    const ratio =
+      ratioText.length === 0 || ratioText.toLowerCase() === 'null'
+        ? null
+        : Number(ratioText)
+    if (ratio !== null && (!Number.isFinite(ratio) || ratio < 0 || ratio > 0.95)) {
+      toast.error('perceivedCacheHitRatio 必须在 [0.0, 0.95] 范围内，留空表示关闭')
+      return
+    }
 
     mutate(
       {
         enabled,
         capacity: cap,
         ttlSecs: ttl,
+        perceivedCacheHitRatio: ratio,
       },
       {
         onSuccess: () => {
@@ -106,8 +122,8 @@ export function PromptCacheDialog({ open, onOpenChange }: PromptCacheDialogProps
         <DialogHeader>
           <DialogTitle>Prompt Cache 配置</DialogTitle>
           <DialogDescription>
-            中转层自实现的 prefix 缓存。命中时复用 conversation_id，并向客户端上报真实
-            的 cache_*_input_tokens（解决上游 Kiro 不支持 prompt caching 导致命中率永远 0% 的问题）。
+            中转层自实现的 prefix 缓存。真实缓存用于诊断，计费口径可单独设置为稳定的
+            cache_read_input_tokens 比例，避免 cache_creation 溢价。
           </DialogDescription>
         </DialogHeader>
 
@@ -160,6 +176,23 @@ export function PromptCacheDialog({ open, onOpenChange }: PromptCacheDialogProps
               </p>
             </div>
 
+            <div className="space-y-2">
+              <Label htmlFor="pc-perceived-ratio">计费命中率系数</Label>
+              <Input
+                id="pc-perceived-ratio"
+                type="number"
+                min={0}
+                max={0.95}
+                step={0.01}
+                placeholder="留空关闭，例如 0.92"
+                value={perceivedRatio}
+                onChange={(e) => setPerceivedRatio(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                范围 [0.0, 0.95]。开启后客户端可见 input 内按该比例上报 cache_read，cache_creation 置 0。
+              </p>
+            </div>
+
             {/* 运行时统计 */}
             {data && (
               <div className="rounded-lg border p-3 space-y-2">
@@ -182,7 +215,21 @@ export function PromptCacheDialog({ open, onOpenChange }: PromptCacheDialogProps
                     <b className="text-foreground">{data.missTotal ?? 0}</b>
                   </div>
                   <div>
-                    命中率（1min）:{' '}
+                    计费命中率（1min）:{' '}
+                    <b
+                      className={
+                        data.reportedHitRate1m && data.reportedHitRate1m >= 30
+                          ? 'text-green-600'
+                          : 'text-foreground'
+                      }
+                    >
+                      {data.reportedHitRate1m !== undefined
+                        ? `${data.reportedHitRate1m.toFixed(1)}%`
+                        : '—'}
+                    </b>
+                  </div>
+                  <div>
+                    真实命中率（1min）:{' '}
                     <b
                       className={
                         data.hitRate1m && data.hitRate1m >= 30
@@ -196,7 +243,7 @@ export function PromptCacheDialog({ open, onOpenChange }: PromptCacheDialogProps
                     </b>
                   </div>
                   <div>
-                    命中率（5min）:{' '}
+                    真实命中率（5min）:{' '}
                     <b className="text-foreground">
                       {data.hitRate5m !== undefined
                         ? `${data.hitRate5m.toFixed(1)}%`
@@ -207,6 +254,19 @@ export function PromptCacheDialog({ open, onOpenChange }: PromptCacheDialogProps
                     5min 节省 input tokens:{' '}
                     <b className="text-foreground">
                       {data.savedInputTokens5m ?? 0}
+                    </b>
+                    <span className="text-muted-foreground">
+                      {' '}
+                      / 计费 {data.reportedSavedInputTokens5m ?? 0}
+                    </span>
+                  </div>
+                  <div className="col-span-2">
+                    计费系数:{' '}
+                    <b className="text-foreground">
+                      {data.perceivedCacheHitRatio === null ||
+                      data.perceivedCacheHitRatio === undefined
+                        ? '关闭'
+                        : data.perceivedCacheHitRatio}
                     </b>
                   </div>
                 </div>

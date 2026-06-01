@@ -11,15 +11,17 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useAddCredential } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import type { CredentialGroupStatusItem } from '@/types/api'
 
 interface AddCredentialDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  credentialGroups: CredentialGroupStatusItem[]
 }
 
 type AuthMethod = 'social' | 'idc' | 'api_key'
 
-export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
+export function AddCredentialDialog({ open, onOpenChange, credentialGroups }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
@@ -32,6 +34,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
+  const [group, setGroup] = useState('')
   const [endpoint, setEndpoint] = useState('')
 
   const { mutate, isPending } = useAddCredential()
@@ -49,6 +52,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUrl('')
     setProxyUsername('')
     setProxyPassword('')
+    setGroup('')
     setEndpoint('')
   }
 
@@ -89,6 +93,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
+        group: group.trim() || undefined,
         endpoint: endpoint.trim() || undefined,
       },
       {
@@ -274,6 +279,30 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
+              </p>
+            </div>
+
+            {/* 分组 */}
+            <div className="space-y-2">
+              <label htmlFor="group" className="text-sm font-medium">
+                凭据分组
+              </label>
+              <select
+                id="group"
+                value={group}
+                onChange={(e) => setGroup(e.target.value)}
+                disabled={isPending || credentialGroups.length === 0}
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="">未分组</option>
+                {credentialGroups.map(item => (
+                  <option key={item.id} value={item.id}>
+                    {item.id}{item.hasProxy ? ' · 代理' : ' · 直连'}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground">
+                分组在 config.json 的 credentialGroups 中配置；未配置分组时会保持未分组
               </p>
             </div>
 

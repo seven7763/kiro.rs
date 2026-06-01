@@ -9,6 +9,7 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  SetCredentialGroupRequest,
   AddCredentialRequest,
   AddCredentialResponse,
   SystemPromptConfig,
@@ -62,6 +63,18 @@ export async function setCredentialPriority(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/${id}/priority`,
     { priority } as SetPriorityRequest
+  )
+  return data
+}
+
+// 设置凭据分组
+export async function setCredentialGroup(
+  id: number,
+  group: string | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/group`,
+    { group } as SetCredentialGroupRequest
   )
   return data
 }

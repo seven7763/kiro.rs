@@ -15,10 +15,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+import type { CredentialStatusItem, BalanceResponse, CredentialGroupStatusItem } from '@/types/api'
 import {
   useSetDisabled,
   useSetPriority,
+  useSetCredentialGroup,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -26,6 +27,7 @@ import {
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
+  credentialGroups: CredentialGroupStatusItem[]
   onViewBalance: (id: number) => void
   selected: boolean
   onToggleSelect: () => void
@@ -63,6 +65,24 @@ function formatCooldownReason(reason?: string): string {
   }
 }
 
+function formatProxySource(source?: CredentialStatusItem['proxySource']): string {
+  switch (source) {
+    case 'credential':
+      return '凭据代理'
+    case 'credential_direct':
+      return '凭据直连'
+    case 'group':
+      return '分组代理'
+    case 'group_direct':
+      return '分组直连'
+    case 'global':
+      return '全局代理'
+    case 'none':
+    default:
+      return '直连'
+  }
+}
+
 /**
  * 实时倒计时 hook：
  * 后端 30s refetch 一次，前端基于上次拿到的剩余秒数 + 本地经过时间秒级自减，
@@ -90,6 +110,7 @@ function useLiveCooldown(remainingSeconds: number | undefined): number {
 
 export function CredentialCard({
   credential,
+  credentialGroups,
   onViewBalance,
   selected,
   onToggleSelect,
@@ -98,6 +119,8 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [editingGroup, setEditingGroup] = useState(false)
+  const [groupValue, setGroupValue] = useState(credential.group || '')
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const liveCooldown = useLiveCooldown(credential.cooldownRemainingSeconds)
@@ -106,9 +129,20 @@ export function CredentialCard({
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setGroup = useSetCredentialGroup()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+
+  useEffect(() => {
+    if (!editingGroup) {
+      setGroupValue(credential.group || '')
+    }
+  }, [credential.group, editingGroup])
+
+  const groupOptions = credential.group && !credentialGroups.some(group => group.id === credential.group)
+    ? [{ id: credential.group, hasProxy: false }, ...credentialGroups]
+    : credentialGroups
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -136,6 +170,22 @@ export function CredentialCard({
         onSuccess: (res) => {
           toast.success(res.message)
           setEditingPriority(false)
+        },
+        onError: (err) => {
+          toast.error('操作失败: ' + (err as Error).message)
+        },
+      }
+    )
+  }
+
+  const handleGroupChange = () => {
+    const nextGroup = groupValue.trim() || null
+    setGroup.mutate(
+      { id: credential.id, group: nextGroup },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingGroup(false)
         },
         onError: (err) => {
           toast.error('操作失败: ' + (err as Error).message)
@@ -330,6 +380,63 @@ export function CredentialCard({
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">分组：</span>
+              {editingGroup ? (
+                <div className="mt-2 flex items-center gap-2">
+                  <select
+                    value={groupValue}
+                    onChange={(e) => setGroupValue(e.target.value)}
+                    disabled={setGroup.isPending}
+                    className="h-8 min-w-36 rounded-md border border-input bg-background px-2 text-sm"
+                  >
+                    <option value="">未分组</option>
+                    {groupOptions.map(group => (
+                      <option key={group.id} value={group.id}>
+                        {group.id}{group.hasProxy ? ' · 代理' : ' · 直连'}
+                      </option>
+                    ))}
+                  </select>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-8 px-2"
+                    onClick={handleGroupChange}
+                    disabled={setGroup.isPending}
+                  >
+                    保存
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-8 px-2"
+                    onClick={() => {
+                      setEditingGroup(false)
+                      setGroupValue(credential.group || '')
+                    }}
+                  >
+                    取消
+                  </Button>
+                </div>
+              ) : (
+                <span
+                  className="font-medium cursor-pointer hover:underline ml-1"
+                  onClick={() => setEditingGroup(true)}
+                >
+                  {credential.group || '未分组'}
+                  <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
+                </span>
+              )}
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">出口：</span>
+              <span className="font-medium ml-1">{formatProxySource(credential.proxySource)}</span>
+              {credential.proxyUrl && (
+                <span className="ml-2 font-mono text-xs text-muted-foreground break-all">
+                  {credential.proxyUrl}
+                </span>
+              )}
+            </div>
             {credential.maskedApiKey && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">API Key：</span>
@@ -353,12 +460,6 @@ export function CredentialCard({
                 <span className="text-sm text-muted-foreground ml-1">未知</span>
               )}
             </div>
-            {credential.hasProxy && (
-              <div className="col-span-2">
-                <span className="text-muted-foreground">代理：</span>
-                <span className="font-medium">{credential.proxyUrl}</span>
-              </div>
-            )}
             {credential.hasProfileArn && (
               <div className="col-span-2">
                 <Badge variant="secondary">有 Profile ARN</Badge>

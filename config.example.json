@@ -5,5 +5,15 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
+  "credentialGroups": [
+    {
+      "id": "direct",
+      "proxyUrl": "direct"
+    },
+    {
+      "id": "socks-a",
+      "proxyUrl": "socks5://127.0.0.1:1080"
+    }
+  ],
   "defaultEndpoint": "ide"
 }
