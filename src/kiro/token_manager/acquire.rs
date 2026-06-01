@@ -79,16 +79,21 @@ impl MultiTokenManager {
                                 // 已在本请求试过的号:快路径跳过,走 select 选别的
                                 && !exclude.contains(&e.id)
                         })
-                        .map(|e| {
-                            // 快路径也必须取并发 permit（acquire-or-degrade，只认这一个号），
-                            // 否则 priority 模式下该路径会完全绕过 max_inflight_per_credential。
-                            let permit = e
-                                .permit_semaphore
-                                .as_ref()
-                                .and_then(|sem| sem.clone().try_acquire_owned().ok());
+                        .and_then(|e| {
+                            // 快路径并发 permit:语义与 select 的 skip-if-full 对齐——
+                            // 配了上限且已满时**不**降级硬用本号(那会让 priority 模式
+                            // 的热号绕过 max_inflight_per_credential),而是返回 None 落到
+                            // select_and_acquire_slot,由它跳过满号选下一个真有空位的。
+                            let permit = match e.permit_semaphore.as_ref() {
+                                None => None, // 未配置上限:不限并发
+                                Some(sem) => match sem.clone().try_acquire_owned() {
+                                    Ok(p) => Some(p),
+                                    Err(_) => return None, // 满 → 落 select 换号
+                                },
+                            };
                             e.inflight = e.inflight.saturating_add(1);
                             // current_id 直接命中且不在 cooldown：非 fallback 路径
-                            (e.id, e.credentials.clone(), false, permit)
+                            Some((e.id, e.credentials.clone(), false, permit))
                         })
                 };
 

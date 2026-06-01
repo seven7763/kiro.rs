@@ -395,15 +395,13 @@ impl MultiTokenManager {
         let mut has_new_machine_ids = false;
         let config_ref = &config;
 
-        // 创建 per-credential 并发限制 semaphore（None = 不限制）
-        let per_cred_semaphore: Option<Arc<Semaphore>> =
-            config.max_inflight_per_credential.and_then(|n| {
-                if n == 0 {
-                    None
-                } else {
-                    Some(Arc::new(Semaphore::new(n as usize)))
-                }
-            });
+        // per-credential 并发上限 n（None / 0 = 不限制）。
+        // 注意：每个凭据必须各自持有**独立**的 Semaphore——下方在 map 里为每条
+        // entry 新建 `Semaphore::new(n)`。早期实现误用一个共享 Arc 克隆到所有
+        // 凭据，导致 `max_inflight_per_credential` 退化成全局上限。
+        let per_cred_limit: Option<usize> = config
+            .max_inflight_per_credential
+            .and_then(|n| if n == 0 { None } else { Some(n as usize) });
 
         let entries: Vec<CredentialEntry> = credentials
             .into_iter()
@@ -441,7 +439,7 @@ impl MultiTokenManager {
                     cooldown_until: None,
                     cooldown_reason: None,
                     directory_key: None,
-                    permit_semaphore: per_cred_semaphore.clone(),
+                    permit_semaphore: per_cred_limit.map(|n| Arc::new(Semaphore::new(n))),
                 }
             })
             .collect();
@@ -2094,6 +2092,39 @@ mod tests {
         assert!(
             c4.concurrency_permit.is_some(),
             "释放一个 permit 后,新请求应能重新取得 permit"
+        );
+    }
+
+    /// 回归（审计 P0,priority 模式快路径）：max_inflight=1 + 多凭据 priority 模式下,
+    /// current_id 命中的热号满载时,**第二个并发请求必须切到另一个号**(skip-if-full),
+    /// 而不是降级硬用同一个号——后者会让快路径绕过 max_inflight_per_credential。
+    #[tokio::test]
+    async fn priority_fast_path_skips_full_credential() {
+        let mut config = Config::default();
+        config.max_inflight_per_credential = Some(1);
+        // 默认 priority 模式;两个号,current_id 初始指向 #1
+        let mut c1 = live_cred("t1");
+        c1.id = Some(1);
+        let mut c2 = live_cred("t2");
+        c2.id = Some(2);
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        // 第一个请求:走快路径命中 #1,取得它唯一的 permit
+        let a = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(a.id, 1, "首个请求应命中 current_id=#1");
+        assert!(a.concurrency_permit.is_some(), "#1 应取得 permit");
+
+        // 第二个并发请求:#1 已满。旧实现会降级硬用 #1(permit=None);
+        // 修复后应跳过 #1、切到 #2 并取得 #2 的 permit。
+        let b = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            b.id, 2,
+            "#1 满载时第二个请求应切到 #2(skip-if-full),实际命中 #{}",
+            b.id
+        );
+        assert!(
+            b.concurrency_permit.is_some(),
+            "切到 #2 后应取得 #2 的 permit"
         );
     }
 

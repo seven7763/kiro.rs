@@ -408,8 +408,14 @@ impl MultiTokenManager {
 
         {
             let mut entries = self.entries.lock();
-            // 复用已有凭据的 per-credential semaphore（所有凭据共享同一配置的 semaphore）
-            let per_cred_sem = entries.iter().find_map(|e| e.permit_semaphore.clone());
+            // 为新凭据创建**独立**的 per-credential semaphore（容量取自 config）。
+            // 不可复用已有 entry 的 semaphore——那会让多个凭据共享一个并发上限，
+            // 使 max_inflight_per_credential 退化成全局限制。
+            let per_cred_sem = self
+                .config
+                .max_inflight_per_credential
+                .and_then(|n| if n == 0 { None } else { Some(n as usize) })
+                .map(|n| Arc::new(Semaphore::new(n)));
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
