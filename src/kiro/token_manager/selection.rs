@@ -65,10 +65,15 @@ impl MultiTokenManager {
     /// 跳过已满的号选下一个真正有空位的；仅当所有 live 候选都满时才退化为"不限并发"
     /// 借用调度键最优的那个。sticky / 全员 cooldown fallback 路径只对单个选中号做
     /// acquire-or-degrade（不跨号跳过，保持其路由意图）。
+    ///
+    /// **`exclude`（per-request 已试过的凭据）**：软排除——仅当排除后仍 ≥1 候选时才生效，
+    /// 否则忽略（即"所有号都试过了"时自动重置，回到正常选号，避免请求直接饿死）。
+    /// 用于同一请求的 retry 不要反复打同一个刚失败的号。
     pub(super) fn select_and_acquire_slot(
         &self,
         model: Option<&str>,
         conversation_id: Option<&str>,
+        exclude: &HashSet<u64>,
     ) -> Option<SlotSelection> {
         let mut entries = self.entries.lock();
 
@@ -99,6 +104,22 @@ impl MultiTokenManager {
         if candidates.is_empty() {
             return None;
         }
+
+        // 软排除已试过的凭据：排除后仍有候选才采用,否则保留全集(=自动重置)。
+        let candidates: Vec<usize> = if exclude.is_empty() {
+            candidates
+        } else {
+            let filtered: Vec<usize> = candidates
+                .iter()
+                .copied()
+                .filter(|&i| !exclude.contains(&entries[i].id))
+                .collect();
+            if filtered.is_empty() {
+                candidates
+            } else {
+                filtered
+            }
+        };
 
         // Sticky session：同一 conversation_id 优先路由到同一凭据
         if let Some(cid) = conversation_id {

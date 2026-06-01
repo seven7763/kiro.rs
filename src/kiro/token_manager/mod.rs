@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -2107,6 +2107,53 @@ mod tests {
         assert!(
             ctx.concurrency_permit.is_none(),
             "未配置并发上限时 permit 应为 None(不限并发)"
+        );
+    }
+
+    /// 回归（审计 P1）：retry 软排除已试过的凭据。
+    /// 排除 cred #1 后应选到 #2;排除全部时软重置（仍返回一个,不饿死）。
+    #[tokio::test]
+    async fn acquire_excludes_tried_credentials() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let mut c1 = live_cred("t1");
+        c1.id = Some(1);
+        let mut c2 = live_cred("t2");
+        c2.id = Some(2);
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        // 排除 #1 → 必得 #2
+        let mut tried = HashSet::new();
+        tried.insert(1u64);
+        let ctx = manager
+            .acquire_context_excluding(None, None, &tried)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2, "排除 #1 后应选中 #2");
+        manager.release_inflight(ctx.id);
+
+        // 排除 #2 → 必得 #1
+        let mut tried2 = HashSet::new();
+        tried2.insert(2u64);
+        let ctx = manager
+            .acquire_context_excluding(None, None, &tried2)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1, "排除 #2 后应选中 #1");
+        manager.release_inflight(ctx.id);
+
+        // 全部排除 → 软重置,仍返回某个号(不报错/不饿死)
+        let mut tried_all = HashSet::new();
+        tried_all.insert(1u64);
+        tried_all.insert(2u64);
+        let ctx = manager
+            .acquire_context_excluding(None, None, &tried_all)
+            .await
+            .unwrap();
+        assert!(
+            ctx.id == 1 || ctx.id == 2,
+            "全部排除时应软重置返回一个号,实际 id={}",
+            ctx.id
         );
     }
 }

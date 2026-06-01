@@ -693,6 +693,10 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        // 本请求已试过的凭据：retry 时软排除,避免反复打同一个刚失败的号
+        // （尤其是 401/403 这类不进 cooldown 的失败,否则 priority 快路径会重选同号）。
+        // 软排除:所有号都试过后 select 自动忽略它,回到正常选号。
+        let mut tried: HashSet<u64> = HashSet::new();
         let label = kind.label(); // 错误信息前缀：如 "流式 API" / "非流式 API" / "MCP"
         let tag = kind.tag(); // 发送失败日志短标：如 "API" / "MCP"
 
@@ -708,7 +712,7 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let ctx = match self
                 .token_manager
-                .acquire_context(model.as_deref(), conversation_id.as_deref())
+                .acquire_context_excluding(model.as_deref(), conversation_id.as_deref(), &tried)
                 .await
             {
                 Ok(c) => c,
@@ -719,6 +723,8 @@ impl KiroProvider {
             };
             // 跟踪本次请求最后命中的凭据 ID（用于 admin metrics 的 by_credential 聚合）
             *last_credential_id = Some(ctx.id);
+            // 记入本请求已试集合:下一次 acquire 软排除它(失败重试不反复打同一个号)
+            tried.insert(ctx.id);
             // 聚合 metrics 标志：本次请求只要任一次 acquire 走到 fallback/wait 即整体标记
             if ctx.from_cooldown_fallback {
                 *used_fallback = true;
@@ -868,6 +874,9 @@ impl KiroProvider {
                         {
                             tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                             self.token_manager.release_inflight(ctx.id);
+                            // force-refresh 的本意是用新 token 重试**同一个号**,
+                            // 故从已试集合移除它,否则会被软排除选到别的号。
+                            tried.remove(&ctx.id);
                             continue;
                         }
                         tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);

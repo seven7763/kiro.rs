@@ -3,7 +3,20 @@
 use super::*;
 
 impl MultiTokenManager {
-    /// 获取 API 调用上下文
+    /// 获取 API 调用上下文（不排除任何凭据）。
+    ///
+    /// 大多数调用方用这个；需要在同一请求内排除已试过凭据的 retry 循环用
+    /// [`Self::acquire_context_excluding`]。
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
+        self.acquire_context_excluding(model, conversation_id, &HashSet::new())
+            .await
+    }
+
+    /// 获取 API 调用上下文，并软排除 `exclude` 中已试过的凭据。
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
     /// 确保整个 API 调用过程中使用一致的凭据信息
@@ -14,10 +27,13 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     /// - `conversation_id`: 可选的会话 ID，用于 sticky session 路由
-    pub async fn acquire_context(
+    /// - `exclude`: 本请求已试过的凭据 ID 集合。软排除——排除后无候选时自动忽略
+    ///   （见 [`Self::select_and_acquire_slot`]），保证不会因排除而饿死。
+    pub async fn acquire_context_excluding(
         &self,
         model: Option<&str>,
         conversation_id: Option<&str>,
+        exclude: &HashSet<u64>,
     ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -60,6 +76,8 @@ impl MultiTokenManager {
                                 && !e.disabled
                                 && !is_in_cooldown(e, Instant::now())
                                 && (!is_opus || e.credentials.supports_opus())
+                                // 已在本请求试过的号:快路径跳过,走 select 选别的
+                                && !exclude.contains(&e.id)
                         })
                         .map(|e| {
                             // 快路径也必须取并发 permit（acquire-or-degrade，只认这一个号），
@@ -78,7 +96,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，按策略选号并占用 inflight 槽
-                    let mut best = self.select_and_acquire_slot(model, conversation_id);
+                    let mut best = self.select_and_acquire_slot(model, conversation_id, exclude);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -97,7 +115,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_and_acquire_slot(model, conversation_id);
+                            best = self.select_and_acquire_slot(model, conversation_id, exclude);
                         }
                     }
 
