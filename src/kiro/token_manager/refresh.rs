@@ -400,6 +400,7 @@ impl MultiTokenManager {
                 token,
                 from_cooldown_fallback: false,
                 waited_for_cooldown: false,
+                concurrency_permit: None,
             });
         }
 
@@ -472,6 +473,7 @@ impl MultiTokenManager {
             token,
             from_cooldown_fallback: false,
             waited_for_cooldown: false,
+            concurrency_permit: None,
         })
     }
 

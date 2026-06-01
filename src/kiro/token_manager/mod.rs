@@ -67,12 +67,12 @@ struct CredentialEntry {
     directory_key: Option<String>,
     /// Per-credential 并发限制 semaphore（None = 不限制）
     ///
-    /// 非阻塞 try_acquire 模式：选号时调用 `sem.try_acquire_owned()`，
-    /// 成功则持有 permit，失败则跳过该号选下一个。
+    /// 非阻塞 try_acquire 模式：选号时调用 `sem.try_acquire_owned()`，成功则把
+    /// permit **移交给本次请求的 [`CallContext`]**（per-request 持有，请求结束 drop
+    /// 时自动释放），而非存回共享 entry——后者会在两个请求选中同一号时被覆盖、
+    /// 提前释放，导致 `max_inflight_per_credential` 被绕过。
     /// 防止单个凭据同时承受过多请求被 Kiro 风控。
     permit_semaphore: Option<Arc<Semaphore>>,
-    /// 当前持有的 per-credential 并发 permit（选号时 acquire，请求结束时 release）
-    concurrency_permit: Option<OwnedSemaphorePermit>,
 }
 
 /// 判断凭据当前是否处于冷却中
@@ -321,7 +321,6 @@ const DEFAULT_MAX_FALLBACK_WAIT_ATTEMPTS: u32 = 5;
 ///
 /// 绑定特定凭据的调用上下文，确保 token、credentials 和 id 的一致性
 /// 用于解决并发调用时 current_id 竞态问题
-#[derive(Clone)]
 pub struct CallContext {
     /// 凭据 ID（用于 report_success/report_failure）
     pub id: u64,
@@ -341,6 +340,13 @@ pub struct CallContext {
     /// 用于 metrics 观测：true 表示调度器为了避免 fallback 借号、主动 sleep
     /// 等到最早过期的号恢复后再返回（提供观测信号，与正确性无关）。
     pub waited_for_cooldown: bool,
+    /// 本次请求持有的 per-credential 并发 permit（per-request 所有权）。
+    ///
+    /// 选号时从该凭据的 `permit_semaphore` acquire 得到；`CallContext` 被 drop 时
+    /// permit 自动归还 semaphore，从而精确地把"在途请求数"约束在
+    /// `max_inflight_per_credential`。`None` 表示未配置限制或满载降级。
+    /// 字段顺序置于末尾，确保即便手工构造也不影响其余字段语义。
+    pub(crate) concurrency_permit: Option<OwnedSemaphorePermit>,
 }
 
 mod acquire;
@@ -429,7 +435,6 @@ impl MultiTokenManager {
                     cooldown_reason: None,
                     directory_key: None,
                     permit_semaphore: per_cred_semaphore.clone(),
-                    concurrency_permit: None,
                 }
             })
             .collect();
@@ -1930,5 +1935,64 @@ mod tests {
                 counts
             );
         }
+    }
+
+    /// 构造一个带有效（未过期）access_token 的凭据，避免 try_ensure_token 走网络刷新。
+    fn live_cred(token: &str) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.access_token = Some(token.to_string());
+        c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        c
+    }
+
+    /// 回归（审计 P0）：per-credential 并发 permit 移入 CallContext 后，
+    /// `max_inflight_per_credential` 必须被精确约束——同一凭据上同时存活的
+    /// 持 permit 上下文数不得超过上限。
+    ///
+    /// 旧实现把 permit 存进共享 `CredentialEntry.concurrency_permit`，第二个请求
+    /// 选中同一号时会覆盖并 drop 掉第一个 permit，导致上限被绕过。
+    #[tokio::test]
+    async fn permit_caps_concurrent_inflight_per_credential() {
+        let mut config = Config::default();
+        config.max_inflight_per_credential = Some(2);
+        // 单凭据：所有请求都落到它身上，便于观察并发上限
+        let manager =
+            MultiTokenManager::new(config, vec![live_cred("t1")], None, None, false).unwrap();
+
+        // 同时持有 3 个 ctx：前 2 个应拿到 permit，第 3 个应满载降级（permit=None）
+        let c1 = manager.acquire_context(None, None).await.unwrap();
+        let c2 = manager.acquire_context(None, None).await.unwrap();
+        let c3 = manager.acquire_context(None, None).await.unwrap();
+
+        let held = [&c1, &c2, &c3]
+            .iter()
+            .filter(|c| c.concurrency_permit.is_some())
+            .count();
+        assert_eq!(
+            held, 2,
+            "max_inflight_per_credential=2 时,同时存活的持 permit 上下文应恰为 2(第 3 个降级)"
+        );
+
+        // 释放一个持 permit 的 ctx 后,semaphore 腾出一个 slot,新请求应能再拿到 permit。
+        // （drop CallContext 即归还其 permit，与 inflight 计数无关）
+        drop(c1);
+        let c4 = manager.acquire_context(None, None).await.unwrap();
+        assert!(
+            c4.concurrency_permit.is_some(),
+            "释放一个 permit 后,新请求应能重新取得 permit"
+        );
+    }
+
+    /// 未配置 max_inflight_per_credential 时不应有任何 permit（不限并发）。
+    #[tokio::test]
+    async fn no_permit_when_limit_unset() {
+        let config = Config::default(); // max_inflight_per_credential = None
+        let manager =
+            MultiTokenManager::new(config, vec![live_cred("t1")], None, None, false).unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        assert!(
+            ctx.concurrency_permit.is_none(),
+            "未配置并发上限时 permit 应为 None(不限并发)"
+        );
     }
 }

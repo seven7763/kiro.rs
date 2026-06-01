@@ -37,7 +37,7 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials, from_fallback) = {
+            let (id, credentials, from_fallback, permit) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 // balanced 模式：原子地"选号 + inflight +1"，让并发请求分发到不同号
@@ -62,9 +62,15 @@ impl MultiTokenManager {
                                 && (!is_opus || e.credentials.supports_opus())
                         })
                         .map(|e| {
+                            // 快路径也必须取并发 permit（acquire-or-degrade，只认这一个号），
+                            // 否则 priority 模式下该路径会完全绕过 max_inflight_per_credential。
+                            let permit = e
+                                .permit_semaphore
+                                .as_ref()
+                                .and_then(|sem| sem.clone().try_acquire_owned().ok());
                             e.inflight = e.inflight.saturating_add(1);
                             // current_id 直接命中且不在 cooldown：非 fallback 路径
-                            (e.id, e.credentials.clone(), false)
+                            (e.id, e.credentials.clone(), false, permit)
                         })
                 };
 
@@ -99,7 +105,7 @@ impl MultiTokenManager {
                     // 释放 slot、sleep 到过期 + 50ms 缓冲、重新 select。
                     // 至多重复 max_wait_attempts 轮，避免饥饿。
                     let wait_target = if fallback_wait_count < max_wait_attempts {
-                        best.as_ref().and_then(|(tmp_id, _, fb, until)| {
+                        best.as_ref().and_then(|(tmp_id, _, fb, until, _)| {
                             if *fb {
                                 until.map(|u| (*tmp_id, u))
                             } else {
@@ -115,6 +121,9 @@ impl MultiTokenManager {
                             let wait = until.saturating_duration_since(now);
                             if wait <= max_wait_per_round {
                                 fallback_wait_count = fallback_wait_count.saturating_add(1);
+                                // 先 drop best（释放刚取得的并发 permit），再归还 inflight，
+                                // 这样 sleep 后重新 select 时该号 permit 已可用。
+                                best = None;
                                 self.release_inflight(tmp_id);
                                 let total_wait = wait + StdDuration::from_millis(50);
                                 tracing::info!(
@@ -131,11 +140,11 @@ impl MultiTokenManager {
                         }
                     }
 
-                    if let Some((new_id, new_creds, from_fb, _)) = best {
+                    if let Some((new_id, new_creds, from_fb, _, permit)) = best {
                         // 更新 current_id
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
-                        (new_id, new_creds, from_fb)
+                        (new_id, new_creds, from_fb, permit)
                     } else {
                         let entries = self.entries.lock();
                         // 注意：必须在 bail! 之前计算 available_count，
@@ -152,11 +161,16 @@ impl MultiTokenManager {
                 Ok(mut ctx) => {
                     ctx.from_cooldown_fallback = from_fallback;
                     ctx.waited_for_cooldown = fallback_wait_count > 0;
+                    // 把并发 permit 移交本次请求上下文：请求结束 drop ctx 时自动归还 semaphore
+                    ctx.concurrency_permit = permit;
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    // 刷新失败：归还 inflight 槽（这次没产生真实请求）
+                    // 刷新失败：先归还 inflight 槽（这次没产生真实请求），
+                    // 再立即 drop permit 释放并发 slot——否则下一轮 select 在单号池上
+                    // 可能误判该号满载。
                     self.release_inflight(id);
+                    drop(permit);
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);

@@ -427,7 +427,6 @@ impl MultiTokenManager {
                 cooldown_reason: None,
                 directory_key: None,
                 permit_semaphore: per_cred_sem,
-                concurrency_permit: None,
             });
         }
 

@@ -101,7 +101,6 @@ impl MultiTokenManager {
                 let effective_directory_key = {
                     let entry = &mut entries[idx];
                     entry.inflight = entry.inflight.saturating_sub(1);
-                    entry.concurrency_permit = None;
                     entry.transient_failure_count =
                         entry.transient_failure_count.saturating_add(1);
                     entry.last_transient_failure_at = Some(now_rfc);
@@ -214,7 +213,6 @@ impl MultiTokenManager {
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 entry.inflight = entry.inflight.saturating_sub(1);
-                entry.concurrency_permit = None;
                 // 成功调用证明上游对该号已恢复，立即解除冷却
                 entry.cooldown_until = None;
                 entry.cooldown_reason = None;
@@ -248,7 +246,6 @@ impl MultiTokenManager {
 
             // 释放 inflight 槽（请求已结束）
             entry.inflight = entry.inflight.saturating_sub(1);
-            entry.concurrency_permit = None;
 
             if entry.disabled {
                 return entries.iter().any(|e| !e.disabled);
@@ -311,7 +308,6 @@ impl MultiTokenManager {
 
             // 释放 inflight 槽（请求已结束）
             entry.inflight = entry.inflight.saturating_sub(1);
-            entry.concurrency_permit = None;
 
             if entry.disabled {
                 return entries.iter().any(|e| !e.disabled);
