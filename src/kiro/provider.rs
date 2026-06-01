@@ -447,9 +447,9 @@ impl KiroProvider {
         let model = Self::extract_model_from_request(request_body);
         let result = match timeout(
             Duration::from_secs(REQUEST_TOTAL_TIMEOUT_SECS),
-            self.call_api_with_retry(
+            self.call_with_retry(
                 request_body,
-                false,
+                CallKind::Api { is_stream: false },
                 &mut used_fallback,
                 &mut waited,
                 &mut last_cred_id,
@@ -500,9 +500,9 @@ impl KiroProvider {
         let model = Self::extract_model_from_request(request_body);
         let result = match timeout(
             Duration::from_secs(REQUEST_TOTAL_TIMEOUT_SECS),
-            self.call_api_with_retry(
+            self.call_with_retry(
                 request_body,
-                true,
+                CallKind::Api { is_stream: true },
                 &mut used_fallback,
                 &mut waited,
                 &mut last_cred_id,
@@ -547,8 +547,9 @@ impl KiroProvider {
         let mut last_cred_id: Option<u64> = None;
         let result = match timeout(
             Duration::from_secs(REQUEST_TOTAL_TIMEOUT_SECS),
-            self.call_mcp_with_retry(
+            self.call_with_retry(
                 request_body,
+                CallKind::Mcp,
                 &mut used_fallback,
                 &mut waited,
                 &mut last_cred_id,
@@ -674,235 +675,18 @@ impl KiroProvider {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("ListAvailableModels: 无可用凭据")))
     }
 
-    /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(
-        &self,
-        request_body: &str,
-        used_fallback: &mut bool,
-        waited: &mut bool,
-        last_credential_id: &mut Option<u64>,
-    ) -> anyhow::Result<reqwest::Response> {
-        let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
-        let mut last_error: Option<anyhow::Error> = None;
-        let mut force_refreshed: HashSet<u64> = HashSet::new();
-
-        for attempt in 0..max_retries {
-            // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None, None).await {
-                Ok(c) => c,
-                Err(e) => {
-                    last_error = Some(e);
-                    continue;
-                }
-            };
-            // 跟踪本次请求最后命中的凭据 ID（用于 admin metrics 的 by_credential 聚合）
-            *last_credential_id = Some(ctx.id);
-            // 聚合 metrics 标志：本次请求过程中只要任何一次 acquire 走到 fallback/wait，
-            // 整个请求就标记为 fallback/wait（语义"端到端是否经历过此分支"）
-            if ctx.from_cooldown_fallback {
-                *used_fallback = true;
-            }
-            if ctx.waited_for_cooldown {
-                *waited = true;
-            }
-
-            let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
-
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
-                Ok(e) => e,
-                Err(e) => {
-                    last_error = Some(e);
-                    // endpoint 解析失败：记为失败，换下一张凭据
-                    self.token_manager.report_failure(ctx.id);
-                    continue;
-                }
-            };
-
-            let rctx = RequestContext {
-                credentials: &ctx.credentials,
-                token: &ctx.token,
-                machine_id: &machine_id,
-                config,
-            };
-
-            let url = endpoint.mcp_url(&rctx);
-            let body = endpoint.transform_mcp_body(request_body, &rctx);
-
-            let base = self
-                .client_for_attempt(&ctx.credentials, attempt)?
-                .post(&url)
-                .body(body)
-                .header("content-type", "application/json");
-            let request = endpoint.decorate_mcp(base, &rctx);
-
-            let response = match request.send().await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::warn!(
-                        "MCP 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
-                        max_retries,
-                        e
-                    );
-                    self.token_manager.release_inflight(ctx.id);
-                    last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt, RetryReason::Network)).await;
-                    }
-                    continue;
-                }
-            };
-
-            let status = response.status();
-
-            // 成功响应
-            if status.is_success() {
-                self.token_manager.report_success(ctx.id);
-                return Ok(response);
-            }
-
-            // 在消费 body 前先抓 Retry-After 头（response.text() 会消费 response）
-            let retry_after = parse_retry_after(response.headers());
-
-            // 失败响应
-            let body = response.text().await.unwrap_or_default();
-
-            // 402 额度用尽（永久禁用）
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
-                if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
-                }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                continue;
-            }
-
-            // 402 + OVERAGE_REQUEST_LIMIT_EXCEEDED：开启 overage 后短窗口速率上限
-            // 进入较长 cooldown 等待 hour/day 窗口刷新，**不**禁用凭据
-            if status.as_u16() == 402 && endpoint.is_overage_request_limit(&body) {
-                tracing::warn!(
-                    "MCP 请求失败（OVERAGE 速率上限，凭据进入 cooldown 等待窗口刷新，尝试 {}/{}）: {}",
-                    attempt + 1,
-                    max_retries,
-                    body
-                );
-                self.token_manager.report_transient_failure(
-                    ctx.id,
-                    TransientFailureKind::OverageRequestLimit,
-                    retry_after,
-                    ctx.from_cooldown_fallback,
-                );
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt, RetryReason::SwitchCredential)).await;
-                }
-                continue;
-            }
-
-            // 400 Bad Request
-            if status.as_u16() == 400 {
-                self.token_manager.release_inflight(ctx.id);
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
-            }
-
-            // 401/403 凭据问题
-            if matches!(status.as_u16(), 401 | 403) {
-                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
-                    force_refreshed.insert(ctx.id);
-                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self
-                        .token_manager
-                        .force_refresh_token_for(ctx.id)
-                        .await
-                        .is_ok()
-                    {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
-                        self.token_manager.release_inflight(ctx.id);
-                        continue;
-                    }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
-                }
-
-                let has_available = self.token_manager.report_failure(ctx.id);
-                if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
-                }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                continue;
-            }
-
-            // 瞬态错误：把该号放入短期 cooldown，下一轮 acquire 自动绕过
-            // 5xx 不禁用凭据（仅 cooldown），避免上游短暂抖动导致全号池被误禁用
-            // （参考 kiro2cc-proxy: "avoid cascade lock-out during upstream instability"）
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
-                tracing::warn!(
-                    "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
-                let kind = if status.as_u16() == 429 {
-                    TransientFailureKind::classify_429(&body)
-                } else {
-                    TransientFailureKind::from_status(status.as_u16())
-                };
-                let directory_key = if matches!(kind, TransientFailureKind::SuspiciousActivity) {
-                    extract_suspicious_directory_key(&body)
-                } else {
-                    None
-                };
-                self.token_manager.report_transient_failure_with_directory(
-                    ctx.id,
-                    kind,
-                    retry_after,
-                    ctx.from_cooldown_fallback,
-                    directory_key.as_deref(),
-                );
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt, RetryReason::SwitchCredential)).await;
-                }
-                continue;
-            }
-
-            // 其他 4xx
-            if status.is_client_error() {
-                self.token_manager.release_inflight(ctx.id);
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
-            }
-
-            // 兜底：未知错误归类为上游瞬态，进入短期 cooldown
-            self.token_manager.report_transient_failure(
-                ctx.id,
-                TransientFailureKind::UpstreamError,
-                retry_after,
-                ctx.from_cooldown_fallback,
-            );
-            last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-            if attempt + 1 < max_retries {
-                sleep(Self::retry_delay(attempt, RetryReason::SwitchCredential)).await;
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!("MCP 请求失败：已达到最大重试次数（{}次）", max_retries)
-        }))
-    }
-
-    /// 内部方法：带重试逻辑的 API 调用
+    /// 内部方法：带重试逻辑的上游调用（API 流式/非流式 与 MCP 共用一套重试引擎）
     ///
     /// 重试策略：
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
-    /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
-    /// - 硬上限 9 次，避免无限重试
-    async fn call_api_with_retry(
+    /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)，硬上限 9 次
+    ///
+    /// API 与 MCP 的差异由 [`CallKind`] 封装：acquire 过滤参数、URL/body/装饰、
+    /// 成功后是否绑定 conversation、错误前缀。错误分类走纯函数 [`classify_failure`]。
+    async fn call_with_retry(
         &self,
         request_body: &str,
-        is_stream: bool,
+        kind: CallKind,
         used_fallback: &mut bool,
         waited: &mut bool,
         last_credential_id: &mut Option<u64>,
@@ -911,15 +695,19 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
-        let api_type = if is_stream { "流式" } else { "非流式" };
+        let label = kind.label(); // 错误信息前缀：如 "流式 API" / "非流式 API" / "MCP"
+        let tag = kind.tag(); // 发送失败日志短标：如 "API" / "MCP"
 
-        // 尝试从请求体中提取模型信息
-        let model = Self::extract_model_from_request(request_body);
-        // 提取 conversation_id 用于 sticky session 路由
-        let conversation_id = Self::extract_conversation_id(request_body);
+        // 仅 API 调用按模型过滤凭据 + sticky 路由；MCP 不涉及模型选择
+        let (model, conversation_id) = match kind {
+            CallKind::Api { .. } => (
+                Self::extract_model_from_request(request_body),
+                Self::extract_conversation_id(request_body),
+            ),
+            CallKind::Mcp => (None, None),
+        };
 
         for attempt in 0..max_retries {
-            // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
                 .token_manager
                 .acquire_context(model.as_deref(), conversation_id.as_deref())
@@ -931,9 +719,9 @@ impl KiroProvider {
                     continue;
                 }
             };
-            // 跟踪最后命中的凭据 ID
+            // 跟踪本次请求最后命中的凭据 ID（用于 admin metrics 的 by_credential 聚合）
             *last_credential_id = Some(ctx.id);
-            // 聚合 metrics 标志（端到端是否经历过 fallback / wait）
+            // 聚合 metrics 标志：本次请求只要任一次 acquire 走到 fallback/wait 即整体标记
             if ctx.from_cooldown_fallback {
                 *used_fallback = true;
             }
@@ -960,27 +748,39 @@ impl KiroProvider {
                 config,
             };
 
-            let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            // URL / body / 装饰按 API vs MCP 分流（唯一的请求构造差异点）
+            let (url, body) = match kind {
+                CallKind::Api { .. } => (
+                    endpoint.api_url(&rctx),
+                    endpoint.transform_api_body(request_body, &rctx),
+                ),
+                CallKind::Mcp => (
+                    endpoint.mcp_url(&rctx),
+                    endpoint.transform_mcp_body(request_body, &rctx),
+                ),
+            };
 
             let base = self
                 .client_for_attempt(&ctx.credentials, attempt)?
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json");
-            let request = endpoint.decorate_api(base, &rctx);
+            let request = match kind {
+                CallKind::Api { .. } => endpoint.decorate_api(base, &rctx),
+                CallKind::Mcp => endpoint.decorate_mcp(base, &rctx),
+            };
 
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
+                        "{} 请求发送失败（尝试 {}/{}）: {}",
+                        tag,
                         attempt + 1,
                         max_retries,
                         e
                     );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                    // 网络错误是上游/链路瞬态问题，不禁用/不切号，仅指数退避后重试
                     self.token_manager.release_inflight(ctx.id);
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
@@ -995,206 +795,155 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                // 绑定 conversation_id 到该凭据（sticky session）
+                // 仅 API 调用绑定 conversation_id 到该凭据（sticky session）
                 if let Some(ref cid) = conversation_id {
                     self.token_manager.bind_conversation(cid, ctx.id);
                 }
                 return Ok(response);
             }
 
-            // 在消费 body 前先抓 Retry-After 头
+            // 在消费 body 前先抓 Retry-After 头（response.text() 会消费 response）
             let retry_after = parse_retry_after(response.headers());
-
-            // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+            let err = || anyhow::anyhow!("{} 请求失败: {} {}", label, status, body);
 
-            // 402 Payment Required 且月度配额永久耗尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
-                tracing::warn!(
-                    "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
-
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
-                if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
+            match classify_failure(status, &body, endpoint.as_ref()) {
+                FailureAction::QuotaExhausted => {
+                    tracing::warn!(
+                        "{} 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
+                        label,
+                        attempt + 1,
+                        max_retries,
                         status,
                         body
                     );
-                }
-
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
-                continue;
-            }
-
-            // 402 + OVERAGE_REQUEST_LIMIT_EXCEEDED：开启 overage 后短窗口速率上限
-            // 凭据进入较长 cooldown 等待 hour/day 窗口刷新，**不**禁用
-            if status.as_u16() == 402 && endpoint.is_overage_request_limit(&body) {
-                tracing::warn!(
-                    "API 请求失败（OVERAGE 速率上限，凭据进入 cooldown 等待窗口刷新，尝试 {}/{}）: {}",
-                    attempt + 1,
-                    max_retries,
-                    body
-                );
-                self.token_manager.report_transient_failure(
-                    ctx.id,
-                    TransientFailureKind::OverageRequestLimit,
-                    retry_after,
-                    ctx.from_cooldown_fallback,
-                );
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
-                if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt, RetryReason::SwitchCredential)).await;
-                }
-                continue;
-            }
-
-            // 400 Bad Request - 请求问题，重试/切换凭据无意义
-            if status.as_u16() == 400 {
-                self.token_manager.release_inflight(ctx.id);
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
-            }
-
-            // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
-            if matches!(status.as_u16(), 401 | 403) {
-                tracing::warn!(
-                    "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
-
-                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
-                    force_refreshed.insert(ctx.id);
-                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self
-                        .token_manager
-                        .force_refresh_token_for(ctx.id)
-                        .await
-                        .is_ok()
-                    {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
-                        self.token_manager.release_inflight(ctx.id);
-                        continue;
+                    let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                    if !has_available {
+                        anyhow::bail!("{} 请求失败（所有凭据已用尽）: {} {}", label, status, body);
                     }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                    last_error = Some(err());
+                    continue;
                 }
-
-                let has_available = self.token_manager.report_failure(ctx.id);
-                if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
+                FailureAction::OverageRateLimit => {
+                    tracing::warn!(
+                        "{} 请求失败（OVERAGE 速率上限，凭据进入 cooldown 等待窗口刷新，尝试 {}/{}）: {}",
+                        label,
+                        attempt + 1,
+                        max_retries,
+                        body
+                    );
+                    self.token_manager.report_transient_failure(
+                        ctx.id,
+                        TransientFailureKind::OverageRequestLimit,
+                        retry_after,
+                        ctx.from_cooldown_fallback,
+                    );
+                    last_error = Some(err());
+                    if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt, RetryReason::SwitchCredential)).await;
+                    }
+                    continue;
+                }
+                FailureAction::BadRequest => {
+                    self.token_manager.release_inflight(ctx.id);
+                    anyhow::bail!("{} 请求失败: {} {}", label, status, body);
+                }
+                FailureAction::AuthError => {
+                    tracing::warn!(
+                        "{} 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
+                        label,
+                        attempt + 1,
+                        max_retries,
                         status,
                         body
                     );
+                    // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                    if endpoint.is_bearer_token_invalid(&body)
+                        && !force_refreshed.contains(&ctx.id)
+                    {
+                        force_refreshed.insert(ctx.id);
+                        tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
+                        if self
+                            .token_manager
+                            .force_refresh_token_for(ctx.id)
+                            .await
+                            .is_ok()
+                        {
+                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                            self.token_manager.release_inflight(ctx.id);
+                            continue;
+                        }
+                        tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                    }
+                    let has_available = self.token_manager.report_failure(ctx.id);
+                    if !has_available {
+                        anyhow::bail!("{} 请求失败（所有凭据已用尽）: {} {}", label, status, body);
+                    }
+                    last_error = Some(err());
+                    continue;
                 }
-
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
-                continue;
-            }
-
-            // 429/408/5xx - 瞬态上游错误：把该凭据放入短期 cooldown，retry 自动选其他号
-            // （避免 retry 全打到同一个被限号上）。不禁用凭据，cooldown 过期自动恢复。
-            // 5xx 不禁用凭据（仅 cooldown），避免上游短暂抖动导致全号池被误禁用
-            // （参考 kiro2cc-proxy: "avoid cascade lock-out during upstream instability"）
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
-                tracing::warn!(
-                    "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
-                let kind = if status.as_u16() == 429 {
-                    TransientFailureKind::classify_429(&body)
-                } else {
-                    TransientFailureKind::from_status(status.as_u16())
-                };
-                let directory_key = if matches!(kind, TransientFailureKind::SuspiciousActivity) {
-                    extract_suspicious_directory_key(&body)
-                } else {
-                    None
-                };
-                self.token_manager.report_transient_failure_with_directory(
-                    ctx.id,
-                    kind,
-                    retry_after,
-                    ctx.from_cooldown_fallback,
-                    directory_key.as_deref(),
-                );
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
-                if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt, RetryReason::SwitchCredential)).await;
+                FailureAction::Transient => {
+                    tracing::warn!(
+                        "{} 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
+                        label,
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    let kind_t = if status.as_u16() == 429 {
+                        TransientFailureKind::classify_429(&body)
+                    } else {
+                        TransientFailureKind::from_status(status.as_u16())
+                    };
+                    let directory_key =
+                        if matches!(kind_t, TransientFailureKind::SuspiciousActivity) {
+                            extract_suspicious_directory_key(&body)
+                        } else {
+                            None
+                        };
+                    self.token_manager.report_transient_failure_with_directory(
+                        ctx.id,
+                        kind_t,
+                        retry_after,
+                        ctx.from_cooldown_fallback,
+                        directory_key.as_deref(),
+                    );
+                    last_error = Some(err());
+                    if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt, RetryReason::SwitchCredential)).await;
+                    }
+                    continue;
                 }
-                continue;
-            }
-
-            // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
-            if status.is_client_error() {
-                self.token_manager.release_inflight(ctx.id);
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
-            }
-
-            // 兜底：未知错误归类为上游瞬态，进入短期 cooldown（不切换凭据）
-            tracing::warn!(
-                "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
-                attempt + 1,
-                max_retries,
-                status,
-                body
-            );
-            self.token_manager.report_transient_failure(
-                ctx.id,
-                TransientFailureKind::UpstreamError,
-                retry_after,
-                ctx.from_cooldown_fallback,
-            );
-            last_error = Some(anyhow::anyhow!(
-                "{} API 请求失败: {} {}",
-                api_type,
-                status,
-                body
-            ));
-            if attempt + 1 < max_retries {
-                sleep(Self::retry_delay(attempt, RetryReason::SwitchCredential)).await;
+                FailureAction::OtherClientError => {
+                    self.token_manager.release_inflight(ctx.id);
+                    anyhow::bail!("{} 请求失败: {} {}", label, status, body);
+                }
+                FailureAction::UnknownUpstream => {
+                    tracing::warn!(
+                        "{} 请求失败（未知错误，尝试 {}/{}）: {} {}",
+                        label,
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    self.token_manager.report_transient_failure(
+                        ctx.id,
+                        TransientFailureKind::UpstreamError,
+                        retry_after,
+                        ctx.from_cooldown_fallback,
+                    );
+                    last_error = Some(err());
+                    if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt, RetryReason::SwitchCredential)).await;
+                    }
+                }
             }
         }
 
-        // 所有重试都失败
         Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!(
-                "{} API 请求失败：已达到最大重试次数（{}次）",
-                api_type,
-                max_retries
-            )
+            anyhow::anyhow!("{} 请求失败：已达到最大重试次数（{}次）", label, max_retries)
         }))
     }
 
@@ -1267,6 +1016,157 @@ pub(crate) enum RetryReason {
     SwitchCredential,
     /// 网络层错误（连接失败/超时），可能是链路抖动 → 指数退避
     Network,
+}
+
+/// 上游调用类型，封装 API 与 MCP 两条路径在 `call_with_retry` 中的差异。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallKind {
+    /// `/v1/messages` 类 API 调用；`is_stream` 仅影响错误信息前缀与可观测口径
+    Api { is_stream: bool },
+    /// MCP 工具调用（WebSearch 等），不涉及模型选择 / sticky 路由
+    Mcp,
+}
+
+impl CallKind {
+    /// 错误信息前缀（保持与历史循环逐字一致：流式/非流式 API、MCP）
+    fn label(self) -> &'static str {
+        match self {
+            CallKind::Api { is_stream: true } => "流式 API",
+            CallKind::Api { is_stream: false } => "非流式 API",
+            CallKind::Mcp => "MCP",
+        }
+    }
+
+    /// 发送失败日志短标
+    fn tag(self) -> &'static str {
+        match self {
+            CallKind::Api { .. } => "API",
+            CallKind::Mcp => "MCP",
+        }
+    }
+}
+
+/// 上游失败响应（非 2xx）经分类后得出的处置动作。
+///
+/// 这是 API 与 MCP 两条重试循环**完全一致**的错误分类逻辑，抽成纯函数
+/// [`classify_failure`] 以便单测覆盖（历史上两条循环各自内联一份，易漂移）。
+/// 副作用（report_*、release_inflight、force_refresh、sleep、bail）仍由循环执行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureAction {
+    /// 402 + 月度配额永久耗尽：禁用凭据并故障转移（report_quota_exhausted）
+    QuotaExhausted,
+    /// 402 + OVERAGE 速率上限：进入较长 cooldown 等窗口刷新，不禁用
+    OverageRateLimit,
+    /// 400：请求本身有问题，重试/换号无意义，直接 bail
+    BadRequest,
+    /// 401/403：凭据/权限问题，先尝试 force-refresh（每号一次），否则计失败故障转移
+    AuthError,
+    /// 408/429/5xx：上游瞬态错误，凭据进短期 cooldown，下一轮自动绕过
+    Transient,
+    /// 其他 4xx：通常为请求/配置问题，直接 bail，不计凭据失败
+    OtherClientError,
+    /// 兜底未知（非 4xx/5xx 的异常 status）：归类为上游瞬态
+    UnknownUpstream,
+}
+
+/// 把一个失败的上游响应（status + body）分类成 [`FailureAction`]。
+///
+/// 纯函数：不触碰 token_manager、不产生副作用，便于单测。`endpoint` 仅用于
+/// body 语义判别（is_monthly/overage/bearer-invalid）。
+pub(crate) fn classify_failure(
+    status: reqwest::StatusCode,
+    body: &str,
+    endpoint: &dyn KiroEndpoint,
+) -> FailureAction {
+    let code = status.as_u16();
+    if code == 402 && endpoint.is_monthly_request_limit(body) {
+        return FailureAction::QuotaExhausted;
+    }
+    if code == 402 && endpoint.is_overage_request_limit(body) {
+        return FailureAction::OverageRateLimit;
+    }
+    if code == 400 {
+        return FailureAction::BadRequest;
+    }
+    if matches!(code, 401 | 403) {
+        return FailureAction::AuthError;
+    }
+    if matches!(code, 408 | 429) || status.is_server_error() {
+        return FailureAction::Transient;
+    }
+    if status.is_client_error() {
+        return FailureAction::OtherClientError;
+    }
+    FailureAction::UnknownUpstream
+}
+
+#[cfg(test)]
+mod classify_failure_tests {
+    use super::*;
+    use crate::kiro::endpoint::IdeEndpoint;
+    use reqwest::StatusCode;
+
+    fn act(code: u16, body: &str) -> FailureAction {
+        let ep = IdeEndpoint::new();
+        classify_failure(StatusCode::from_u16(code).unwrap(), body, &ep)
+    }
+
+    #[test]
+    fn classifies_402_monthly_as_quota_exhausted() {
+        assert_eq!(
+            act(402, r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#),
+            FailureAction::QuotaExhausted
+        );
+    }
+
+    #[test]
+    fn classifies_402_overage_as_overage_rate_limit() {
+        assert_eq!(
+            act(402, "OVERAGE_REQUEST_LIMIT_EXCEEDED"),
+            FailureAction::OverageRateLimit
+        );
+    }
+
+    #[test]
+    fn classifies_402_without_marker_as_other_client_error() {
+        // 402 但既非月度也非 overage：落到其他 4xx，直接 bail（不计凭据失败）
+        assert_eq!(act(402, "something else"), FailureAction::OtherClientError);
+    }
+
+    #[test]
+    fn classifies_400_as_bad_request() {
+        assert_eq!(act(400, "bad"), FailureAction::BadRequest);
+    }
+
+    #[test]
+    fn classifies_401_403_as_auth_error() {
+        assert_eq!(act(401, "nope"), FailureAction::AuthError);
+        assert_eq!(act(403, "nope"), FailureAction::AuthError);
+    }
+
+    #[test]
+    fn classifies_408_429_5xx_as_transient() {
+        assert_eq!(act(408, ""), FailureAction::Transient);
+        assert_eq!(act(429, "Too Many Requests"), FailureAction::Transient);
+        assert_eq!(act(500, ""), FailureAction::Transient);
+        assert_eq!(act(502, ""), FailureAction::Transient);
+        assert_eq!(act(503, ""), FailureAction::Transient);
+    }
+
+    #[test]
+    fn classifies_other_4xx_as_other_client_error() {
+        assert_eq!(act(404, ""), FailureAction::OtherClientError);
+        assert_eq!(act(418, ""), FailureAction::OtherClientError);
+    }
+
+    #[test]
+    fn monthly_marker_takes_precedence_over_overage_at_402() {
+        // 同时含两种标记时，月度永久耗尽优先（与原循环 if 顺序一致）
+        assert_eq!(
+            act(402, "MONTHLY_REQUEST_COUNT OVERAGE_REQUEST_LIMIT_EXCEEDED"),
+            FailureAction::QuotaExhausted
+        );
+    }
 }
 
 #[cfg(test)]
