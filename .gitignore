@@ -15,3 +15,4 @@
 /admin-ui/package-lock.json
 /.pentest/
 .DS_Store
+/.claude/
