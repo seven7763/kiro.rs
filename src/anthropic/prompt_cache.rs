@@ -652,6 +652,54 @@ fn hash_chunk(hasher: &mut Sha256, chunk: &str) {
     hasher.update(b"\0");
 }
 
+/// 把 JSON 值序列化成**键序规范化**(对象 key 递归字典序排序)的字符串,用于指纹。
+///
+/// 为什么必须规范化:本 crate 的 serde_json 开启了 `preserve_order` feature,
+/// `Value::Object` 保留**传入的 key 顺序**。客户端/网关(new2api 是 Go,跨进程
+/// 反序列化-再序列化会改变 key 顺序)每请求送来的 `input_schema` / tool_use.input /
+/// tool_result 等对象 key 顺序可能不同 → 同一内容 `.to_string()` 出不同字节 →
+/// 指纹漂移 → 累积链全毒化 → 每个断点都 MISS(线上实测 matched_bp 恒 None)。
+///
+/// 排序后键序与传入无关,相同内容必得相同指纹。对齐 chaogei/Quorinex 的
+/// `canonicalize` / `writeCanonicalJSON`(它们正是靠这个稳定命中)。
+fn canonical_json(value: &serde_json::Value) -> String {
+    let mut buf = String::new();
+    write_canonical(&mut buf, value);
+    buf
+}
+
+fn write_canonical(buf: &mut String, v: &serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            buf.push('{');
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    buf.push(',');
+                }
+                // key 本身按 JSON 字符串转义
+                buf.push_str(&serde_json::Value::String((*k).clone()).to_string());
+                buf.push(':');
+                write_canonical(buf, &map[*k]);
+            }
+            buf.push('}');
+        }
+        serde_json::Value::Array(arr) => {
+            buf.push('[');
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    buf.push(',');
+                }
+                write_canonical(buf, item);
+            }
+            buf.push(']');
+        }
+        // 标量(string/number/bool/null)无 key 顺序问题,直接用 serde 标准序列化
+        other => buf.push_str(&other.to_string()),
+    }
+}
+
 /// 从 MessagesRequest 构建缓存 profile。无任何 cache_control 标记时返回 None。
 pub fn build_profile_from_request(
     payload: &super::types::MessagesRequest,
@@ -738,13 +786,14 @@ fn flatten_cache_blocks(payload: &super::types::MessagesRequest) -> Vec<Cacheabl
     // tools
     if let Some(tools) = payload.tools.as_ref() {
         for tool in tools {
-            let value = serde_json::json!({
+            // 键序规范化:input_schema 是客户端送来的任意对象,key 顺序可能每请求不同
+            // （preserve_order 会原样保留）。规范化后同一 schema 必得同一指纹。
+            let value = canonical_json(&serde_json::json!({
                 "kind": "tool",
                 "name": tool.name,
                 "description": tool.description,
                 "input_schema": tool.input_schema,
-            })
-            .to_string();
+            }));
             let tokens = super::token_count::count_tokens(&value) as i32;
             blocks.push(CacheableBlock {
                 value,
@@ -837,16 +886,18 @@ fn flatten_message_blocks(
     }
 }
 
-/// 返回去掉 `cache_control` 字段后的 block 序列化字符串，用于稳定 fingerprint。
-/// 非 object 或无 cache_control 时直接返回原序列化。
+/// 返回去掉 `cache_control` 字段后的 block **键序规范化**序列化字符串,用于稳定
+/// fingerprint。键序规范化原因见 [`canonical_json`]:message block(tool_use.input /
+/// tool_result content 等)的对象 key 顺序经网关可能每请求漂移,不规范化会让相同
+/// 历史 message 在不同轮指纹不同 → 永远 MISS。非 object 也走规范化(标量原样)。
 fn strip_cache_control(block: &serde_json::Value) -> String {
     match block.as_object() {
         Some(obj) if obj.contains_key("cache_control") => {
             let mut cloned = obj.clone();
             cloned.remove("cache_control");
-            serde_json::Value::Object(cloned).to_string()
+            canonical_json(&serde_json::Value::Object(cloned))
         }
-        _ => block.to_string(),
+        _ => canonical_json(block),
     }
 }
 
@@ -973,6 +1024,84 @@ mod tests {
     /// 构造一个 token 数足够大（≥1024）的文本
     fn big_text(repeat: usize) -> String {
         "word ".repeat(repeat)
+    }
+
+    /// 回归(线上根因):`input_schema` 是 `HashMap<String,Value>`,Rust HashMap
+    /// **每个实例随机迭代序**。即便客户端每次送来完全相同的 schema,每请求反序列化成
+    /// 新 HashMap → `.to_string()` 出不同 key 顺序 → tool 指纹每请求漂移 → 累积链
+    /// 毒化 → 所有断点 MISS(线上实测 matched_bp 恒 None,即便 name/desc/系统都稳定)。
+    /// canonical_json 排序 key 后,无论 HashMap 迭代序如何,相同 schema 必得相同指纹。
+    #[test]
+    fn tool_input_schema_key_order_does_not_drift_fingerprint() {
+        let big = big_text(5000);
+        // 两次独立从 JSON 反序列化(input_schema → 两个不同随机种子的 HashMap),
+        // 且源 JSON key 顺序也不同 —— 模拟跨请求的真实情况。
+        let parse = |schema_json: serde_json::Value| -> MessagesRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "system": [{"text": big, "cache_control": {"type": "ephemeral"}}],
+                "tools": [{
+                    "name": "edit",
+                    "description": "edit a file",
+                    "input_schema": schema_json
+                }],
+                "messages": []
+            }))
+            .unwrap()
+        };
+        let a = parse(serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"]
+        }));
+        let b = parse(serde_json::json!({
+            "required": ["path", "content"],
+            "properties": {"content": {"type": "string"}, "path": {"type": "string"}},
+            "type": "object"
+        }));
+        let fa = build_profile_from_request(&a, 5000).unwrap();
+        let fb = build_profile_from_request(&b, 5000).unwrap();
+        assert_eq!(
+            fa.stable_fingerprint, fb.stable_fingerprint,
+            "input_schema key 顺序/HashMap 迭代序不同但内容相同,规范化后指纹必须一致"
+        );
+        assert_eq!(
+            fa.breakpoints.last().unwrap().fingerprint,
+            fb.breakpoints.last().unwrap().fingerprint,
+            "末断点指纹也必须一致(累积链不被 key 顺序毒化)"
+        );
+    }
+
+    /// message block 的 key 顺序漂移(tool_use.input 等)同样不能破坏 prefix 命中。
+    #[test]
+    fn message_block_key_order_does_not_drift_fingerprint() {
+        let ctx = big_text(6000);
+        let mk = |blk: serde_json::Value| {
+            mk_request(
+                None,
+                vec![Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([blk]),
+                }],
+            )
+        };
+        let a = mk(serde_json::json!({
+            "type": "tool_result", "tool_use_id": "x", "content": ctx,
+            "cache_control": {"type": "ephemeral"}
+        }));
+        // 同内容,object key 顺序打乱
+        let b = mk(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "content": ctx, "tool_use_id": "x", "type": "tool_result"
+        }));
+        let fa = build_profile_from_request(&a, 6000).unwrap();
+        let fb = build_profile_from_request(&b, 6000).unwrap();
+        assert_eq!(
+            fa.breakpoints.last().unwrap().fingerprint,
+            fb.breakpoints.last().unwrap().fingerprint,
+            "message block key 顺序不同但内容相同,指纹必须一致"
+        );
     }
 
     #[test]
