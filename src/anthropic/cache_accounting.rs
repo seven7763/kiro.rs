@@ -174,19 +174,21 @@ pub(crate) fn lookup_prompt_cache(
         }
     };
 
-    // 诊断探针（定位 "只创建不读取"）：暴露 account_key 前缀 + 桶大小 + 命中断点位置。
-    // bucket=0 → account 每次都变/从未回写；bucket>0 且 matched=None → 指纹漂移。
-    // 用 info! 级别,使生产默认 filter(info)即可见,无需开全局 debug(会刷请求体)。
-    if let Some(account) = account_key.as_deref() {
-        let (bucket_len, matched, total_bp) = cache.debug_probe(account, &profile);
-        tracing::info!(
-            "prompt_cache.probe: account={} bucket_entries={} matched_bp={:?}/{} stable_fp={}",
-            account,
-            bucket_len,
-            matched,
-            total_bp,
-            &profile.stable_fingerprint.get(..12).unwrap_or("")
-        );
+    // 诊断探针（定位 "只创建不读取"）：暴露 account_key 前缀 + 全局桶大小 + 命中断点位置。
+    // 仅在 debug 级启用时才执行（zero-cost in prod info 级）：RUST_LOG 含 debug 即可见。
+    // bucket=0 → 从未 update；bucket>0 且 matched=None → 指纹漂移。
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        if let Some(account) = account_key.as_deref() {
+            let (bucket_len, matched, total_bp) = cache.debug_probe(account, &profile);
+            tracing::debug!(
+                "prompt_cache.probe: account={} bucket_entries={} matched_bp={:?}/{} stable_fp={}",
+                account,
+                bucket_len,
+                matched,
+                total_bp,
+                &profile.stable_fingerprint.get(..12).unwrap_or("")
+            );
+        }
     }
 
     tracing::debug!(
@@ -638,6 +640,61 @@ mod tests {
             history.push(serde_json::json!({"role": "assistant", "content": "ok"}));
         }
         assert!(saw_read, "真实模式多轮必须出现 cache_read>0");
+    }
+
+    /// 直击生产根因：客户端 `metadata.user_id` 经 new2api 网关每轮漂移
+    /// （session id 每请求都不同 → account_key 每轮不同）。修复前每轮落空桶 →
+    /// 只创建不读取；全局内容寻址后,只要 prefix 内容稳定,R2 起照样命中 cache_read。
+    #[test]
+    fn drifting_account_key_still_hits_cache_read_after_global_fix() {
+        let cache = PromptCache::new(1024, std::time::Duration::from_secs(300), true);
+        assert!(cache.perceived_ratio().is_none(), "真实模式");
+        // 固定的可缓存 system prefix（跨轮内容不变,只有 user_id 在变）
+        let system_text = "stable cacheable project context line. ".repeat(5000);
+        let mut history = Vec::new();
+
+        let mut saw_read = false;
+        for round in 1..=4 {
+            history.push(serde_json::json!({"role": "user", "content": "1"}));
+            // 关键:每轮一个**全新的 session id**,模拟网关漂移 account_key。
+            let drifting_session = format!("{round:08x}-ec7c-4540-a9ca-beb6d79f1552");
+            let payload: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "metadata": { "user_id": format!("user_x_account__session_{drifting_session}") },
+                "system": [{ "text": system_text, "cache_control": {"type": "ephemeral"} }],
+                "messages": serde_json::Value::Array(history.clone())
+            }))
+            .expect("构造请求");
+
+            let total = saturating_to_i32(token::count_all_tokens(
+                payload.model.clone(),
+                payload.system.clone(),
+                payload.messages.clone(),
+                payload.tools.clone(),
+            ));
+            let decision = lookup_prompt_cache(&cache, &payload, total);
+            let (_, creation, read) = client_visible_usage(
+                &cache,
+                &decision,
+                &payload.model,
+                total,
+                estimate_incremental_input_tokens(&payload, total),
+            );
+
+            if round == 1 {
+                assert!(creation > 0 && read == 0, "R1 全 creation");
+            } else {
+                assert!(
+                    read > 0,
+                    "R{round} account_key 漂移仍应命中 cache_read（全局桶）: creation={creation} read={read}"
+                );
+                saw_read = true;
+            }
+            record_cache_outcome(&cache, &decision, "conv-real", read);
+            history.push(serde_json::json!({"role": "assistant", "content": "ok"}));
+        }
+        assert!(saw_read, "account_key 漂移场景修复后必须出现 cache_read>0");
     }
 
     // CACHE_TESTS_PLACEHOLDER

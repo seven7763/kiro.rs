@@ -56,12 +56,10 @@ const MAX_CACHE_RATIO: f64 = 0.85;
 /// 与 [`MAX_CACHE_RATIO`] 分离:真实模拟受 0.85 物理约束(最新内容必为全价),
 /// 但运营口径允许上报到 0.95(下游计费系统能接受的最高稳定命中率)。
 const PERCEIVED_MAX_RATIO: f64 = 0.95;
-/// 每个 account 最大缓存条目数
-const MAX_ENTRIES_PER_ACCOUNT: usize = 200;
 /// 后台清理最小间隔
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// 测试用桶名；线上请求必须由 handler 传入用户/session 级 account。
+/// 测试用桶名；conversation_id 复用仍按此 account 维度隔离（accounting 已全局化）。
 #[cfg(test)]
 pub const GLOBAL_ACCOUNT: &str = "_global";
 
@@ -130,10 +128,18 @@ enum EventKind {
     Miss,
 }
 
-/// 内部状态：按 account 分桶
+/// 内部状态
+///
+/// **accounting 桶（`entries`）已从 per-account 改为全局内容寻址。** 指纹是
+/// `prelude(model/tool_choice) → tools → system → messages` 的累积 SHA-256，
+/// 指纹相同即内容逐字节相同，跨请求共享缓存判定**不泄露任何内容**，且能修复
+/// "客户端 `metadata.user_id` 经网关漂移 → 每次落空桶 → 只创建不读取" 的问题。
+///
+/// `conversation_by_fingerprint`（conversation_id 复用）**仍按 account 隔离**：
+/// 它会让上游 Kiro 复用同一 session，串号会泄露会话历史，必须按 client session 锁。
 struct CacheInner {
-    /// account → (fingerprint → entry)
-    entries_by_account: HashMap<String, HashMap<String, CacheEntry>>,
+    /// 全局 accounting 桶：fingerprint → entry（不再按 account 分桶）
+    entries: HashMap<String, CacheEntry>,
     /// `(account, 最稳定断点 fingerprint)` → 上次该 prefix 的 conversation_id
     conversation_by_fingerprint: HashMap<String, (String, Instant)>,
     capacity: usize,
@@ -151,7 +157,7 @@ struct CacheInner {
 impl CacheInner {
     fn new(capacity: usize, ttl: Duration) -> Self {
         Self {
-            entries_by_account: HashMap::new(),
+            entries: HashMap::new(),
             conversation_by_fingerprint: HashMap::new(),
             capacity,
             ttl,
@@ -164,7 +170,7 @@ impl CacheInner {
     }
 
     fn total_entries(&self) -> usize {
-        self.entries_by_account.values().map(|m| m.len()).sum()
+        self.entries.len()
     }
 
     /// 记录一次缓存判定。`real_saved` = 真实命中节省；`reported_saved` = 上报口径节省。
@@ -221,32 +227,28 @@ impl CacheInner {
             return;
         }
         self.last_prune = now;
-        self.entries_by_account.retain(|_, entries| {
-            entries.retain(|_, e| e.expires_at > now);
-            !entries.is_empty()
-        });
+        self.entries.retain(|_, e| e.expires_at > now);
         // conversation 映射用最长 TTL（1h）兜底过期
         self.conversation_by_fingerprint
             .retain(|_, (_, created)| now.duration_since(*created) < ONE_HOUR_TTL);
     }
 
-    /// 缩容：当某 account 桶超过 capacity 时按 expires_at 淘汰最旧
-    fn enforce_account_capacity(&mut self, account: &str) {
-        let per_account_cap = self.capacity.clamp(1, MAX_ENTRIES_PER_ACCOUNT);
-        if let Some(entries) = self.entries_by_account.get_mut(account) {
-            if entries.len() <= per_account_cap {
-                return;
-            }
-            let mut sorted: Vec<(String, Instant)> = entries
-                .iter()
-                .map(|(k, v)| (k.clone(), v.expires_at))
-                .collect();
-            sorted.sort_by_key(|(_, exp)| *exp);
-            let to_remove = entries.len() - per_account_cap;
-            for (k, _) in sorted.into_iter().take(to_remove) {
-                entries.remove(&k);
-                self.eviction_total = self.eviction_total.saturating_add(1);
-            }
+    /// 缩容：全局 accounting 桶超过 capacity 时按 expires_at 淘汰最旧
+    fn enforce_capacity(&mut self) {
+        let cap = self.capacity.max(1);
+        if self.entries.len() <= cap {
+            return;
+        }
+        let mut sorted: Vec<(String, Instant)> = self
+            .entries
+            .iter()
+            .map(|(k, v)| (k.clone(), v.expires_at))
+            .collect();
+        sorted.sort_by_key(|(_, exp)| *exp);
+        let to_remove = self.entries.len() - cap;
+        for (k, _) in sorted.into_iter().take(to_remove) {
+            self.entries.remove(&k);
+            self.eviction_total = self.eviction_total.saturating_add(1);
         }
     }
 }
@@ -364,10 +366,7 @@ impl PromptCache {
     pub fn set_capacity(&self, capacity: usize) {
         let mut inner = self.inner.lock();
         inner.capacity = capacity.max(1);
-        let accounts: Vec<String> = inner.entries_by_account.keys().cloned().collect();
-        for acc in accounts {
-            inner.enforce_account_capacity(&acc);
-        }
+        inner.enforce_capacity();
     }
 
     pub fn set_ttl(&self, ttl: Duration) {
@@ -380,8 +379,10 @@ impl PromptCache {
     /// 只有上游成功接受请求后，handler 才会调用 [`Self::record_success`] 与
     /// [`Self::update`]，避免 429/5xx 失败请求污染真实缓存诊断和命中率窗口。
     ///
-    /// `account`：当前请求命中的凭据维度（如 credential id），用于缓存隔离。
-    pub fn compute(&self, account: &str, profile: &CacheProfile) -> CacheUsage {
+    /// `account`：保留入参以兼容调用点与 conversation_id 复用维度；**accounting
+    /// 命中判定已全局内容寻址**，不再按 account 隔离（指纹相同即内容逐字节相同，
+    /// 跨请求共享不泄露内容，且修复 metadata.user_id 经网关漂移导致的"只创建不读取"）。
+    pub fn compute(&self, _account: &str, profile: &CacheProfile) -> CacheUsage {
         if !self.is_enabled() || profile.breakpoints.is_empty() {
             return CacheUsage::default();
         }
@@ -394,73 +395,47 @@ impl PromptCache {
         let last = profile.breakpoints.last().unwrap();
         // 完整可缓存前缀（未经 85% 封顶）——运营口径系数的基数。
         let full_prefix = last.cumulative_tokens.min(profile.total_input_tokens);
-        let mut last_tokens = full_prefix;
 
-        let has_entries = inner
-            .entries_by_account
-            .get(account)
-            .map(|m| !m.is_empty())
-            .unwrap_or(false);
-
-        if !has_entries {
-            // 首次：真实命中为 0，全部 creation（≥ 阈值才计）。
-            let effective_creation = if last_tokens >= min_tokens {
-                last_tokens
-            } else {
-                0
-            };
-            // 首次/空桶没有真实可读缓存，不能用运营系数把 MISS 伪装成 cache_read。
-            // 否则 R1 就会显示 90%+ 命中，既不符合 Anthropic prompt cache 语义，
-            // 也会让下游对账误以为上游已经真实复用。
-            return finalize_usage(profile, effective_creation, 0, 0, None);
-        }
-
-        // 命中上限 85%（仅约束真实模拟 read，不约束运营口径 perceived_base）
-        let max_cacheable = (profile.total_input_tokens as f64 * MAX_CACHE_RATIO).floor() as i32;
-        if last_tokens > max_cacheable {
-            last_tokens = max_cacheable;
-        }
-
-        // 从后往前找最长命中断点
-        let mut matched_tokens = 0i32;
-        {
-            let entries = inner.entries_by_account.get(account);
-            if let Some(entries) = entries {
-                for bp in profile.breakpoints.iter().rev() {
-                    if bp.cumulative_tokens < min_tokens {
-                        continue;
-                    }
-                    if let Some(entry) = entries.get(&bp.fingerprint) {
-                        if entry.expires_at <= now {
-                            continue;
-                        }
-                        matched_tokens = bp.cumulative_tokens.min(profile.total_input_tokens);
-                        if matched_tokens > last_tokens {
-                            matched_tokens = last_tokens;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        // 运营口径基数 + 真实模拟基数同样受最小阈值门控：低于 min_tokens 的前缀
-        // 真端点完全不缓存（cache_read=0 且 cache_creation=0，全部计入 input_tokens），
-        // 强行上报任一非零会与官方行为矛盾、暴露中转身份。
+        // 低于最小阈值的前缀完全不缓存（cache_read=0 且 cache_creation=0，全部计入
+        // input_tokens）；强行上报任一非零会与官方行为矛盾、暴露中转身份。
         if full_prefix < min_tokens {
             return CacheUsage::default();
         }
 
-        // compute 返回值保持真实模拟口径：perceived 只能抬高“已有真实命中”的 read 比例，
-        // 不能把无匹配的大请求从 MISS 变成 HIT。handler 会在最终客户端 usage 层做 fake billing。
-        let perceived_for_usage = if matched_tokens > 0 { perceived } else { None };
-        finalize_usage(
-            profile,
-            last_tokens,
-            matched_tokens,
-            full_prefix,
-            perceived_for_usage,
-        )
+        // 从后往前找最长命中断点（全局内容寻址桶）。命中与否决定这是"首次/未命中"
+        // 还是"命中" —— 不再依赖全局桶是否非空（否则别的会话填了桶会让本会话首请求
+        // 的 creation 被 85% 误封顶）。
+        let mut matched_tokens = 0i32;
+        for bp in profile.breakpoints.iter().rev() {
+            if bp.cumulative_tokens < min_tokens {
+                continue;
+            }
+            if let Some(entry) = inner.entries.get(&bp.fingerprint) {
+                if entry.expires_at <= now {
+                    continue;
+                }
+                matched_tokens = bp.cumulative_tokens.min(profile.total_input_tokens);
+                break;
+            }
+        }
+
+        if matched_tokens == 0 {
+            // 首次/未命中：真实命中为 0，全部 creation（不封顶）。不能用运营系数把
+            // MISS 伪装成 cache_read，否则首请求就显示 90%+ 命中，违反 Anthropic
+            // prompt cache 语义,也会让下游对账误以为上游已真实复用。
+            return finalize_usage(profile, full_prefix, 0, 0, None);
+        }
+
+        // 命中：85% 封顶仅约束真实模拟 read（最新内容不可能 100% 命中）。
+        let max_cacheable = (profile.total_input_tokens as f64 * MAX_CACHE_RATIO).floor() as i32;
+        let last_tokens = full_prefix.min(max_cacheable);
+        if matched_tokens > last_tokens {
+            matched_tokens = last_tokens;
+        }
+
+        // 命中路径才允许 perceived 抬高 read 比例；handler 会在最终客户端 usage 层
+        // 做 fake billing（无匹配的大请求不会被从 MISS 翻成 HIT）。
+        finalize_usage(profile, last_tokens, matched_tokens, full_prefix, perceived)
     }
 
     /// 上游成功后记录本次缓存统计。
@@ -493,24 +468,21 @@ impl PromptCache {
         let min_tokens = min_cacheable_tokens(&profile.model);
         let mut inner = self.inner.lock();
 
-        let entries = inner
-            .entries_by_account
-            .entry(account.to_string())
-            .or_default();
+        // accounting 断点写入全局内容寻址桶（不再按 account 分桶）。
         for bp in &profile.breakpoints {
             if bp.cumulative_tokens < min_tokens {
                 continue;
             }
-            entries.insert(
+            inner.entries.insert(
                 bp.fingerprint.clone(),
                 CacheEntry {
                     expires_at: now + bp.ttl,
                 },
             );
         }
-        inner.enforce_account_capacity(account);
+        inner.enforce_capacity();
 
-        // conversation_id 复用映射（最稳定断点），必须按 account 隔离。
+        // conversation_id 复用映射（最稳定断点），必须按 account 隔离 —— 串号会泄露会话历史。
         if !profile.stable_fingerprint.is_empty() && !conversation_id.is_empty() {
             inner.conversation_by_fingerprint.insert(
                 conversation_key(account, &profile.stable_fingerprint),
@@ -550,37 +522,37 @@ impl PromptCache {
 
     pub fn clear(&self) {
         let mut inner = self.inner.lock();
-        inner.entries_by_account.clear();
+        inner.entries.clear();
         inner.conversation_by_fingerprint.clear();
     }
 
-    /// 诊断探针：返回 `(该 account 桶内条目数, 命中的断点序号 from-end, 断点总数)`。
+    /// 诊断探针：返回 `(全局桶内条目数, 命中的断点序号 from-end, 断点总数)`。
     ///
     /// 用于定位生产 "只创建不读取" 问题：
-    /// - 桶内条目数恒为 0 → account_key 每次都变（user_id 不稳定）或从未 update。
+    /// - 桶内条目数恒为 0 → 从未 update（走 perceived/skip 路径，或上游一直失败）。
     /// - 桶内有条目但 matched=None → 指纹漂移（system 动态字段没归一化干净）。
+    ///
     /// `matched` 为命中断点距末尾的偏移（0=最后一个断点命中），None=无命中。
-    pub fn debug_probe(&self, account: &str, profile: &CacheProfile) -> (usize, Option<usize>, usize) {
+    /// `account` 入参保留以兼容调用点；accounting 已全局化，命中判定与 account 无关。
+    pub fn debug_probe(
+        &self,
+        _account: &str,
+        profile: &CacheProfile,
+    ) -> (usize, Option<usize>, usize) {
         let now = Instant::now();
         let min_tokens = min_cacheable_tokens(&profile.model);
         let inner = self.inner.lock();
-        let bucket_len = inner
-            .entries_by_account
-            .get(account)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let bucket_len = inner.entries.len();
         let total_bp = profile.breakpoints.len();
         let mut matched = None;
-        if let Some(entries) = inner.entries_by_account.get(account) {
-            for (i, bp) in profile.breakpoints.iter().rev().enumerate() {
-                if bp.cumulative_tokens < min_tokens {
-                    continue;
-                }
-                if let Some(e) = entries.get(&bp.fingerprint) {
-                    if e.expires_at > now {
-                        matched = Some(i);
-                        break;
-                    }
+        for (i, bp) in profile.breakpoints.iter().rev().enumerate() {
+            if bp.cumulative_tokens < min_tokens {
+                continue;
+            }
+            if let Some(e) = inner.entries.get(&bp.fingerprint) {
+                if e.expires_at > now {
+                    matched = Some(i);
+                    break;
                 }
             }
         }
@@ -1082,16 +1054,33 @@ mod tests {
         assert!(usage.cache_read > 0, "第二次应命中 cache_read");
     }
 
+    /// accounting 已全局内容寻址：相同 prefix 跨 account 应命中 cache_read（安全 ——
+    /// 指纹相同即内容逐字节相同，不泄露内容）。但 conversation_id 复用仍按 account 隔离。
     #[test]
-    fn account_isolation() {
+    fn accounting_is_global_but_conversation_isolated() {
         let cache = PromptCache::new(1024, Duration::from_secs(300), true);
         let payload = mk_request(Some(vec![sys(&big_text(5000), true)]), vec![]);
         let profile = build_profile_from_request(&payload, 5000).unwrap();
         let _ = cache.compute("acc1", &profile);
         cache.update("acc1", &profile, "conv-1");
-        // 不同 account 不应命中
+
+        // accounting：不同 account、相同内容 → 命中 cache_read（全局内容寻址）。
+        // 这正是修复点：客户端 metadata.user_id 经网关漂移成 acc2 也照样读到缓存。
         let usage = cache.compute("acc2", &profile);
-        assert_eq!(usage.cache_read, 0, "不同 account 应隔离，不命中");
+        assert!(
+            usage.cache_read > 0,
+            "全局 accounting：相同 prefix 跨 account 应命中 cache_read"
+        );
+
+        // conversation_id 复用：仍按 account 隔离，acc2 不能复用 acc1 的 conversation_id。
+        assert_eq!(
+            cache.lookup_conversation("acc1", &profile).as_deref(),
+            Some("conv-1")
+        );
+        assert!(
+            cache.lookup_conversation("acc2", &profile).is_none(),
+            "conversation_id 复用必须按 account 隔离（串号会泄露会话历史）"
+        );
     }
 
     #[test]
