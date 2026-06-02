@@ -553,6 +553,39 @@ impl PromptCache {
         inner.entries_by_account.clear();
         inner.conversation_by_fingerprint.clear();
     }
+
+    /// 诊断探针：返回 `(该 account 桶内条目数, 命中的断点序号 from-end, 断点总数)`。
+    ///
+    /// 用于定位生产 "只创建不读取" 问题：
+    /// - 桶内条目数恒为 0 → account_key 每次都变（user_id 不稳定）或从未 update。
+    /// - 桶内有条目但 matched=None → 指纹漂移（system 动态字段没归一化干净）。
+    /// `matched` 为命中断点距末尾的偏移（0=最后一个断点命中），None=无命中。
+    pub fn debug_probe(&self, account: &str, profile: &CacheProfile) -> (usize, Option<usize>, usize) {
+        let now = Instant::now();
+        let min_tokens = min_cacheable_tokens(&profile.model);
+        let inner = self.inner.lock();
+        let bucket_len = inner
+            .entries_by_account
+            .get(account)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let total_bp = profile.breakpoints.len();
+        let mut matched = None;
+        if let Some(entries) = inner.entries_by_account.get(account) {
+            for (i, bp) in profile.breakpoints.iter().rev().enumerate() {
+                if bp.cumulative_tokens < min_tokens {
+                    continue;
+                }
+                if let Some(e) = entries.get(&bp.fingerprint) {
+                    if e.expires_at > now {
+                        matched = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+        (bucket_len, matched, total_bp)
+    }
 }
 
 impl Default for PromptCache {

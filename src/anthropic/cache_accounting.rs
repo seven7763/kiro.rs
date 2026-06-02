@@ -174,6 +174,21 @@ pub(crate) fn lookup_prompt_cache(
         }
     };
 
+    // 诊断探针（定位 "只创建不读取"）：暴露 account_key 前缀 + 桶大小 + 命中断点位置。
+    // bucket=0 → account 每次都变/从未回写；bucket>0 且 matched=None → 指纹漂移。
+    // 用 info! 级别,使生产默认 filter(info)即可见,无需开全局 debug(会刷请求体)。
+    if let Some(account) = account_key.as_deref() {
+        let (bucket_len, matched, total_bp) = cache.debug_probe(account, &profile);
+        tracing::info!(
+            "prompt_cache.probe: account={} bucket_entries={} matched_bp={:?}/{} stable_fp={}",
+            account,
+            bucket_len,
+            matched,
+            total_bp,
+            &profile.stable_fingerprint.get(..12).unwrap_or("")
+        );
+    }
+
     tracing::debug!(
         "prompt_cache: creation={} read={} (5m={} 1h={}) breakpoints={} account_scoped={} conv_reuse={}",
         usage.cache_creation,
@@ -580,6 +595,49 @@ mod tests {
         assert_eq!(snap.miss_total, 1);
         assert_eq!(snap.last1m.reported_hit_rate(), 100.0);
         assert!(snap.last1m.reported_saved_input_tokens > 0);
+    }
+
+    /// 真实模式（无 perceived 系数）多轮对话：R1 全 creation，R2 起必须命中 cache_read。
+    /// 复现生产 "只有创建缓存、没有读取缓存" 的诉求 —— 走完整 cache_accounting 路径。
+    #[test]
+    fn cctest_like_real_mode_multiround_hits_cache_read() {
+        let cache = PromptCache::new(1024, std::time::Duration::from_secs(300), true);
+        assert!(cache.perceived_ratio().is_none(), "本测试必须是真实模式");
+        let session_id = "8bb5523b-ec7c-4540-a9ca-beb6d79f1552";
+        let mut history = Vec::new();
+
+        let mut saw_read = false;
+        for round in 1..=4 {
+            history.push(serde_json::json!({"role": "user", "content": "1"}));
+            let payload =
+                cctest_like_payload(session_id, serde_json::Value::Array(history.clone()));
+            let total = client_total_tokens(&payload);
+
+            let decision = lookup_prompt_cache(&cache, &payload, total);
+            let (input, creation, read) = client_visible_usage(
+                &cache,
+                &decision,
+                &payload.model,
+                total,
+                estimate_incremental_input_tokens(&payload, total),
+            );
+
+            if round == 1 {
+                assert!(creation > 0, "R1 应有 cache_creation");
+                assert_eq!(read, 0, "R1 不应有 cache_read");
+            } else {
+                assert!(
+                    read > 0,
+                    "R{round} 应命中 cache_read（input={input} creation={creation} read={read}）"
+                );
+                saw_read = true;
+            }
+
+            // 模拟上游成功 → 回写断点 + conversation
+            record_cache_outcome(&cache, &decision, "conv-real", read);
+            history.push(serde_json::json!({"role": "assistant", "content": "ok"}));
+        }
+        assert!(saw_read, "真实模式多轮必须出现 cache_read>0");
     }
 
     // CACHE_TESTS_PLACEHOLDER
