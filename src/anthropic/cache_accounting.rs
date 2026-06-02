@@ -72,6 +72,62 @@ fn short_hash(input: &str) -> String {
     hex::encode(&digest[..16])
 }
 
+/// 诊断:把请求按 fingerprint 的组成拆成各部件的短 hash(纯 hash,不泄露内容),
+/// 用于定位"同一会话每请求 stable_fp 都变"到底是哪个部件在漂移。
+/// 部件:prelude(model+tool_choice) / tools / system(归一化后) / 首条 message。
+fn diag_fingerprint_components(payload: &MessagesRequest) -> String {
+    let h = |s: &str| {
+        let d = Sha256::digest(s.as_bytes());
+        hex::encode(&d[..6])
+    };
+    let tc = payload
+        .tool_choice
+        .as_ref()
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    let n_tools = payload.tools.as_ref().map(|t| t.len()).unwrap_or(0);
+    let tools_repr = payload
+        .tools
+        .as_ref()
+        .map(|ts| {
+            ts.iter()
+                .map(|t| format!("{}\u{1f}{}", t.name, t.description))
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .unwrap_or_default();
+    let n_sys = payload.system.as_ref().map(|s| s.len()).unwrap_or(0);
+    let sys_norm = payload
+        .system
+        .as_ref()
+        .map(|ss| {
+            ss.iter()
+                .map(|s| super::prompt_cache::normalize_system_text(&s.text))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let n_msgs = payload.messages.len();
+    let msg0 = payload
+        .messages
+        .first()
+        .map(|m| m.content.to_string())
+        .unwrap_or_default();
+    format!(
+        "model={} h_tc={} n_tools={} h_tools={} n_sys={} h_sys={} sys_len={} n_msgs={} h_msg0={} msg0_len={}",
+        payload.model,
+        h(&tc),
+        n_tools,
+        h(&tools_repr),
+        n_sys,
+        h(&sys_norm),
+        sys_norm.len(),
+        n_msgs,
+        h(&msg0),
+        msg0.len(),
+    )
+}
+
 pub(crate) fn prompt_cache_account(payload: &MessagesRequest) -> Option<String> {
     let user_id = payload
         .metadata
@@ -187,6 +243,11 @@ pub(crate) fn lookup_prompt_cache(
                 matched,
                 total_bp,
                 &profile.stable_fingerprint.get(..12).unwrap_or("")
+            );
+            tracing::debug!(
+                "prompt_cache.diag: account={} {}",
+                account,
+                diag_fingerprint_components(payload)
             );
         }
     }
