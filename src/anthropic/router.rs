@@ -1,0 +1,88 @@
+//! Anthropic API 路由配置
+
+use std::time::Duration;
+
+use axum::{
+    Router,
+    extract::DefaultBodyLimit,
+    middleware,
+    routing::{get, post},
+};
+use tower_http::timeout::RequestBodyTimeoutLayer;
+
+use crate::kiro::provider::KiroProvider;
+use crate::model::runtime::SharedPromptConfig;
+
+use super::{
+    handlers::{count_tokens, get_models, post_messages, post_messages_cc},
+    middleware::{AppState, auth_middleware, cors_layer},
+    prompt_cache::PromptCache,
+};
+
+/// 请求体最大大小限制 (50MB)
+const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
+
+/// 请求体读取超时 (60s)
+///
+/// 只限制"读完客户端请求体"的时间，防慢 loris 式上传拖住连接；
+/// 不限制响应阶段，因此正常的 SSE 流式响应（可能持续数分钟）不受影响。
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 创建 Anthropic API 路由
+///
+/// # 端点
+/// - `GET /v1/models` - 获取可用模型列表
+/// - `POST /v1/messages` - 创建消息（对话）
+/// - `POST /v1/messages/count_tokens` - 计算 token 数量
+///
+/// # 认证
+/// 所有 `/v1` 路径需要 API Key 认证，支持：
+/// - `x-api-key` header
+/// - `Authorization: Bearer <token>` header
+///
+/// # 参数
+/// - `api_key`: API 密钥，用于验证客户端请求
+/// - `kiro_provider`: 可选的 KiroProvider，用于调用上游 API
+///
+/// 创建带有 KiroProvider 的 Anthropic API 路由
+pub fn create_router_with_provider(
+    api_key: impl Into<String>,
+    kiro_provider: Option<KiroProvider>,
+    extract_thinking: bool,
+    prompt_config: SharedPromptConfig,
+    prompt_cache: PromptCache,
+) -> Router {
+    let mut state =
+        AppState::new(api_key, extract_thinking, prompt_config).with_prompt_cache(prompt_cache);
+    if let Some(provider) = kiro_provider {
+        state = state.with_kiro_provider(provider);
+    }
+
+    // 需要认证的 /v1 路由
+    let v1_routes = Router::new()
+        .route("/models", get(get_models))
+        .route("/messages", post(post_messages))
+        .route("/messages/count_tokens", post(count_tokens))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
+    // 与 /v1 的区别：流式响应会等待 contextUsageEvent 后再发送 message_start
+    let cc_v1_routes = Router::new()
+        .route("/messages", post(post_messages_cc))
+        .route("/messages/count_tokens", post(count_tokens))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    Router::new()
+        .nest("/v1", v1_routes)
+        .nest("/cc/v1", cc_v1_routes)
+        .layer(cors_layer())
+        .layer(RequestBodyTimeoutLayer::new(REQUEST_BODY_TIMEOUT))
+        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+        .with_state(state)
+}

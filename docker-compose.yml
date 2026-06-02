@@ -1,0 +1,23 @@
+services:
+  kiro-rs:
+    # 使用国内镜像
+    # image: ghcr.nju.edu.cn/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
+    image: ghcr.io/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
+    container_name: kiro-rs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8990:8990"
+    volumes:
+      - ./config/:/app/config/
+    restart: unless-stopped
+    networks:
+      - default
+      - sub2api
+
+networks:
+  # External 网络：让 sub2api 容器能通过容器名直连 kiro-rs
+  # 若本地没有该网络，可以注释掉 sub2api 段或设 SUB2API_NETWORK 为已有 bridge
+  sub2api:
+    external: true
+    name: ${SUB2API_NETWORK:-sub2api-deploy_sub2api-network}

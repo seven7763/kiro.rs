@@ -1,0 +1,370 @@
+//! Anthropic API 类型定义
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+// === 错误响应 ===
+
+/// API 错误响应
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
+    pub error: ErrorDetail,
+}
+
+/// 错误详情
+#[derive(Debug, Serialize)]
+pub struct ErrorDetail {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub message: String,
+}
+
+impl ErrorResponse {
+    /// 创建新的错误响应
+    pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            error: ErrorDetail {
+                error_type: error_type.into(),
+                message: message.into(),
+            },
+        }
+    }
+
+    /// 创建认证错误响应
+    pub fn authentication_error() -> Self {
+        Self::new("authentication_error", "Invalid API key")
+    }
+}
+
+// === Models 端点类型 ===
+
+/// 模型信息
+#[derive(Debug, Serialize)]
+pub struct Model {
+    pub id: String,
+    pub object: String,
+    pub created: i64,
+    pub owned_by: String,
+    pub display_name: String,
+    #[serde(rename = "type")]
+    pub model_type: String,
+    pub max_tokens: i32,
+}
+
+/// 模型列表响应
+#[derive(Debug, Serialize)]
+pub struct ModelsResponse {
+    pub object: String,
+    pub data: Vec<Model>,
+}
+
+// === Messages 端点类型 ===
+
+/// 最大思考预算 tokens
+const MAX_BUDGET_TOKENS: i32 = 24576;
+
+/// Thinking 配置
+///
+/// Anthropic 三种类型：
+/// - `enabled`：手动指定 `budget_tokens`（Opus 4.6 / Sonnet 4.6 / 老模型）
+/// - `adaptive`：模型自适应分配（Opus 4.7 / 4.6 / Sonnet 4.6；Opus 4.7 只支持此模式）
+/// - `disabled`：关闭 thinking
+///
+/// `display` 控制 thinking 块内容是否对客户端可见：
+/// - `summarized`（默认 4.6）：返回模型 thinking 文本摘要
+/// - `omitted`（默认 4.7）：thinking 字段为空，仅保留 signature
+///
+/// 对 Kiro 上游：4.7 默认 omitted → Kiro 可能不输出 `<thinking>` 文本块，
+/// 我们在 prefix 中显式声明 `<thinking_display>summarized</thinking_display>` 强制可见。
+#[derive(Debug, Deserialize, Clone)]
+pub struct Thinking {
+    #[serde(rename = "type")]
+    pub thinking_type: String,
+    #[serde(
+        default = "default_budget_tokens",
+        deserialize_with = "deserialize_budget_tokens"
+    )]
+    pub budget_tokens: i32,
+    /// `summarized` / `omitted`，未提供时由后端按模型默认填入。
+    /// 无效值会在反序列化阶段被规范化为 `None`（防客户端把脏值原样传给上游）。
+    #[serde(
+        default,
+        deserialize_with = "deserialize_display",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub display: Option<String>,
+}
+
+impl Thinking {
+    /// 是否启用了 thinking（enabled 或 adaptive）
+    pub fn is_enabled(&self) -> bool {
+        self.thinking_type == "enabled" || self.thinking_type == "adaptive"
+    }
+
+    /// 有效 display 值（None 时回退 "summarized"，确保 Kiro 能吐 thinking 文本）
+    pub fn effective_display(&self) -> &str {
+        self.display.as_deref().unwrap_or("summarized")
+    }
+}
+
+/// 反序列化 `display` 字段，只接受 `summarized` / `omitted`，其他值降级为 `None`。
+///
+/// 不返回 Err 是因为 thinking.display 是可选字段；客户端传错时降级到默认行为
+/// 比起整请求拒绝更友好。会记录一条 warn 帮助排查。
+fn deserialize_display<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    match opt.as_deref() {
+        None => Ok(None),
+        Some("summarized") | Some("omitted") => Ok(opt),
+        Some(other) => {
+            tracing::warn!(
+                value = %other,
+                "thinking.display 收到无效值（仅接受 summarized / omitted），已忽略"
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn default_budget_tokens() -> i32 {
+    20000
+}
+fn deserialize_budget_tokens<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = i32::deserialize(deserializer)?;
+    Ok(value.min(MAX_BUDGET_TOKENS))
+}
+
+/// OutputConfig 配置
+#[derive(Debug, Deserialize, Clone)]
+pub struct OutputConfig {
+    #[serde(default = "default_effort")]
+    pub effort: String,
+}
+
+fn default_effort() -> String {
+    "high".to_string()
+}
+
+/// Claude Code 请求中的 metadata
+#[derive(Debug, Clone, Deserialize)]
+pub struct Metadata {
+    /// 用户 ID，格式如: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
+    pub user_id: Option<String>,
+}
+
+/// Messages 请求体
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct MessagesRequest {
+    pub model: String,
+    pub max_tokens: i32,
+    pub messages: Vec<Message>,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default, deserialize_with = "deserialize_system")]
+    pub system: Option<Vec<SystemMessage>>,
+    pub tools: Option<Vec<Tool>>,
+    pub tool_choice: Option<serde_json::Value>,
+    pub thinking: Option<Thinking>,
+    pub output_config: Option<OutputConfig>,
+    /// Claude Code 请求中的 metadata，包含 session 信息
+    pub metadata: Option<Metadata>,
+}
+
+/// 反序列化 system 字段，支持字符串或数组格式
+fn deserialize_system<'de, D>(deserializer: D) -> Result<Option<Vec<SystemMessage>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // 创建一个 visitor 来处理 string 或 array
+    struct SystemVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for SystemVisitor {
+        type Value = Option<Vec<SystemMessage>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or an array of system messages")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Some(vec![SystemMessage {
+                text: value.to_string(),
+                cache_control: None,
+            }]))
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut messages = Vec::new();
+            while let Some(msg) = seq.next_element()? {
+                messages.push(msg);
+            }
+            Ok(if messages.is_empty() {
+                None
+            } else {
+                Some(messages)
+            })
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            serde::de::Deserialize::deserialize(deserializer)
+        }
+    }
+
+    deserializer.deserialize_any(SystemVisitor)
+}
+
+/// 消息
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Message {
+    pub role: String,
+    /// 可以是 string 或 ContentBlock 数组
+    pub content: serde_json::Value,
+}
+
+/// 系统消息
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SystemMessage {
+    pub text: String,
+    /// Anthropic prompt caching 标记。中转层不会回传给上游 Kiro（上游协议不支持），
+    /// 但会用于 prompt_cache 模块判定 cache breakpoint，让命中信号传递给客户端。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Anthropic prompt caching 控制标记
+///
+/// 规范：客户端在 system / message content block / tool 上打 `cache_control: {type: "ephemeral"}`，
+/// 表示从这条内容开始（含）的 prefix 应被缓存 5 分钟。中转层据此判断 cache breakpoint。
+///
+/// 上游 Kiro 协议不支持，本字段仅在 kiro-rs 内部使用。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub cache_type: String,
+    /// 缓存 TTL：Anthropic 支持 `"5m"`（默认）或 `"1h"`。未提供时按 5m 处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
+impl CacheControl {
+    pub fn is_ephemeral(&self) -> bool {
+        self.cache_type == "ephemeral"
+    }
+
+    /// 解析 TTL 字符串为秒数。`"1h"` → 3600，其余（含 `"5m"`/None/未知）→ 300。
+    pub fn ttl_secs(&self) -> u64 {
+        match self.ttl.as_deref() {
+            Some("1h") | Some("1H") => 3600,
+            _ => 300,
+        }
+    }
+}
+
+/// 工具定义
+///
+/// 支持两种格式：
+/// 1. 普通工具：{ name, description, input_schema }
+/// 2. WebSearch 工具：{ type: "web_search_20250305", name: "web_search", max_uses: 8 }
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Tool {
+    /// 工具类型，如 "web_search_20250305"（可选，仅 WebSearch 工具）
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub tool_type: Option<String>,
+    /// 工具名称
+    #[serde(default)]
+    pub name: String,
+    /// 工具描述（普通工具必需，WebSearch 工具可选）
+    #[serde(default)]
+    pub description: String,
+    /// 输入参数 schema（普通工具必需，WebSearch 工具无此字段）
+    #[serde(default)]
+    pub input_schema: HashMap<String, serde_json::Value>,
+    /// 最大使用次数（仅 WebSearch 工具）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<i32>,
+    /// Anthropic prompt caching 标记（同 SystemMessage）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// 内容块
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ContentBlock {
+    #[serde(rename = "type")]
+    pub block_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<ImageSource>,
+    /// Anthropic prompt caching 标记（同 SystemMessage）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// 图片数据源
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ImageSource {
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub media_type: String,
+    pub data: String,
+}
+
+// === Count Tokens 端点类型 ===
+
+/// Token 计数请求
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CountTokensRequest {
+    pub model: String,
+    pub messages: Vec<Message>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_system"
+    )]
+    pub system: Option<Vec<SystemMessage>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
+}
+
+/// Token 计数响应
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CountTokensResponse {
+    pub input_tokens: i32,
+}

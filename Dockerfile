@@ -1,0 +1,33 @@
+FROM node:22-alpine AS frontend-builder
+
+WORKDIR /app/admin-ui
+# 固定 pnpm@9（pnpm 10+ 严格拒绝 native build scripts，会卡 @swc/core 和 esbuild）
+COPY admin-ui/package.json admin-ui/pnpm-lock.yaml* ./
+RUN npm install -g pnpm@9 \
+    && pnpm install --no-frozen-lockfile
+COPY admin-ui ./
+RUN pnpm build
+
+FROM rust:1.92-alpine AS builder
+
+RUN apk add --no-cache musl-dev perl make
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock* ./
+COPY src ./src
+COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
+
+RUN cargo build --release --no-default-features
+
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /app
+COPY --from=builder /app/target/release/kiro-rs /app/kiro-rs
+
+VOLUME ["/app/config"]
+
+EXPOSE 8990
+
+CMD ["./kiro-rs", "-c", "/app/config/config.json", "--credentials", "/app/config/credentials.json"]

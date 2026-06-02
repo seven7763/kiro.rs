@@ -1,0 +1,20 @@
+{
+  "host": "127.0.0.1",
+  "port": 8990,
+  "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+  "tlsBackend": "rustls",
+  "region": "us-east-1",
+  "adminApiKey": "sk-admin-your-secret-key",
+  "tokenWesternCharWeight": 1.85,
+  "credentialGroups": [
+    {
+      "id": "direct",
+      "proxyUrl": "direct"
+    },
+    {
+      "id": "socks-a",
+      "proxyUrl": "socks5://127.0.0.1:1080"
+    }
+  ],
+  "defaultEndpoint": "ide"
+}

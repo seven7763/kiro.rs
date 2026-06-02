@@ -1,0 +1,1293 @@
+//! Anthropic API Handler 函数
+
+#![allow(clippy::too_many_arguments)] // handler 需要透传 provider/cache/runtime/state 等多个上下文
+
+use std::convert::Infallible;
+
+use crate::kiro::model::events::Event;
+use crate::kiro::model::requests::KiroRequest;
+use crate::kiro::parser::decoder::EventStreamDecoder;
+use axum::{
+    Json as JsonExtractor,
+    body::Body,
+    extract::State,
+    http::{StatusCode, header},
+    response::{IntoResponse, Json, Response},
+};
+use bytes::Bytes;
+use futures::{Stream, StreamExt, stream};
+use serde_json::json;
+use std::time::Duration;
+use std::time::Instant;
+use tokio::time::interval;
+
+use super::cache_accounting::{
+    CacheDecision, client_visible_usage, estimate_incremental_input_tokens, lookup_prompt_cache,
+    record_cache_outcome, record_cache_report_only,
+};
+use super::converter::{ConversionError, canonical_anthropic_model, convert_request_with_options};
+use super::error_map::map_provider_error;
+use super::middleware::AppState;
+use super::models::{models_from_upstream, static_models};
+use super::preprocess::{inject_system_prompt, override_thinking_from_model_name};
+use super::prompt_cache::PromptCache;
+use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::token_count::{self as token, saturating_to_i32};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, ModelsResponse,
+};
+use super::websearch;
+
+/// GET /v1/models
+///
+/// 返回可用的模型列表。优先尝试从上游（Kiro / CodeWhisperer 的
+/// `ListAvailableModels`）获取真实可用模型，用其结果**过滤**内置静态列表
+/// （只暴露上游确认可用的系列）；上游获取失败时回退到完整静态列表，
+/// 保证该端点永不因上游问题而失败。
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
+    tracing::info!("Received GET /v1/models request");
+
+    let models = match &state.kiro_provider {
+        Some(provider) => match provider.list_upstream_models().await {
+            Ok(upstream) if !upstream.is_empty() => {
+                tracing::info!("上游 ListAvailableModels 返回 {} 个模型", upstream.len());
+                models_from_upstream(&upstream)
+            }
+            Ok(_) => {
+                tracing::warn!("上游模型列表为空，回退到内置静态列表");
+                static_models()
+            }
+            Err(e) => {
+                tracing::warn!("上游模型列表获取失败，回退到内置静态列表: {}", e);
+                static_models()
+            }
+        },
+        None => static_models(),
+    };
+
+    Json(ModelsResponse {
+        object: "list".to_string(),
+        data: models,
+    })
+}
+
+/// POST /v1/messages
+///
+/// 创建消息（对话）
+pub async fn post_messages(
+    State(state): State<AppState>,
+    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    tracing::info!(
+        model = %payload.model,
+        max_tokens = %payload.max_tokens,
+        stream = %payload.stream,
+        message_count = %payload.messages.len(),
+        "Received POST /v1/messages request"
+    );
+
+    // 客户端可见的 input_tokens 口径：在注入自定义 system prompt（pentest preset 等）之前
+    // 按"客户端实际发送的内容"计数。注入是中转层实现细节，不应转嫁到客户端可见 usage，
+    // 否则客户端发 1 个字也会看到几百 token（注入开销）。与 /count_tokens 端点同口径。
+    let client_input_tokens = saturating_to_i32(token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ));
+    let incremental_input_tokens = estimate_incremental_input_tokens(&payload, client_input_tokens);
+
+    // 注入自定义系统提示词
+    inject_system_prompt(&mut payload, &state.prompt_config);
+
+    // 检查 KiroProvider 是否可用
+    let provider = match &state.kiro_provider {
+        Some(p) => p.clone(),
+        None => {
+            tracing::error!("KiroProvider 未配置");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse::new(
+                    "service_unavailable",
+                    "Kiro API provider not configured",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+    override_thinking_from_model_name(&mut payload);
+
+    // 检查是否为 WebSearch 请求
+    if websearch::has_web_search_tool(&payload) {
+        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
+
+        // 估算上游全量 tokens 供 prompt cache 判定；客户端可见 usage 仍使用注入前预算。
+        let input_tokens = saturating_to_i32(token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ));
+        let cache_decision = lookup_prompt_cache(&state.prompt_cache, &payload, input_tokens);
+        let (input_tokens_for_client, cache_creation_input_tokens, cache_read_input_tokens) =
+            client_visible_usage(
+                &state.prompt_cache,
+                &cache_decision,
+                &payload.model,
+                client_input_tokens,
+                incremental_input_tokens,
+            );
+
+        let response = websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens_for_client,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        )
+        .await;
+        if response.status().is_success() {
+            record_cache_report_only(
+                &state.prompt_cache,
+                &cache_decision,
+                cache_read_input_tokens,
+            );
+        }
+        return response;
+    }
+
+    // 估算输入 tokens（发给 Kiro 上游的"全量" input tokens；也用于 prompt cache 的
+    // 85% 上限与 TTL 分桶计算）
+    let input_tokens = saturating_to_i32(token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ));
+
+    // ===== Prompt Cache 决定（多断点精确计费 + conversation_id 复用）=====
+    let cache_decision = lookup_prompt_cache(&state.prompt_cache, &payload, input_tokens);
+
+    // 转换请求（命中时强制 conversation_id）
+    let conversion_result =
+        match convert_request_with_options(&payload, cache_decision.forced_conversation_id.clone())
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let (error_type, message) = match &e {
+                    ConversionError::UnsupportedModel(model) => {
+                        ("invalid_request_error", format!("模型不支持: {}", model))
+                    }
+                    ConversionError::EmptyMessages => {
+                        ("invalid_request_error", "消息列表为空".to_string())
+                    }
+                };
+                tracing::warn!("请求转换失败: {}", e);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(error_type, message)),
+                )
+                    .into_response();
+            }
+        };
+
+    // cache entry 只能在上游成功接受请求后回写；否则 429/5xx 会污染真实缓存诊断。
+    let actual_conversation_id = conversion_result.conversation_state.conversation_id.clone();
+
+    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    let kiro_request = KiroRequest {
+        conversation_state: conversion_result.conversation_state,
+        profile_arn: None,
+    };
+
+    let request_body = match serde_json::to_string(&kiro_request) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::error!("序列化请求失败: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    format!("序列化请求失败: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    tracing::debug!("Kiro request body: {}", request_body);
+
+    // 客户端可见 usage 必须以注入前的 client_input_tokens 为总预算。
+    // fake cache 开启时也只在这个预算内重分配，避免把中转层 system/preset 注入
+    // 算进客户账单，或让 cache_creation 每轮写入造成溢价。
+    let (input_tokens_for_client, cache_creation_input_tokens, cache_read_input_tokens) =
+        client_visible_usage(
+            &state.prompt_cache,
+            &cache_decision,
+            &payload.model,
+            client_input_tokens,
+            incremental_input_tokens,
+        );
+
+    // 检查是否启用了thinking
+    let thinking_enabled = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.is_enabled())
+        .unwrap_or(false);
+
+    let tool_name_map = conversion_result.tool_name_map;
+
+    if payload.stream {
+        // 流式响应
+        handle_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens_for_client,
+            thinking_enabled,
+            tool_name_map,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            payload.max_tokens,
+            state.prompt_cache.clone(),
+            cache_decision,
+            actual_conversation_id,
+        )
+        .await
+    } else {
+        // 非流式响应：仅在配置开启时提取 thinking 块
+        let extract_thinking = state.extract_thinking && thinking_enabled;
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens_for_client,
+            extract_thinking,
+            tool_name_map,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            payload.max_tokens,
+            state.prompt_cache.clone(),
+            cache_decision,
+            actual_conversation_id,
+        )
+        .await
+    }
+}
+
+/// 处理流式请求
+async fn handle_stream_request(
+    provider: std::sync::Arc<dyn crate::kiro::provider::UpstreamProvider>,
+    request_body: &str,
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+    max_output_tokens: i32,
+    cache: PromptCache,
+    cache_decision: CacheDecision,
+    actual_conversation_id: String,
+) -> Response {
+    // 调用 Kiro API（支持多凭据故障转移）
+    let (response, record) = match provider.call_api_stream(request_body).await {
+        Ok(resp) => resp,
+        Err(e) => return map_provider_error(e),
+    };
+    record_cache_outcome(
+        &cache,
+        &cache_decision,
+        &actual_conversation_id,
+        cache_read_input_tokens,
+    );
+
+    // 创建流处理上下文
+    let mut ctx =
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    ctx.cache_creation_input_tokens = cache_creation_input_tokens;
+    ctx.cache_read_input_tokens = cache_read_input_tokens;
+    ctx.record = Some(record);
+    // 客户端输出预算（max_tokens）：Kiro 上游无限长字段，由本层累计 output 到顶截断断流
+    ctx.set_max_output_tokens(max_output_tokens);
+
+    // 生成初始事件
+    let initial_events = ctx.generate_initial_events();
+
+    // 创建 SSE 流
+    let stream = create_sse_stream(response, ctx, initial_events);
+
+    // 返回 SSE 响应
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// Ping 事件间隔（25秒）
+const PING_INTERVAL_SECS: u64 = 25;
+
+/// 创建 ping 事件的 SSE 字符串
+fn create_ping_sse() -> Bytes {
+    Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
+}
+
+/// 流式吐字耗时探针状态：定位"变慢"是上游慢（首字/吐字速率）还是中转慢。
+///
+/// 计时基准 `stream_start` = 开始 poll 上游 body 的时刻（此时响应头已到，
+/// 连接/选号/鉴权耗时不计入；那部分在 acquire/连接 timeout 侧已有日志）。
+struct StreamTiming {
+    /// 开始读上游 body 流的时刻
+    stream_start: Instant,
+    /// 第一个数据 chunk 到达时刻（用于 TTFB：上游 prefill 耗时）
+    first_chunk_at: Option<Instant>,
+    /// 最近一个数据 chunk 到达时刻（用于算 chunk 间隔）
+    last_chunk_at: Option<Instant>,
+    /// 数据 chunk 计数
+    chunk_count: u64,
+    /// chunk 间最大间隔（ms）——卡顿/一顿一顿的直接信号
+    max_gap_ms: u64,
+}
+
+impl StreamTiming {
+    fn new() -> Self {
+        Self {
+            stream_start: Instant::now(),
+            first_chunk_at: None,
+            last_chunk_at: None,
+            chunk_count: 0,
+            max_gap_ms: 0,
+        }
+    }
+
+    /// 记录一个数据 chunk 到达，更新首字/间隔统计
+    fn record_chunk(&mut self) {
+        let now = Instant::now();
+        self.chunk_count += 1;
+        if self.first_chunk_at.is_none() {
+            self.first_chunk_at = Some(now);
+        } else if let Some(last) = self.last_chunk_at {
+            let gap = now.duration_since(last).as_millis() as u64;
+            if gap > self.max_gap_ms {
+                self.max_gap_ms = gap;
+            }
+        }
+        self.last_chunk_at = Some(now);
+    }
+}
+
+/// 流结束时输出一条耗时汇总探针：TTFB / 总耗时 / chunk 数 / 最大间隔 / 吐字速率。
+///
+/// 判读：
+/// - `ttfb_ms` 高、`max_gap_ms` 低 → 上游 prefill 慢（首字慢），非中转问题
+/// - `max_gap_ms` 高（成块卡顿）→ 上游吐字一顿一顿，或中转 select/解码阻塞
+/// - `tokens_per_sec` 低且 chunk 多 → 上游吐字速率本身慢
+fn log_stream_latency(timing: &StreamTiming, ctx: &StreamContext) {
+    let now = Instant::now();
+    let ttfb_ms = timing
+        .first_chunk_at
+        .map(|t| t.duration_since(timing.stream_start).as_millis() as u64);
+    let total_ms = now.duration_since(timing.stream_start).as_millis() as u64;
+    let gen_ms = match (timing.first_chunk_at, timing.last_chunk_at) {
+        (Some(first), Some(last)) => last.duration_since(first).as_millis() as u64,
+        _ => 0,
+    };
+    let out_tokens = ctx.output_tokens.max(0) as u64;
+    let tokens_per_sec = if gen_ms > 0 {
+        (out_tokens as f64) * 1000.0 / (gen_ms as f64)
+    } else {
+        0.0
+    };
+    tracing::info!(
+        target: "kiro::probe::stream_latency",
+        model = %ctx.model,
+        ttfb_ms = ttfb_ms.unwrap_or(0),
+        total_ms = total_ms,
+        gen_ms = gen_ms,
+        chunk_count = timing.chunk_count,
+        max_gap_ms = timing.max_gap_ms,
+        output_tokens = out_tokens,
+        tokens_per_sec = tokens_per_sec,
+        "流式吐字耗时汇总（定位上游慢 vs 中转慢）"
+    );
+}
+
+/// 创建 SSE 事件流
+fn create_sse_stream(
+    response: reqwest::Response,
+    ctx: StreamContext,
+    initial_events: Vec<SseEvent>,
+) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    // 先发送初始事件
+    let initial_stream = stream::iter(
+        initial_events
+            .into_iter()
+            .map(|e| Ok(Bytes::from(e.to_sse_string()))),
+    );
+
+    // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
+    let body_stream = response.bytes_stream();
+
+    let processing_stream = stream::unfold(
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), StreamTiming::new()),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut timing)| async move {
+            if finished {
+                return None;
+            }
+
+            // 使用 select! 同时等待数据和 ping 定时器
+            tokio::select! {
+                // 处理数据流
+                chunk_result = body_stream.next() => {
+                    match chunk_result {
+                        Some(Ok(chunk)) => {
+                            // 计时探针：记录 chunk 到达（首字 TTFB + chunk 间隔）
+                            timing.record_chunk();
+                            // 解码事件
+                            if let Err(e) = decoder.feed(&chunk) {
+                                tracing::warn!("缓冲区溢出: {}", e);
+                            }
+
+                            let mut events = Vec::new();
+                            for result in decoder.decode_iter() {
+                                match result {
+                                    Ok(frame) => {
+                                        if let Ok(event) = Event::from_frame(frame) {
+                                            let sse_events = ctx.process_kiro_event(&event);
+                                            events.extend(sse_events);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("解码事件失败: {}", e);
+                                    }
+                                }
+                            }
+
+                            // 输出预算耗尽：已截断当前 delta，立即收尾并断开上游流。
+                            // 设 finished=true 让下一次 poll 返回 None，drop body_stream 即关闭
+                            // 上游连接，避免为客户端收不到的内容继续付费（参考 kirocc）。
+                            if ctx.budget_exceeded {
+                                events.extend(ctx.generate_final_events());
+                                ctx.log_completion();
+                                log_stream_latency(&timing, &ctx);
+                                tracing::info!(
+                                    output_tokens = ctx.output_tokens,
+                                    "输出达 max_tokens 预算，主动截断并断开上游流"
+                                );
+                                let bytes: Vec<Result<Bytes, Infallible>> = events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, timing)));
+                            }
+
+                            // 转换为 SSE 字节流
+                            let bytes: Vec<Result<Bytes, Infallible>> = events
+                                .into_iter()
+                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                .collect();
+
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, timing)))
+                        }
+                        Some(Err(e)) => {
+                            tracing::error!("读取响应流失败: {}", e);
+                            // 发送最终事件并结束
+                            let final_events = ctx.generate_final_events();
+                            // 记录请求完成日志（含 token 用量与耗时）
+                            ctx.log_completion();
+                            log_stream_latency(&timing, &ctx);
+                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                                .into_iter()
+                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                .collect();
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, timing)))
+                        }
+                        None => {
+                            // 流结束，发送最终事件
+                            let final_events = ctx.generate_final_events();
+                            // 记录请求完成日志（含 token 用量与耗时）
+                            ctx.log_completion();
+                            log_stream_latency(&timing, &ctx);
+                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                                .into_iter()
+                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                .collect();
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, timing)))
+                        }
+                    }
+                }
+                // 发送 ping 保活
+                _ = ping_interval.tick() => {
+                    tracing::trace!("发送 ping 保活事件");
+                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, timing)))
+                }
+            }
+        },
+    )
+    .flatten();
+
+    initial_stream.chain(processing_stream)
+}
+
+use super::converter::get_context_window_size;
+
+/// 处理非流式请求
+async fn handle_non_stream_request(
+    provider: std::sync::Arc<dyn crate::kiro::provider::UpstreamProvider>,
+    request_body: &str,
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+    max_output_tokens: i32,
+    cache: PromptCache,
+    cache_decision: CacheDecision,
+    actual_conversation_id: String,
+) -> Response {
+    let start_time = std::time::Instant::now();
+    // 调用 Kiro API（支持多凭据故障转移）
+    let (response, record) = match provider.call_api(request_body).await {
+        Ok(resp) => resp,
+        Err(e) => return map_provider_error(e),
+    };
+
+    // 读取响应体
+    let body_bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            // 详细错误（含上游 URL/IP/超时细节）只记 log，对外只返通用文案
+            // 防内部地址/代理信息通过错误响应泄露给客户端
+            tracing::error!("读取响应体失败: {}", e);
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "Failed to read upstream response body",
+                )),
+            )
+                .into_response();
+        }
+    };
+    record_cache_outcome(
+        &cache,
+        &cache_decision,
+        &actual_conversation_id,
+        cache_read_input_tokens,
+    );
+
+    // 解析事件流
+    let mut decoder = EventStreamDecoder::new();
+    if let Err(e) = decoder.feed(&body_bytes) {
+        tracing::warn!("缓冲区溢出: {}", e);
+    }
+
+    let mut text_content = String::new();
+    let mut tool_uses: Vec<serde_json::Value> = Vec::new();
+    let mut has_tool_use = false;
+    let mut stop_reason = "end_turn".to_string();
+    // 收集 reasoningContentEvent 的 thinking 内容
+    let mut thinking_content = String::new();
+    let mut thinking_signature: Option<String> = None;
+    // 上游 tokenUsageEvent 精确计量（三段不重叠计费口径）；Some 时覆盖本地估算
+    let mut real_usage: Option<crate::kiro::model::events::BillingSplit> = None;
+    // 上游 meteringEvent 的 credit（纯观测，对账真实命中率，不改计费）
+    let mut metering_credit: Option<f64> = None;
+
+    // 收集工具调用的增量 JSON
+    let mut tool_json_buffers: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for result in decoder.decode_iter() {
+        match result {
+            Ok(frame) => {
+                if let Ok(event) = Event::from_frame(frame) {
+                    match event {
+                        Event::AssistantResponse(resp) => {
+                            text_content.push_str(&resp.content);
+                        }
+                        Event::ToolUse(tool_use) => {
+                            has_tool_use = true;
+
+                            // 累积工具的 JSON 输入
+                            let buffer = tool_json_buffers
+                                .entry(tool_use.tool_use_id.clone())
+                                .or_default();
+                            buffer.push_str(&tool_use.input);
+
+                            // 如果是完整的工具调用，添加到列表
+                            if tool_use.stop {
+                                let input: serde_json::Value = if buffer.is_empty() {
+                                    serde_json::json!({})
+                                } else {
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
+                                };
+
+                                let original_name = tool_name_map
+                                    .get(&tool_use.name)
+                                    .cloned()
+                                    .unwrap_or_else(|| tool_use.name.clone());
+
+                                tool_uses.push(json!({
+                                    "type": "tool_use",
+                                    "id": tool_use.tool_use_id,
+                                    "name": original_name,
+                                    "input": input
+                                }));
+                            }
+                        }
+                        Event::ContextUsage(context_usage) => {
+                            // 从上下文使用百分比计算实际的 input_tokens
+                            // clamp 防上游异常返回 NaN/负/>100，避免 input_tokens 错乱
+                            let pct = super::stream::clamp_context_percentage(
+                                context_usage.context_usage_percentage,
+                            );
+                            let window_size = get_context_window_size(model);
+                            let actual_input_tokens = (pct * (window_size as f64) / 100.0)
+                                .clamp(0.0, i32::MAX as f64)
+                                as i32;
+                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
+                            if pct >= 100.0 {
+                                stop_reason = "model_context_window_exceeded".to_string();
+                            }
+                            // 探针：token 双计根因定位（非流式路径），与流式同口径
+                            tracing::warn!(
+                                target: "kiro::probe::context_usage",
+                                model = %model,
+                                raw_pct = context_usage.context_usage_percentage,
+                                clamped_pct = pct,
+                                window_size = window_size,
+                                derived_context_input = actual_input_tokens,
+                                local_input_after_cache = input_tokens,
+                                cache_creation = cache_creation_input_tokens,
+                                cache_read = cache_read_input_tokens,
+                                "contextUsageEvent 探针（非流式，token 双计根因定位）"
+                            );
+                        }
+                        Event::TokenUsage(token_usage) => {
+                            // 上游精确计量：派生三段不重叠计费口径，覆盖本地估算（非流式）
+                            let split = token_usage.billing_split();
+                            tracing::info!(
+                                target: "kiro::probe::token_usage",
+                                model = %model,
+                                raw_uncached = token_usage.uncached_input_tokens,
+                                raw_output = token_usage.output_tokens,
+                                raw_total = token_usage.total_tokens,
+                                raw_cache_read = token_usage.cache_read_input_tokens.unwrap_or(0),
+                                raw_cache_write = token_usage.cache_write_input_tokens.unwrap_or(0),
+                                extra = ?token_usage.extra,
+                                derived_input = split.input_tokens,
+                                derived_cache_creation = split.cache_creation_input_tokens,
+                                derived_cache_read = split.cache_read_input_tokens,
+                                derived_output = split.output_tokens,
+                                local_est_input = input_tokens,
+                                "tokenUsageEvent 精确计量（非流式，覆盖本地估算 → 修正 NewAPI 计费）"
+                            );
+                            if token_usage.has_real_usage() {
+                                real_usage = Some(split);
+                            }
+                        }
+                        Event::Metering(metering) => {
+                            // 纯观测：记录 Kiro 真实 credit，与对外上报口径对账（不改计费）。
+                            if metering.has_usage() {
+                                metering_credit = Some(metering.usage);
+                            }
+                        }
+                        Event::Exception { exception_type, .. }
+                            if exception_type == "ContentLengthExceededException" =>
+                        {
+                            stop_reason = "max_tokens".to_string();
+                        }
+                        Event::ReasoningContent(reasoning) => {
+                            if let Some(text) = &reasoning.text {
+                                thinking_content.push_str(text);
+                            } else if let Some(sig) = &reasoning.signature {
+                                thinking_signature = Some(sig.clone());
+                            }
+                        }
+                        Event::Unknown {
+                            event_type,
+                            payload_preview,
+                        } => {
+                            // 非流式路径同样记录未处理事件（如 reasoningContentEvent）
+                            tracing::warn!(
+                                "收到未处理的上游事件(非流式): event_type={} payload_preview={:?}",
+                                event_type,
+                                payload_preview
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("解码事件失败: {}", e);
+            }
+        }
+    }
+
+    // 确定 stop_reason
+    if has_tool_use && stop_reason == "end_turn" {
+        stop_reason = "tool_use".to_string();
+    }
+
+    // 输出预算（客户端 max_tokens）：Kiro 上游无限长字段，非流式整体响应已收齐，
+    // 在此把 thinking + text 总输出截断到预算内，避免客户端按 max_tokens 校验后 abort。
+    // thinking 与 text 共享预算（与流式、与 Claude Code 客户端口径一致）：先扣 thinking，
+    // text 用剩余配额。工具调用不截断（截断 JSON 会破坏参数）。
+    if max_output_tokens > 0 {
+        use super::stream::{estimate_tokens, truncate_text_to_token_budget};
+        let thinking_tokens = if thinking_content.is_empty() {
+            0
+        } else {
+            estimate_tokens(&thinking_content)
+        };
+        if thinking_tokens >= max_output_tokens {
+            // thinking 已吃满预算：截断 thinking，正文清空
+            thinking_content = truncate_text_to_token_budget(&thinking_content, max_output_tokens);
+            text_content.clear();
+            stop_reason = "max_tokens".to_string();
+        } else {
+            let text_budget = max_output_tokens - thinking_tokens;
+            if estimate_tokens(&text_content) > text_budget {
+                text_content = truncate_text_to_token_budget(&text_content, text_budget);
+                stop_reason = "max_tokens".to_string();
+            }
+        }
+    }
+
+    // 构建响应内容
+    let mut content: Vec<serde_json::Value> = Vec::new();
+
+    if thinking_enabled {
+        if !thinking_content.is_empty() {
+            // 4.8+ 路径：thinking 通过 reasoningContentEvent 独立传输
+            content.push(json!({
+                "type": "thinking",
+                "thinking": thinking_content,
+                "signature": thinking_signature.unwrap_or_default()
+            }));
+            if !text_content.is_empty() {
+                content.push(json!({
+                    "type": "text",
+                    "text": text_content
+                }));
+            }
+        } else {
+            // 旧路径：thinking 嵌入在 assistantResponseEvent 的 <thinking> 标签中
+            let (before_text, thinking, remaining_text) =
+                super::stream::extract_thinking_from_complete_text(&text_content);
+
+            if let Some(before) = before_text {
+                if !before.trim().is_empty() {
+                    content.push(json!({
+                        "type": "text",
+                        "text": before
+                    }));
+                }
+            }
+
+            if let Some(thinking_text) = thinking {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": thinking_text,
+                    "signature": super::stream::generate_fake_signature_for_model(model)
+                }));
+            }
+
+            if !remaining_text.is_empty() {
+                content.push(json!({
+                    "type": "text",
+                    "text": remaining_text
+                }));
+            }
+        }
+    } else if !text_content.is_empty() {
+        content.push(json!({
+            "type": "text",
+            "text": text_content
+        }));
+    }
+
+    content.extend(tool_uses);
+
+    // 估算输出 tokens（仅在上游未下发 tokenUsageEvent 时作为兜底）
+    let estimated_output_tokens = token::estimate_output_tokens(&content);
+
+    // 客户端可见 usage：输入侧三字段(input/cache_creation/cache_read)用本地缓存账
+    // (perceived 假缓存或真断点)，与流式 resolved_usage 同口径。上游 tokenUsageEvent
+    // 只接管 output_tokens(含 thinking，本地估算漏算；为 0 时不可信，回退估算)。
+    //
+    // 不让上游真值覆盖输入侧的原因(详见 stream::context::resolved_usage):
+    // 1. Kiro 多数模型 cacheRead 恒 0/None → 覆盖会把 perceived cache_read 顶成 0;
+    // 2. 上游 uncached_input 含 Kiro agent prompt + 注入 preset → 当 input 会虚高、被判异常。
+    let output_from_upstream = matches!(real_usage, Some(s) if s.output_tokens > 0);
+    let final_input_tokens = input_tokens.max(0);
+    let output_tokens = match real_usage {
+        Some(split) if split.output_tokens > 0 => split.output_tokens.max(0),
+        _ => estimated_output_tokens,
+    };
+    let final_cache_creation = cache_creation_input_tokens;
+    let final_cache_read = cache_read_input_tokens;
+
+    // 构建 Anthropic 响应
+    // 字段对齐官方 API（jp.pincc.ai 实测）：stop_details、usage.cache_creation/iterations/
+    // output_tokens_details/inference_geo、顶层 context_management。
+    let response_body = json!({
+        "model": canonical_anthropic_model(model),
+        "id": super::stream::generate_message_id(),
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": null,
+        "stop_details": null,
+        "usage": {
+            "input_tokens": final_input_tokens,
+            "cache_creation_input_tokens": final_cache_creation,
+            "cache_read_input_tokens": final_cache_read,
+            "cache_creation": super::cache_accounting::cache_creation_breakdown(final_cache_creation),
+            "iterations": [{
+                "input_tokens": final_input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_input_tokens": final_cache_read,
+                "cache_creation_input_tokens": final_cache_creation,
+                "cache_creation": super::cache_accounting::cache_creation_breakdown(final_cache_creation),
+                "type": "message"
+            }],
+            "output_tokens": output_tokens,
+            "output_tokens_details": { "thinking_tokens": 0 },
+            "service_tier": "standard",
+            "inference_geo": "not_available"
+        },
+        "context_management": { "applied_edits": [] }
+    });
+
+    // 记录请求完成日志（含 token 用量与耗时）
+    tracing::info!(
+        model = %model,
+        input_tokens = final_input_tokens,
+        cache_creation_input_tokens = final_cache_creation,
+        cache_read_input_tokens = final_cache_read,
+        output_tokens = output_tokens,
+        output_source = if output_from_upstream { "upstream" } else { "estimate" },
+        upstream_credit = metering_credit,
+        stop_reason = %stop_reason,
+        elapsed_ms = start_time.elapsed().as_millis() as u64,
+        "请求处理完成（非流式）"
+    );
+
+    // 把最终 token 回填到 metrics（与客户端可见 usage 口径一致）
+    record.update_tokens(
+        Some(final_input_tokens as u32),
+        Some(output_tokens.max(0) as u32),
+        Some(final_cache_read as u32),
+    );
+
+    (StatusCode::OK, Json(response_body)).into_response()
+}
+
+/// POST /v1/messages/count_tokens
+///
+/// 计算消息的 token 数量
+pub async fn count_tokens(
+    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
+) -> impl IntoResponse {
+    tracing::info!(
+        model = %payload.model,
+        message_count = %payload.messages.len(),
+        "Received POST /v1/messages/count_tokens request"
+    );
+
+    let total_tokens = token::count_all_tokens(
+        payload.model,
+        payload.system,
+        payload.messages,
+        payload.tools,
+    );
+
+    Json(CountTokensResponse {
+        input_tokens: saturating_to_i32(total_tokens.max(1)),
+    })
+}
+
+/// POST /cc/v1/messages
+///
+/// Claude Code 兼容端点，与 /v1/messages 的区别在于：
+/// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
+/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
+pub async fn post_messages_cc(
+    State(state): State<AppState>,
+    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    tracing::info!(
+        model = %payload.model,
+        max_tokens = %payload.max_tokens,
+        stream = %payload.stream,
+        message_count = %payload.messages.len(),
+        "Received POST /cc/v1/messages request"
+    );
+
+    // /cc/v1 也使用客户端原始输入作为 usage 总预算；注入的系统提示词是中转层实现细节。
+    let client_input_tokens = saturating_to_i32(token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ));
+    let incremental_input_tokens = estimate_incremental_input_tokens(&payload, client_input_tokens);
+
+    // 注入自定义系统提示词
+    inject_system_prompt(&mut payload, &state.prompt_config);
+
+    // 检查 KiroProvider 是否可用
+    let provider = match &state.kiro_provider {
+        Some(p) => p.clone(),
+        None => {
+            tracing::error!("KiroProvider 未配置");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse::new(
+                    "service_unavailable",
+                    "Kiro API provider not configured",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+    override_thinking_from_model_name(&mut payload);
+
+    // 检查是否为 WebSearch 请求
+    if websearch::has_web_search_tool(&payload) {
+        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
+
+        // 估算上游全量 tokens 供 prompt cache 判定；客户端可见 usage 仍使用注入前预算。
+        let input_tokens = saturating_to_i32(token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ));
+        let cache_decision = lookup_prompt_cache(&state.prompt_cache, &payload, input_tokens);
+        let (input_tokens_for_client, cache_creation_input_tokens, cache_read_input_tokens) =
+            client_visible_usage(
+                &state.prompt_cache,
+                &cache_decision,
+                &payload.model,
+                client_input_tokens,
+                incremental_input_tokens,
+            );
+
+        let response = websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens_for_client,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        )
+        .await;
+        if response.status().is_success() {
+            record_cache_report_only(
+                &state.prompt_cache,
+                &cache_decision,
+                cache_read_input_tokens,
+            );
+        }
+        return response;
+    }
+
+    // 估算输入 tokens（全量；也用于 prompt cache 的 85% 上限与 TTL 分桶）
+    let input_tokens = saturating_to_i32(token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ));
+
+    // ===== Prompt Cache 决定（多断点精确计费 + conversation_id 复用）=====
+    let cache_decision = lookup_prompt_cache(&state.prompt_cache, &payload, input_tokens);
+
+    // 转换请求（命中时强制 conversation_id）
+    let conversion_result =
+        match convert_request_with_options(&payload, cache_decision.forced_conversation_id.clone())
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let (error_type, message) = match &e {
+                    ConversionError::UnsupportedModel(model) => {
+                        ("invalid_request_error", format!("模型不支持: {}", model))
+                    }
+                    ConversionError::EmptyMessages => {
+                        ("invalid_request_error", "消息列表为空".to_string())
+                    }
+                };
+                tracing::warn!("请求转换失败: {}", e);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(error_type, message)),
+                )
+                    .into_response();
+            }
+        };
+
+    // cache entry 只能在上游成功接受请求后回写；否则 429/5xx 会污染真实缓存诊断。
+    let actual_conversation_id = conversion_result.conversation_state.conversation_id.clone();
+
+    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    let kiro_request = KiroRequest {
+        conversation_state: conversion_result.conversation_state,
+        profile_arn: None,
+    };
+
+    let request_body = match serde_json::to_string(&kiro_request) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::error!("序列化请求失败: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    format!("序列化请求失败: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    tracing::debug!("Kiro request body: {}", request_body);
+
+    let (input_tokens_for_client, cache_creation_input_tokens, cache_read_input_tokens) =
+        client_visible_usage(
+            &state.prompt_cache,
+            &cache_decision,
+            &payload.model,
+            client_input_tokens,
+            incremental_input_tokens,
+        );
+
+    // 检查是否启用了thinking
+    let thinking_enabled = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.is_enabled())
+        .unwrap_or(false);
+
+    let tool_name_map = conversion_result.tool_name_map;
+
+    if payload.stream {
+        // 流式响应（缓冲模式）
+        handle_stream_request_buffered(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens_for_client,
+            thinking_enabled,
+            tool_name_map,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            payload.max_tokens,
+            state.prompt_cache.clone(),
+            cache_decision,
+            actual_conversation_id,
+        )
+        .await
+    } else {
+        // 非流式响应：仅在配置开启时提取 thinking 块
+        let extract_thinking = state.extract_thinking && thinking_enabled;
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens_for_client,
+            extract_thinking,
+            tool_name_map,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            payload.max_tokens,
+            state.prompt_cache.clone(),
+            cache_decision,
+            actual_conversation_id,
+        )
+        .await
+    }
+}
+
+/// 处理流式请求（缓冲版本）
+///
+/// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
+/// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
+async fn handle_stream_request_buffered(
+    provider: std::sync::Arc<dyn crate::kiro::provider::UpstreamProvider>,
+    request_body: &str,
+    model: &str,
+    estimated_input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+    max_output_tokens: i32,
+    cache: PromptCache,
+    cache_decision: CacheDecision,
+    actual_conversation_id: String,
+) -> Response {
+    // 调用 Kiro API（支持多凭据故障转移）
+    let (response, record) = match provider.call_api_stream(request_body).await {
+        Ok(resp) => resp,
+        Err(e) => return map_provider_error(e),
+    };
+    record_cache_outcome(
+        &cache,
+        &cache_decision,
+        &actual_conversation_id,
+        cache_read_input_tokens,
+    );
+
+    // 创建缓冲流处理上下文
+    let mut ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    );
+    ctx.cache_creation_input_tokens = cache_creation_input_tokens;
+    ctx.cache_read_input_tokens = cache_read_input_tokens;
+    ctx.set_record(record);
+    // 客户端输出预算（max_tokens）：到顶截断并提前断开上游
+    ctx.set_max_output_tokens(max_output_tokens);
+
+    // 创建缓冲 SSE 流
+    let stream = create_buffered_sse_stream(response, ctx);
+
+    // 返回 SSE 响应
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// 创建缓冲 SSE 事件流
+///
+/// 工作流程：
+/// 1. 等待上游流完成，期间只发送 ping 保活信号
+/// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
+/// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
+/// 4. 一次性发送所有事件
+fn create_buffered_sse_stream(
+    response: reqwest::Response,
+    ctx: BufferedStreamContext,
+) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    let body_stream = response.bytes_stream();
+
+    stream::unfold(
+        (
+            body_stream,
+            ctx,
+            EventStreamDecoder::new(),
+            false,
+            interval(Duration::from_secs(PING_INTERVAL_SECS)),
+        ),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+            if finished {
+                return None;
+            }
+
+            loop {
+                tokio::select! {
+                    // 使用 biased 模式，优先检查 ping 定时器
+                    // 避免在上游 chunk 密集时 ping 被"饿死"
+                    biased;
+
+                    // 优先检查 ping 保活（等待期间唯一发送的数据）
+                    _ = ping_interval.tick() => {
+                        tracing::trace!("发送 ping 保活事件（缓冲模式）");
+                        let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
+                    }
+
+                    // 然后处理数据流
+                    chunk_result = body_stream.next() => {
+                        match chunk_result {
+                            Some(Ok(chunk)) => {
+                                // 解码事件
+                                if let Err(e) = decoder.feed(&chunk) {
+                                    tracing::warn!("缓冲区溢出: {}", e);
+                                }
+
+                                for result in decoder.decode_iter() {
+                                    match result {
+                                        Ok(frame) => {
+                                            if let Ok(event) = Event::from_frame(frame) {
+                                                // 缓冲事件（复用 StreamContext 的处理逻辑）
+                                                ctx.process_and_buffer(&event);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("解码事件失败: {}", e);
+                                        }
+                                    }
+                                }
+
+                                // 输出预算耗尽：收尾并断开上游流（drop body_stream 关连接）。
+                                if ctx.budget_exceeded() {
+                                    let all_events = ctx.finish_and_get_all_events();
+                                    ctx.log_completion();
+                                    tracing::info!("输出达 max_tokens 预算，主动截断并断开上游流（缓冲模式）");
+                                    let bytes: Vec<Result<Bytes, Infallible>> = all_events
+                                        .into_iter()
+                                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                        .collect();
+                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                }
+                                // 继续读取下一个 chunk，不发送任何数据
+                            }
+                            Some(Err(e)) => {
+                                tracing::error!("读取响应流失败: {}", e);
+                                // 发生错误，完成处理并返回所有事件
+                                let all_events = ctx.finish_and_get_all_events();
+                                // 记录请求完成日志（含 token 用量与耗时）
+                                ctx.log_completion();
+                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                            }
+                            None => {
+                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）
+                                let all_events = ctx.finish_and_get_all_events();
+                                // 记录请求完成日志（含 token 用量与耗时）
+                                ctx.log_completion();
+                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+    .flatten()
+}

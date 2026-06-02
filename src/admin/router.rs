@@ -1,0 +1,115 @@
+//! Admin API 路由配置
+
+use axum::{
+    Router,
+    extract::DefaultBodyLimit,
+    middleware,
+    routing::{delete, get, post},
+};
+use std::time::Duration;
+use tower_http::timeout::TimeoutLayer;
+
+use super::{
+    handlers::{
+        add_credential, add_user_preset, clear_prompt_cache, delete_credential,
+        delete_credential_group, delete_user_preset, force_refresh_token, get_all_credentials,
+        get_credential_balance, get_load_balancing_mode, get_metrics, get_metrics_prometheus,
+        get_preset_content, get_prompt_cache_config, get_retry_config, get_system_prompt,
+        list_credential_groups, list_presets, reset_failure_count, set_credential_disabled,
+        set_credential_group, set_credential_priority, set_load_balancing_mode,
+        update_prompt_cache_config, update_retry_config, update_system_prompt, update_user_preset,
+        upsert_credential_group,
+    },
+    middleware::{AdminState, admin_auth_middleware},
+};
+
+/// Admin 请求超时（30s）：所有 admin 接口都是非流式小响应，超过即视为异常。
+const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Admin 请求体上限（1MB）：preset/system-prompt 文本远小于此，收紧防磁盘放大。
+const ADMIN_MAX_BODY_SIZE: usize = 1024 * 1024;
+
+/// 创建 Admin API 路由
+///
+/// # 端点
+/// - `GET /credentials` - 获取所有凭据状态
+/// - `POST /credentials` - 添加新凭据
+/// - `DELETE /credentials/:id` - 删除凭据
+/// - `POST /credentials/:id/disabled` - 设置凭据禁用状态
+/// - `POST /credentials/:id/priority` - 设置凭据优先级
+/// - `POST /credentials/:id/reset` - 重置失败计数
+/// - `POST /credentials/:id/refresh` - 强制刷新 Token
+/// - `GET /credentials/:id/balance` - 获取凭据余额
+/// - `GET /config/load-balancing` - 获取负载均衡模式
+/// - `PUT /config/load-balancing` - 设置负载均衡模式
+///
+/// # 认证
+/// 需要 Admin API Key 认证，支持：
+/// - `x-api-key` header
+/// - `Authorization: Bearer <token>` header
+pub fn create_admin_router(state: AdminState) -> Router {
+    Router::new()
+        .route("/metrics", get(get_metrics))
+        .route("/metrics/prometheus", get(get_metrics_prometheus))
+        .route(
+            "/runtime/retry-config",
+            get(get_retry_config).put(update_retry_config),
+        )
+        .route(
+            "/runtime/prompt-cache-config",
+            get(get_prompt_cache_config).put(update_prompt_cache_config),
+        )
+        .route(
+            "/runtime/prompt-cache-config/clear",
+            post(clear_prompt_cache),
+        )
+        .route(
+            "/credentials",
+            get(get_all_credentials).post(add_credential),
+        )
+        .route("/credentials/{id}", delete(delete_credential))
+        .route("/credentials/{id}/disabled", post(set_credential_disabled))
+        .route("/credentials/{id}/priority", post(set_credential_priority))
+        .route("/credentials/{id}/group", post(set_credential_group))
+        .route("/credentials/{id}/reset", post(reset_failure_count))
+        .route("/credentials/{id}/refresh", post(force_refresh_token))
+        .route("/credentials/{id}/balance", get(get_credential_balance))
+        .route(
+            "/config/load-balancing",
+            get(get_load_balancing_mode).put(set_load_balancing_mode),
+        )
+        .route(
+            "/config/credential-groups",
+            get(list_credential_groups).post(upsert_credential_group),
+        )
+        .route(
+            "/config/credential-groups/{id}",
+            delete(delete_credential_group),
+        )
+        .route(
+            "/config/system-prompt",
+            get(get_system_prompt).put(update_system_prompt),
+        )
+        .route("/config/system-prompt/presets", get(list_presets))
+        .route(
+            "/config/system-prompt/presets/{id}",
+            get(get_preset_content),
+        )
+        .route("/config/system-prompt/user-presets", post(add_user_preset))
+        .route(
+            "/config/system-prompt/user-presets/{id}",
+            axum::routing::put(update_user_preset).delete(delete_user_preset),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_auth_middleware,
+        ))
+        // Admin 接口都是小 JSON 载荷、无流式响应，因此可以套完整请求超时
+        // （防慢 loris）+ 收紧 body 上限（防超大 preset/system-prompt 磁盘放大）。
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            ADMIN_REQUEST_TIMEOUT,
+        ))
+        .layer(DefaultBodyLimit::max(ADMIN_MAX_BODY_SIZE))
+        .with_state(state)
+}
