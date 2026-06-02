@@ -121,6 +121,9 @@ enum DisabledReason {
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
     QuotaExceeded,
+    /// 账号被上游封禁（403 + "temporarily is suspended" / "locked your account"）。
+    /// 永久性问题，force-refresh 无意义，应立即禁用避免反复重试毒化号池。
+    AccountSuspended,
     /// Refresh Token 永久失效（服务端返回 invalid_grant）
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
@@ -1167,6 +1170,26 @@ mod tests {
 
         // 再禁用第二个后，无可用凭据
         assert!(!manager.report_quota_exhausted(2));
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    /// 封号(403 suspended)应立即禁用凭据并故障转移，且不被自动恢复。
+    /// 这是账号持续掉订阅场景下避免被封号反复重试毒化号池的关键。
+    #[test]
+    fn test_multi_token_manager_report_account_suspended() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert_eq!(manager.available_count(), 2);
+        // #1 封号 → 立即禁用，仍有 #2 可用
+        assert!(manager.report_account_suspended(1));
+        assert_eq!(manager.available_count(), 1);
+        // #2 也封号 → 无可用凭据
+        assert!(!manager.report_account_suspended(2));
         assert_eq!(manager.available_count(), 0);
     }
 

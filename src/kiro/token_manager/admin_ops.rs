@@ -73,6 +73,7 @@ impl MultiTokenManager {
                                 DisabledReason::TooManyFailures => "TooManyFailures",
                                 DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                                 DisabledReason::QuotaExceeded => "QuotaExceeded",
+                                DisabledReason::AccountSuspended => "AccountSuspended",
                                 DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                                 DisabledReason::InvalidConfig => "InvalidConfig",
                             }

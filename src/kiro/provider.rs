@@ -826,6 +826,22 @@ impl KiroProvider {
                     last_error = Some(err());
                     continue;
                 }
+                FailureAction::AccountSuspended => {
+                    tracing::error!(
+                        "{} 请求失败（账号被上游封号，立即禁用并切换，尝试 {}/{}）: {} {}",
+                        label,
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    let has_available = self.token_manager.report_account_suspended(ctx.id);
+                    if !has_available {
+                        anyhow::bail!("{} 请求失败（所有凭据已用尽）: {} {}", label, status, body);
+                    }
+                    last_error = Some(err());
+                    continue;
+                }
                 FailureAction::OverageRateLimit => {
                     tracing::warn!(
                         "{} 请求失败（OVERAGE 速率上限，凭据进入 cooldown 等待窗口刷新，尝试 {}/{}）: {}",
@@ -1121,6 +1137,8 @@ impl CallKind {
 pub(crate) enum FailureAction {
     /// 402 + 月度配额永久耗尽：禁用凭据并故障转移（report_quota_exhausted）
     QuotaExhausted,
+    /// 403 + 账号被上游封禁（suspended/locked）：立即禁用并故障转移（report_account_suspended）
+    AccountSuspended,
     /// 402 + OVERAGE 速率上限：进入较长 cooldown 等窗口刷新，不禁用
     OverageRateLimit,
     /// 400：请求本身有问题，重试/换号无意义，直接 bail
@@ -1133,6 +1151,19 @@ pub(crate) enum FailureAction {
     OtherClientError,
     /// 兜底未知（非 4xx/5xx 的异常 status）：归类为上游瞬态
     UnknownUpstream,
+}
+
+/// 判断 403 响应体是否为上游封号（永久性，非 token 问题）。
+///
+/// Kiro 封号文案示例：
+/// `Your User ID (...) temporarily is suspended. We've locked your account ...`
+/// 注意 "temporarily" 仅是话术，实际需人工联系客服解封，对代理而言是永久不可用，
+/// 故归类为立即禁用而非瞬态重试。
+fn is_account_suspended(body: &str) -> bool {
+    let b = body.to_lowercase();
+    b.contains("is suspended")
+        || b.contains("locked your account")
+        || b.contains("account has been suspended")
 }
 
 /// 把一个失败的上游响应（status + body）分类成 [`FailureAction`]。
@@ -1155,6 +1186,10 @@ pub(crate) fn classify_failure(
         return FailureAction::BadRequest;
     }
     if matches!(code, 401 | 403) {
+        // 403 + 封号语义：永久性，force-refresh 无意义，立即禁用而非走 AuthError 反复重试。
+        if code == 403 && is_account_suspended(body) {
+            return FailureAction::AccountSuspended;
+        }
         return FailureAction::AuthError;
     }
     if matches!(code, 408 | 429) || status.is_server_error() {
@@ -1208,6 +1243,19 @@ mod classify_failure_tests {
     fn classifies_401_403_as_auth_error() {
         assert_eq!(act(401, "nope"), FailureAction::AuthError);
         assert_eq!(act(403, "nope"), FailureAction::AuthError);
+    }
+
+    #[test]
+    fn classifies_403_suspended_as_account_suspended() {
+        // Kiro 真实封号文案 → 应立即禁用，不走 AuthError 反复重试
+        let body = r#"{"message":"Your User ID (f42834b8-c091-7003-507a-5cae3da2b4ea) temporarily is suspended. We've locked your account as a security precaution.","reason":null}"#;
+        assert_eq!(act(403, body), FailureAction::AccountSuspended);
+        // 大小写不敏感
+        assert_eq!(act(403, "ACCOUNT HAS BEEN SUSPENDED"), FailureAction::AccountSuspended);
+        // 401 + 同文案不归此类（401 永远走 AuthError force-refresh）
+        assert_eq!(act(401, "is suspended"), FailureAction::AuthError);
+        // 普通 403 仍是 AuthError
+        assert_eq!(act(403, "forbidden"), FailureAction::AuthError);
     }
 
     #[test]

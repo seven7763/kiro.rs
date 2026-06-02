@@ -342,6 +342,55 @@ impl MultiTokenManager {
         result
     }
 
+    /// 报告指定凭据被上游封号（403 + suspended/locked）。永久性，立即禁用并切换。
+    ///
+    /// 与 [`Self::report_quota_exhausted`] 同构，区别仅在 `DisabledReason::AccountSuspended`。
+    /// 封号 force-refresh 无意义，必须立即踢出号池，否则每个请求都会反复选中它、
+    /// 重试耗尽 → 对外 503（账号持续掉订阅时尤其严重）。
+    pub fn report_account_suspended(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            entry.inflight = entry.inflight.saturating_sub(1);
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::AccountSuspended);
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+
+            tracing::error!("凭据 #{} 已被上游封号（account suspended），已被禁用", id);
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.save_stats_debounced();
+        result
+    }
+
     /// 报告指定凭据刷新 Token 失败。
     ///
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
