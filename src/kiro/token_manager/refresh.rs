@@ -96,15 +96,22 @@ pub(crate) async fn refresh_token(
 
     // 根据 auth_method 选择刷新方式
     // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
+    // 顺序：external_idp → idc → social（绝不能把 external_idp 落到 social）
     let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
-        if credentials.client_id.is_some() && credentials.client_secret.is_some() {
+        if credentials.is_external_idp_credential() {
+            "external_idp"
+        } else if credentials.client_id.is_some() && credentials.client_secret.is_some() {
             "idc"
         } else {
             "social"
         }
     });
 
-    if auth_method.eq_ignore_ascii_case("idc")
+    if auth_method.eq_ignore_ascii_case("external_idp")
+        || auth_method.eq_ignore_ascii_case("externalidp")
+    {
+        refresh_external_idp_token(credentials, config, proxy).await
+    } else if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
     {
@@ -302,6 +309,179 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 解析/补全 external_idp 的 token_endpoint（优先凭据内字段，否则 OIDC discovery）
+async fn resolve_external_idp_token_endpoint(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<(String, Option<String>)> {
+    if let Some(endpoint) = credentials
+        .token_endpoint
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        return Ok((endpoint.to_string(), None));
+    }
+
+    let issuer = credentials
+        .issuer_url
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "external_idp 刷新需要 tokenEndpoint 或 issuerUrl（两者皆空，无法定位 token 端点）"
+            )
+        })?;
+
+    let issuer = issuer.trim_end_matches('/');
+    let discovery_url = format!("{}/.well-known/openid-configuration", issuer);
+    tracing::info!(
+        "external_idp: 未配置 tokenEndpoint，正在 OIDC discovery: {}",
+        discovery_url
+    );
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let response = client
+        .get(&discovery_url)
+        .header("Accept", "application/json")
+        .header("Connection", "close")
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let redacted = crate::common::redact::redact_secret_text(&body_text);
+        bail!(
+            "OIDC discovery 失败 ({}): {} {}",
+            discovery_url,
+            status,
+            redacted
+        );
+    }
+
+    let doc: OidcDiscoveryDocument = response.json().await?;
+    let endpoint = doc
+        .token_endpoint
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("OIDC discovery 响应缺少 token_endpoint: {}", discovery_url)
+        })?;
+    Ok((endpoint, Some(discovery_url)))
+}
+
+/// 刷新 External IdP Token（客户 IdP 的 OAuth2 refresh_token grant）
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新 External IdP Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let client_id = credentials
+        .client_id
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("external_idp 刷新需要 clientId"))?;
+
+    let (token_endpoint, _) =
+        resolve_external_idp_token_endpoint(credentials, config, proxy).await?;
+
+    let mut form = vec![
+        ("grant_type", "refresh_token".to_string()),
+        ("refresh_token", refresh_token.to_string()),
+        ("client_id", client_id.to_string()),
+    ];
+    if let Some(scopes) = credentials
+        .scopes
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        form.push(("scope", scopes.to_string()));
+    }
+    if let Some(audience) = credentials
+        .audience
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        form.push(("audience", audience.to_string()));
+    }
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let response = client
+        .post(&token_endpoint)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Connection", "close")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let redacted_body = crate::common::redact::redact_secret_text(&body_text);
+
+        if (status.as_u16() == 400 || status.as_u16() == 401)
+            && (body_text.contains("\"invalid_grant\"") || body_text.contains("invalid_grant"))
+        {
+            return Err(RefreshTokenInvalidError {
+                message: format!(
+                    "external_idp refreshToken 已失效 (invalid_grant): {}",
+                    redacted_body
+                ),
+            }
+            .into());
+        }
+
+        let error_msg = match status.as_u16() {
+            401 => "External IdP 凭证已过期或无效，需要重新认证",
+            403 => "权限不足，无法刷新 External IdP Token",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，External IdP 服务暂时不可用",
+            _ => "External IdP Token 刷新失败",
+        };
+        bail!("{}: {} {}", error_msg, status, redacted_body);
+    }
+
+    let data: ExternalIdpRefreshResponse = response.json().await?;
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(data.access_token);
+    new_credentials.auth_method = Some("external_idp".to_string());
+    if new_credentials.provider.is_none() {
+        new_credentials.provider = Some("ExternalIdp".to_string());
+    }
+    // 写回 discovery 得到的 endpoint，避免每次 discovery
+    if new_credentials
+        .token_endpoint
+        .as_ref()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
+    {
+        new_credentials.token_endpoint = Some(token_endpoint);
+    }
+
+    if let Some(new_refresh_token) = data.refresh_token {
+        if !new_refresh_token.is_empty() {
+            new_credentials.refresh_token = Some(new_refresh_token);
+        }
+    }
+
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    Ok(new_credentials)
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -351,6 +531,8 @@ pub(crate) async fn get_usage_limits(
 
     if credentials.is_api_key_credential() {
         request = request.header("tokentype", "API_KEY");
+    } else if credentials.is_external_idp_credential() {
+        request = request.header("TokenType", "EXTERNAL_IDP");
     }
 
     let response = request.send().await?;

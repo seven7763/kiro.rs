@@ -271,6 +271,7 @@ export function CredentialCard({
                     {credential.authMethod === 'api_key' ? 'API Key' :
                      credential.authMethod === 'idc' ? 'IdC' :
                      credential.authMethod === 'social' ? 'Social' :
+                     credential.authMethod === 'external_idp' ? 'External IdP' :
                      credential.authMethod}
                   </Badge>
                 )}

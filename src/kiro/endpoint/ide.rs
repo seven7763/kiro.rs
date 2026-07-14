@@ -5,6 +5,7 @@
 //! - MCP: `https://q.{api_region}.amazonaws.com/mcp`
 //!
 //! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`。
+//! external_idp 凭据额外带 `TokenType: EXTERNAL_IDP`，并剥离企业 API 不兼容字段。
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
@@ -90,6 +91,8 @@ impl KiroEndpoint for IdeEndpoint {
 
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
+        } else if ctx.credentials.is_external_idp_credential() {
+            req = req.header("TokenType", "EXTERNAL_IDP");
         }
         req
     }
@@ -108,12 +111,19 @@ impl KiroEndpoint for IdeEndpoint {
         }
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
+        } else if ctx.credentials.is_external_idp_credential() {
+            req = req.header("TokenType", "EXTERNAL_IDP");
         }
         req
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        inject_profile_arn(body, &ctx.credentials.profile_arn)
+        let body = if ctx.credentials.is_external_idp_credential() {
+            strip_enterprise_incompatible_fields(body)
+        } else {
+            body.to_string()
+        };
+        inject_profile_arn(&body, &ctx.credentials.profile_arn)
     }
 }
 
@@ -130,9 +140,77 @@ fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Strin
     request_body.to_string()
 }
 
+/// external_idp 企业 API 对部分字段返回 400：剥离 agentContinuationId / agentTaskType，
+/// 以及空的 userInputMessageContext（无 tools / toolResults）。
+fn strip_enterprise_incompatible_fields(request_body: &str) -> String {
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) else {
+        return request_body.to_string();
+    };
+
+    if let Some(state) = json.get_mut("conversationState") {
+        if let Some(obj) = state.as_object_mut() {
+            obj.remove("agentContinuationId");
+            obj.remove("agentTaskType");
+
+            if let Some(current) = obj.get_mut("currentMessage") {
+                if let Some(user_msg) = current.get_mut("userInputMessage") {
+                    if let Some(user_obj) = user_msg.as_object_mut() {
+                        let empty_ctx = user_obj
+                            .get("userInputMessageContext")
+                            .map(is_empty_user_input_message_context)
+                            .unwrap_or(false);
+                        if empty_ctx {
+                            user_obj.remove("userInputMessageContext");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    serde_json::to_string(&json).unwrap_or_else(|_| request_body.to_string())
+}
+
+fn is_empty_user_input_message_context(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                return true;
+            }
+            let tools_empty = map
+                .get("tools")
+                .map(|v| v.as_array().map(|a| a.is_empty()).unwrap_or(false))
+                .unwrap_or(true);
+            let results_empty = map
+                .get("toolResults")
+                .map(|v| v.as_array().map(|a| a.is_empty()).unwrap_or(false))
+                .unwrap_or(true);
+            // 仅当没有实质工具/结果时视为空上下文
+            tools_empty && results_empty && {
+                // 其它键若也全是空数组/空对象/null 仍视为空
+                map.iter().all(|(k, v)| {
+                    if k == "tools" || k == "toolResults" {
+                        true
+                    } else {
+                        match v {
+                            serde_json::Value::Null => true,
+                            serde_json::Value::Array(a) => a.is_empty(),
+                            serde_json::Value::Object(o) => o.is_empty(),
+                            serde_json::Value::String(s) => s.is_empty(),
+                            _ => false,
+                        }
+                    }
+                })
+            }
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::inject_profile_arn;
+    use super::{inject_profile_arn, strip_enterprise_incompatible_fields};
     use serde_json::Value;
 
     #[test]
@@ -172,5 +250,58 @@ mod tests {
         let arn = Some("arn:test".to_string());
         let result = inject_profile_arn(body, &arn);
         assert_eq!(result, "not-valid-json");
+    }
+
+    #[test]
+    fn test_strip_enterprise_fields() {
+        let body = r#"{
+            "conversationState": {
+                "agentContinuationId": "cont-1",
+                "agentTaskType": "vibe",
+                "conversationId": "c1",
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "hi",
+                        "modelId": "m",
+                        "userInputMessageContext": {}
+                    }
+                }
+            }
+        }"#;
+        let stripped = strip_enterprise_incompatible_fields(body);
+        let json: Value = serde_json::from_str(&stripped).unwrap();
+        let state = &json["conversationState"];
+        assert!(state.get("agentContinuationId").is_none());
+        assert!(state.get("agentTaskType").is_none());
+        assert_eq!(state["conversationId"], "c1");
+        assert!(
+            state["currentMessage"]["userInputMessage"]
+                .get("userInputMessageContext")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_strip_keeps_tools_context() {
+        let body = r#"{
+            "conversationState": {
+                "agentContinuationId": "x",
+                "currentMessage": {
+                    "userInputMessage": {
+                        "userInputMessageContext": {
+                            "tools": [{"toolSpecification":{"name":"t"}}]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let stripped = strip_enterprise_incompatible_fields(body);
+        let json: Value = serde_json::from_str(&stripped).unwrap();
+        assert!(
+            json["conversationState"]["currentMessage"]["userInputMessage"]
+                .get("userInputMessageContext")
+                .is_some()
+        );
+        assert!(json["conversationState"].get("agentContinuationId").is_none());
     }
 }

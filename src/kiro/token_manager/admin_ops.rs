@@ -380,6 +380,32 @@ impl MultiTokenManager {
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
 
+        // 3b. 缺 profileArn 时尝试 ListAvailableProfiles 自动探测
+        if !validated_cred
+            .profile_arn
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
+            // 用户导入时可能已带 profile_arn，优先保留；否则用刷新后 token 探测
+            if let Some(arn) = new_cred
+                .profile_arn
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                validated_cred.profile_arn = Some(arn.to_string());
+            } else {
+                let effective_proxy = self.effective_proxy_for(&validated_cred);
+                validated_cred = crate::kiro::profile_discovery::ensure_profile_arn(
+                    validated_cred,
+                    &self.config,
+                    effective_proxy.as_ref(),
+                )
+                .await;
+            }
+        }
+
         // 4. 分配新 ID
         let new_id = {
             let entries = self.entries.lock();
@@ -392,15 +418,36 @@ impl MultiTokenManager {
         validated_cred.auth_method = new_cred.auth_method.map(|m| {
             if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
                 "idc".to_string()
+            } else if m.eq_ignore_ascii_case("externalidp") {
+                "external_idp".to_string()
             } else {
                 m
             }
         });
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
-        validated_cred.region = new_cred.region;
-        validated_cred.auth_region = new_cred.auth_region;
-        validated_cred.api_region = new_cred.api_region;
+        // 企业字段：refresh 路径可能已写回 token_endpoint，优先保留已刷新结果，空则回填用户输入
+        if validated_cred.token_endpoint.is_none() {
+            validated_cred.token_endpoint = new_cred.token_endpoint;
+        }
+        if validated_cred.issuer_url.is_none() {
+            validated_cred.issuer_url = new_cred.issuer_url;
+        }
+        if validated_cred.scopes.is_none() {
+            validated_cred.scopes = new_cred.scopes;
+        }
+        if validated_cred.audience.is_none() {
+            validated_cred.audience = new_cred.audience;
+        }
+        if validated_cred.provider.is_none() {
+            validated_cred.provider = new_cred.provider;
+        }
+        if validated_cred.profile_arn.is_none() {
+            validated_cred.profile_arn = new_cred.profile_arn;
+        }
+        validated_cred.region = new_cred.region.or(validated_cred.region.take());
+        validated_cred.auth_region = new_cred.auth_region.or(validated_cred.auth_region.take());
+        validated_cred.api_region = new_cred.api_region.or(validated_cred.api_region.take());
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
         validated_cred.proxy_url = new_cred.proxy_url;
@@ -408,6 +455,9 @@ impl MultiTokenManager {
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.group = new_cred.group;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        if validated_cred.endpoint.is_none() {
+            validated_cred.endpoint = new_cred.endpoint;
+        }
 
         {
             let mut entries = self.entries.lock();

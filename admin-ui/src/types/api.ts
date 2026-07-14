@@ -275,13 +275,25 @@ export interface UpsertCredentialGroupRequest {
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  accessToken?: string
+  profileArn?: string
+  expiresAt?: string
+  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp'
   clientId?: string
   clientSecret?: string
+  /** 仅诊断用；无法单独刷新 */
+  clientIdHash?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
+  audience?: string
+  provider?: string
   priority?: number
+  region?: string
   authRegion?: string
   apiRegion?: string
   machineId?: string
+  email?: string
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string

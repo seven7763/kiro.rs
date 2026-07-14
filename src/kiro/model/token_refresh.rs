@@ -44,3 +44,21 @@ pub struct IdcRefreshResponse {
     #[serde(default)]
     pub profile_arn: Option<String>,
 }
+
+/// External IdP OAuth2 token 刷新响应（兼容 snake_case 与 camelCase）
+#[derive(Debug, Deserialize)]
+pub struct ExternalIdpRefreshResponse {
+    #[serde(alias = "accessToken")]
+    pub access_token: String,
+    #[serde(default, alias = "refreshToken")]
+    pub refresh_token: Option<String>,
+    #[serde(default, alias = "expiresIn")]
+    pub expires_in: Option<i64>,
+}
+
+/// OIDC discovery 文档中我们关心的字段
+#[derive(Debug, Deserialize)]
+pub struct OidcDiscoveryDocument {
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+}

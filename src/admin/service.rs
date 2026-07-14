@@ -479,15 +479,86 @@ impl AdminService {
 
         // 构建凭据对象
         let email = req.email.clone();
+        let mut auth_method = req.auth_method;
+        if auth_method.eq_ignore_ascii_case("externalidp") {
+            auth_method = "external_idp".to_string();
+        } else if auth_method.eq_ignore_ascii_case("builder-id")
+            || auth_method.eq_ignore_ascii_case("iam")
+            || auth_method.eq_ignore_ascii_case("IdC")
+        {
+            auth_method = "idc".to_string();
+        } else if auth_method.eq_ignore_ascii_case("apikey") {
+            auth_method = "api_key".to_string();
+        }
+
+        // external_idp 导入校验：refreshToken + clientId + (tokenEndpoint|issuerUrl)
+        if auth_method.eq_ignore_ascii_case("external_idp") {
+            if req.client_id.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "external_idp 凭据需要 clientId".to_string(),
+                ));
+            }
+            let has_endpoint = req
+                .token_endpoint
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let has_issuer = req
+                .issuer_url
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !has_endpoint && !has_issuer {
+                return Err(AdminServiceError::InvalidCredential(
+                    "external_idp 凭据需要 tokenEndpoint 或 issuerUrl".to_string(),
+                ));
+            }
+        }
+
+        // IdC 需要 clientId + clientSecret（Enterprise 导出若只有 clientIdHash 无法在服务端还原）
+        if auth_method.eq_ignore_ascii_case("idc") {
+            let missing_id = req.client_id.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true);
+            let missing_secret = req
+                .client_secret
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true);
+            if missing_id || missing_secret {
+                let hash_hint = req
+                    .client_id_hash
+                    .as_ref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|h| {
+                        format!(
+                            " 导出含 clientIdHash={}，请在登录机打开 ~/.aws/sso/cache/{}.json 取出 clientId/clientSecret 后一并导入（或 JSON 里附上 clientRegistration）。",
+                            h, h
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        " 若导出只有 clientIdHash，请在登录机 ~/.aws/sso/cache/<hash>.json 取出 registration。".to_string()
+                    });
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "idc/Enterprise 凭据需要 clientId 与 clientSecret。{}",
+                    hash_hint
+                )));
+            }
+        }
+
         let new_cred = KiroCredentials {
             id: None,
-            access_token: None,
+            access_token: req.access_token,
             refresh_token: req.refresh_token,
-            profile_arn: None,
-            expires_at: None,
-            auth_method: Some(req.auth_method),
+            profile_arn: req.profile_arn,
+            expires_at: req.expires_at,
+            auth_method: Some(auth_method),
             client_id: req.client_id,
             client_secret: req.client_secret,
+            token_endpoint: req.token_endpoint,
+            issuer_url: req.issuer_url,
+            scopes: req.scopes,
+            audience: req.audience,
+            provider: req.provider,
             priority: req.priority,
             region: req.region,
             auth_region: req.auth_region,

@@ -34,17 +34,37 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 
-    /// 认证方式 (social / idc)
+    /// 认证方式 (social / idc / api_key / external_idp)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
 
-    /// OIDC Client ID (IdC 认证需要)
+    /// OIDC Client ID (IdC / external_idp 认证需要)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 
     /// OIDC Client Secret (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
+
+    /// 企业 External IdP 的 token 刷新端点（OAuth2 token endpoint）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// 企业 External IdP 的 issuer URL（OIDC discovery 用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+
+    /// OAuth scopes（空格分隔；external_idp 刷新时可选带上）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+
+    /// OAuth audience（external_idp 可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+
+    /// 登录提供方标识（Enterprise / ExternalIdp / Google 等，便于诊断）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
@@ -125,6 +145,11 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
         "idc"
     } else if value.eq_ignore_ascii_case("api_key") || value.eq_ignore_ascii_case("apikey") {
         "api_key"
+    } else if value.eq_ignore_ascii_case("external_idp") || value.eq_ignore_ascii_case("externalidp")
+    {
+        "external_idp"
+    } else if value.eq_ignore_ascii_case("idc") {
+        "idc"
     } else {
         value
     }
@@ -365,6 +390,26 @@ impl KiroCredentials {
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
     }
+
+    /// 检查是否为 External IdP（企业客户 IdP）凭据
+    pub fn is_external_idp_credential(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("external_idp") || m.eq_ignore_ascii_case("externalidp"))
+            .unwrap_or(false)
+    }
+
+    /// 是否为企业类 provider（Enterprise IdC 或 ExternalIdp）
+    pub fn is_enterprise_provider(&self) -> bool {
+        self.provider
+            .as_deref()
+            .map(|p| {
+                p.eq_ignore_ascii_case("Enterprise")
+                    || p.eq_ignore_ascii_case("ExternalIdp")
+                    || p.eq_ignore_ascii_case("External_Idp")
+            })
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +449,46 @@ mod tests {
     }
 
     #[test]
+    fn test_external_idp_fields_and_helpers() {
+        let json = r#"{
+            "refreshToken": "rt",
+            "authMethod": "ExternalIdp",
+            "clientId": "cid",
+            "tokenEndpoint": "https://idp.example/token",
+            "issuerUrl": "https://idp.example",
+            "scopes": "openid offline_access",
+            "audience": "api",
+            "provider": "ExternalIdp",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/X"
+        }"#;
+        let mut creds = KiroCredentials::from_json(json).unwrap();
+        creds.canonicalize_auth_method();
+        assert_eq!(creds.auth_method.as_deref(), Some("external_idp"));
+        assert!(creds.is_external_idp_credential());
+        assert!(creds.is_enterprise_provider());
+        assert_eq!(
+            creds.token_endpoint.as_deref(),
+            Some("https://idp.example/token")
+        );
+        assert_eq!(creds.issuer_url.as_deref(), Some("https://idp.example"));
+        assert_eq!(creds.scopes.as_deref(), Some("openid offline_access"));
+        assert_eq!(creds.audience.as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn test_canonicalize_external_idp_aliases() {
+        assert_eq!(
+            canonicalize_auth_method_value("external_idp"),
+            "external_idp"
+        );
+        assert_eq!(
+            canonicalize_auth_method_value("ExternalIdp"),
+            "external_idp"
+        );
+        assert_eq!(canonicalize_auth_method_value("idc"), "idc");
+    }
+
+    #[test]
     fn test_from_json_with_unknown_keys() {
         let json = r#"{
             "accessToken": "test_token",
@@ -424,7 +509,12 @@ mod tests {
             expires_at: None,
             auth_method: Some("social".to_string()),
             client_id: None,
-            client_secret: None,
+                        client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            audience: None,
+            provider: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -543,7 +633,12 @@ mod tests {
             expires_at: None,
             auth_method: None,
             client_id: None,
-            client_secret: None,
+                        client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            audience: None,
+            provider: None,
             priority: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
@@ -575,7 +670,12 @@ mod tests {
             expires_at: None,
             auth_method: None,
             client_id: None,
-            client_secret: None,
+                        client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            audience: None,
+            provider: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -690,7 +790,12 @@ mod tests {
             expires_at: None,
             auth_method: Some("social".to_string()),
             client_id: None,
-            client_secret: None,
+                        client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            audience: None,
+            provider: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
             auth_region: None,

@@ -19,7 +19,7 @@ interface AddCredentialDialogProps {
   credentialGroups: CredentialGroupStatusItem[]
 }
 
-type AuthMethod = 'social' | 'idc' | 'api_key'
+type AuthMethod = 'social' | 'idc' | 'api_key' | 'external_idp'
 
 export function AddCredentialDialog({ open, onOpenChange, credentialGroups }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
@@ -29,6 +29,11 @@ export function AddCredentialDialog({ open, onOpenChange, credentialGroups }: Ad
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
+  const [tokenEndpoint, setTokenEndpoint] = useState('')
+  const [issuerUrl, setIssuerUrl] = useState('')
+  const [scopes, setScopes] = useState('')
+  const [profileArn, setProfileArn] = useState('')
+  const [provider, setProvider] = useState('')
   const [priority, setPriority] = useState('0')
   const [machineId, setMachineId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -47,6 +52,11 @@ export function AddCredentialDialog({ open, onOpenChange, credentialGroups }: Ad
     setApiRegion('')
     setClientId('')
     setClientSecret('')
+    setTokenEndpoint('')
+    setIssuerUrl('')
+    setScopes('')
+    setProfileArn('')
+    setProvider('')
     setPriority('0')
     setMachineId('')
     setProxyUrl('')
@@ -77,6 +87,16 @@ export function AddCredentialDialog({ open, onOpenChange, credentialGroups }: Ad
         toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
         return
       }
+      if (authMethod === 'external_idp') {
+        if (!clientId.trim()) {
+          toast.error('External IdP 需要 Client ID')
+          return
+        }
+        if (!tokenEndpoint.trim() && !issuerUrl.trim()) {
+          toast.error('External IdP 需要 Token Endpoint 或 Issuer URL')
+          return
+        }
+      }
     }
 
     mutate(
@@ -87,7 +107,12 @@ export function AddCredentialDialog({ open, onOpenChange, credentialGroups }: Ad
         authRegion: authRegion.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
-        clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
+        clientSecret: isApiKey || authMethod === 'external_idp' ? undefined : clientSecret.trim() || undefined,
+        tokenEndpoint: authMethod === 'external_idp' ? tokenEndpoint.trim() || undefined : undefined,
+        issuerUrl: authMethod === 'external_idp' ? issuerUrl.trim() || undefined : undefined,
+        scopes: authMethod === 'external_idp' ? scopes.trim() || undefined : undefined,
+        profileArn: profileArn.trim() || undefined,
+        provider: provider.trim() || undefined,
         priority: parseInt(priority) || 0,
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
@@ -132,6 +157,7 @@ export function AddCredentialDialog({ open, onOpenChange, credentialGroups }: Ad
               >
                 <option value="social">Social</option>
                 <option value="idc">IdC/Builder-ID/IAM</option>
+                <option value="external_idp">External IdP（企业客户 IdP）</option>
                 <option value="api_key">API Key</option>
               </select>
             </div>
@@ -223,6 +249,99 @@ export function AddCredentialDialog({ open, onOpenChange, credentialGroups }: Ad
                     placeholder="请输入 Client Secret"
                     value={clientSecret}
                     onChange={(e) => setClientSecret(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="profileArn" className="text-sm font-medium">
+                    Profile ARN
+                  </label>
+                  <Input
+                    id="profileArn"
+                    placeholder="可选，缺省时导入后自动探测"
+                    value={profileArn}
+                    onChange={(e) => setProfileArn(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="provider" className="text-sm font-medium">
+                    Provider
+                  </label>
+                  <Input
+                    id="provider"
+                    placeholder="如 Enterprise / BuilderId"
+                    value={provider}
+                    onChange={(e) => setProvider(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+              </>
+            )}
+
+            {/* External IdP 字段 */}
+            {authMethod === 'external_idp' && (
+              <>
+                <div className="space-y-2">
+                  <label htmlFor="clientIdExt" className="text-sm font-medium">
+                    Client ID <span className="text-red-500">*</span>
+                  </label>
+                  <Input
+                    id="clientIdExt"
+                    placeholder="IdP 分配的 client_id"
+                    value={clientId}
+                    onChange={(e) => setClientId(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="tokenEndpoint" className="text-sm font-medium">
+                    Token Endpoint
+                  </label>
+                  <Input
+                    id="tokenEndpoint"
+                    placeholder="https://idp.example.com/oauth/token"
+                    value={tokenEndpoint}
+                    onChange={(e) => setTokenEndpoint(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="issuerUrl" className="text-sm font-medium">
+                    Issuer URL
+                  </label>
+                  <Input
+                    id="issuerUrl"
+                    placeholder="无 Token Endpoint 时用于 OIDC discovery"
+                    value={issuerUrl}
+                    onChange={(e) => setIssuerUrl(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Token Endpoint 与 Issuer URL 至少填一个
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="scopes" className="text-sm font-medium">
+                    Scopes
+                  </label>
+                  <Input
+                    id="scopes"
+                    placeholder="空格分隔，可选"
+                    value={scopes}
+                    onChange={(e) => setScopes(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="profileArnExt" className="text-sm font-medium">
+                    Profile ARN
+                  </label>
+                  <Input
+                    id="profileArnExt"
+                    placeholder="可选，缺省时导入后自动探测"
+                    value={profileArn}
+                    onChange={(e) => setProfileArn(e.target.value)}
                     disabled={isPending}
                   />
                 </div>

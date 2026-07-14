@@ -12,29 +12,20 @@ import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import {
+  parseAndNormalizeImportJson,
+  resolveImportAuthMethod,
+  validateImportCredential,
+  toAddCredentialRequest,
+  type NormalizedCredential,
+} from '@/lib/credential-import'
 
 interface BatchImportDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
 }
 
-interface CredentialInput {
-  refreshToken?: string
-  clientId?: string
-  clientSecret?: string
-  region?: string
-  authRegion?: string
-  apiRegion?: string
-  priority?: number
-  machineId?: string
-  kiroApiKey?: string
-  authMethod?: string
-  endpoint?: string
-  proxyUrl?: string
-  proxyUsername?: string
-  proxyPassword?: string
-  group?: string
-}
+type CredentialInput = NormalizedCredential
 
 interface VerificationResult {
   index: number
@@ -92,15 +83,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     // 先单独解析 JSON，给出精准的错误提示
     let credentials: CredentialInput[]
     try {
-      const parsed = JSON.parse(jsonInput)
-      credentials = Array.isArray(parsed) ? parsed : [parsed]
+      credentials = parseAndNormalizeImportJson(jsonInput)
     } catch (error) {
       toast.error('JSON 格式错误: ' + extractErrorMessage(error))
       return
     }
 
     if (credentials.length === 0) {
-      toast.error('没有可导入的凭据')
+      toast.error('没有可导入的凭据（需要 refreshToken 或 kiroApiKey）')
       return
     }
 
@@ -227,75 +217,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         let addedCredId: number | null = null
 
         try {
-          // 添加凭据
-          if (isApiKeyCred) {
-            // API Key 凭据
-            const addedCred = await addCredential({
-              authMethod: 'api_key',
-              kiroApiKey: cred.kiroApiKey?.trim(),
-              priority: cred.priority || 0,
-              authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-              apiRegion: cred.apiRegion?.trim() || undefined,
-              machineId: cred.machineId?.trim() || undefined,
-              proxyUrl: cred.proxyUrl?.trim() || undefined,
-              proxyUsername: cred.proxyUsername?.trim() || undefined,
-              proxyPassword: cred.proxyPassword?.trim() || undefined,
-              group: cred.group?.trim() || undefined,
-              endpoint: cred.endpoint?.trim() || undefined,
-            })
+          const precheck = validateImportCredential(cred)
+          if (precheck) throw new Error(precheck)
 
-            addedCredId = addedCred.credentialId
-
-            // 延迟 1 秒
-            await new Promise(resolve => setTimeout(resolve, 1000))
-
-            // 验活
-            const balance = await getCredentialBalance(addedCred.credentialId)
-
-            successCount++
-            existingApiKeyHashes.add(credHash)
-            setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
-            setResults(prev => {
-              const newResults = [...prev]
-              newResults[i] = {
-                ...newResults[i],
-                status: 'verified',
-                usage: `${balance.currentUsage}/${balance.usageLimit}`,
-                email: addedCred.email || undefined,
-                credentialId: addedCred.credentialId
-              }
-              return newResults
-            })
-            setProgress({ current: i + 1, total: credentials.length })
-            continue
-          }
-
-          // OAuth 凭据
-          const token = cred.refreshToken!.trim()
-          const clientId = cred.clientId?.trim() || undefined
-          const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
-
-          // idc 模式下必须同时提供 clientId 和 clientSecret
-          if (authMethod === 'social' && (clientId || clientSecret)) {
-            throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
-          }
-
-          const addedCred = await addCredential({
-            refreshToken: token,
-            authMethod,
-            authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-            apiRegion: cred.apiRegion?.trim() || undefined,
-            clientId,
-            clientSecret,
-            priority: cred.priority || 0,
-            machineId: cred.machineId?.trim() || undefined,
-            proxyUrl: cred.proxyUrl?.trim() || undefined,
-            proxyUsername: cred.proxyUsername?.trim() || undefined,
-            proxyPassword: cred.proxyPassword?.trim() || undefined,
-            group: cred.group?.trim() || undefined,
-            endpoint: cred.endpoint?.trim() || undefined,
-          })
+          const authMethod = resolveImportAuthMethod(cred)
+          const payload = toAddCredentialRequest(cred)
+          const addedCred = await addCredential(payload as Parameters<typeof addCredential>[0])
 
           addedCredId = addedCred.credentialId
 
@@ -305,9 +232,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           // 验活
           const balance = await getCredentialBalance(addedCred.credentialId)
 
-          // 验活成功
           successCount++
-          existingOauthHashes.add(credHash)
+          if (authMethod === 'api_key') {
+            existingApiKeyHashes.add(credHash)
+          } else {
+            existingOauthHashes.add(credHash)
+          }
           setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
           setResults(prev => {
             const newResults = [...prev]
@@ -315,11 +245,13 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               ...newResults[i],
               status: 'verified',
               usage: `${balance.currentUsage}/${balance.usageLimit}`,
-              email: addedCred.email || undefined,
+              email: addedCred.email || cred.email || undefined,
               credentialId: addedCred.credentialId
             }
             return newResults
           })
+          setProgress({ current: i + 1, total: credentials.length })
+          continue
         } catch (error) {
           // 验活失败，尝试回滚（先禁用再删除）
           let rollbackStatus: VerificationResult['rollbackStatus'] = 'skipped'
@@ -434,14 +366,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"...","group":"socks-a"}]\nAPI Key: [{"kiroApiKey":"ksk_xxx","group":"direct"}]\n\n支持 region 字段自动映射为 authRegion，也支持 proxyUrl / group'}
+              placeholder={'粘贴 JSON（单个对象或数组）。批量导入与 KAM 导入格式互通：\n\n• Social: {"refreshToken":"..."}\n• IdC/Enterprise: refreshToken + clientId + clientSecret\n• 企业导出: login_provider + kiro_auth_token_raw + kiro_profile_raw\n• 可同时粘贴 [token, sso-cache-registration] 自动合并 clientId/secret\n• KAM: {version, accounts:[...]} 或平铺数组\n• External IdP: authMethod=external_idp + tokenEndpoint/issuerUrl\n• API Key: {"kiroApiKey":"ksk_xxx"}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
+              💡 与「KAM 导入」共用解析逻辑。Enterprise 仅有 clientIdHash 时会提示从 ~/.aws/sso/cache/&lt;hash&gt;.json 补 secret
             </p>
           </div>
 

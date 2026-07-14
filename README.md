@@ -255,9 +255,14 @@ bash tools/redeploy.sh --build /opt/kiro-rs-src
 | `refreshToken` | string | OAuth 刷新令牌                                  |
 | `profileArn`   | string | AWS Profile ARN（可选，登录时返回）                   |
 | `expiresAt`    | string | Token 过期时间 (RFC3339)                        |
-| `authMethod`   | string | 认证方式：`social` 或 `idc`                       |
-| `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
-| `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
+| `authMethod`   | string | 认证方式：`social` / `idc` / `api_key` / `external_idp` |
+| `clientId`     | string | IdC / external_idp 的客户端 ID                     |
+| `clientSecret` | string | IdC 登录的客户端密钥（IdC 必填；external_idp 一般不需要）      |
+| `tokenEndpoint`| string | external_idp 的 OAuth2 token 端点（或靠 issuerUrl discovery） |
+| `issuerUrl`    | string | external_idp 的 OIDC issuer（无 tokenEndpoint 时 discovery） |
+| `scopes`       | string | OAuth scopes，空格分隔（external_idp 可选）           |
+| `audience`     | string | OAuth audience（external_idp 可选）               |
+| `provider`     | string | 登录提供方标识：`Enterprise` / `ExternalIdp` / `Google` 等 |
 | `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
 | `region`       | string | 凭据级 Auth Region, 兼容字段                       |
 | `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
@@ -272,6 +277,10 @@ bash tools/redeploy.sh --build /opt/kiro-rs-src
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
 - 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
+- **Enterprise IdC**（`provider: Enterprise`）仍走 IdC 刷新；导入时必须带 `clientId`+`clientSecret`。仅有 `clientIdHash` 不够——请在登录机的 `~/.aws/sso/cache/<clientIdHash>.json` 取出 registration 一并导入
+- **External IdP**（`authMethod: external_idp`）走客户 IdP 的 token endpoint 刷新，上游请求会带 `TokenType: EXTERNAL_IDP`；缺 `profileArn` 时导入后会尝试 `ListAvailableProfiles` 自动探测
+- 服务器部署请用 Admin「批量导入」粘贴完整 JSON；不要依赖本机 SSO 缓存扫描
+- 示例：`credentials.example.enterprise_idc.json`、`credentials.example.external_idp.json`
 
 #### 单凭据格式（旧格式，向后兼容）
 

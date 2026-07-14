@@ -5,5 +5,6 @@ pub mod machine_id;
 pub mod metrics;
 pub mod model;
 pub mod parser;
+pub mod profile_discovery;
 pub mod provider;
 pub mod token_manager;

@@ -160,15 +160,42 @@ pub struct AddCredentialRequest {
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
     pub refresh_token: Option<String>,
 
-    /// 认证方式（可选，默认 social）
+    /// 访问令牌（可选预填；导入后仍会 refresh 校验）
+    pub access_token: Option<String>,
+
+    /// Profile ARN（企业号/IdC 建议导入时带上）
+    pub profile_arn: Option<String>,
+
+    /// 过期时间 RFC3339（可选预填）
+    pub expires_at: Option<String>,
+
+    /// 认证方式（可选，默认 social；支持 social/idc/api_key/external_idp）
     #[serde(default = "default_auth_method")]
     pub auth_method: String,
 
-    /// OIDC Client ID（IdC 认证需要）
+    /// OIDC Client ID（IdC / external_idp 需要）
     pub client_id: Option<String>,
 
     /// OIDC Client Secret（IdC 认证需要）
     pub client_secret: Option<String>,
+
+    /// 仅诊断：SSO client registration 的 hash。无法单独用于刷新，但可写进错误提示
+    pub client_id_hash: Option<String>,
+
+    /// External IdP token endpoint
+    pub token_endpoint: Option<String>,
+
+    /// External IdP issuer URL（无 tokenEndpoint 时用于 discovery）
+    pub issuer_url: Option<String>,
+
+    /// OAuth scopes（空格分隔）
+    pub scopes: Option<String>,
+
+    /// OAuth audience（可选）
+    pub audience: Option<String>,
+
+    /// 登录提供方（Enterprise / ExternalIdp / Google 等）
+    pub provider: Option<String>,
 
     /// 优先级（可选，默认 0）
     #[serde(default)]
