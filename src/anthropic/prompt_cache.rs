@@ -50,7 +50,7 @@ const DEFAULT_MIN_CACHEABLE_TOKENS: i32 = 1024;
 /// Opus 模型最小可缓存 token 数
 const OPUS_MIN_CACHEABLE_TOKENS: i32 = 4096;
 /// 命中上限比例（最新内容不可能 100% 命中）—— 作用于**真实**模拟命中。
-const MAX_CACHE_RATIO: f64 = 0.85;
+pub(crate) const MAX_CACHE_RATIO: f64 = 0.85;
 /// 上报命中率系数（运营口径）的上限。
 ///
 /// 与 [`MAX_CACHE_RATIO`] 分离:真实模拟受 0.85 物理约束(最新内容必为全价),

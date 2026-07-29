@@ -12,7 +12,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::converter::extract_session_id;
-use super::prompt_cache::{CacheProfile, PromptCache, build_profile_from_request};
+use super::prompt_cache::{
+    CacheProfile, MAX_CACHE_RATIO, PromptCache, build_profile_from_request,
+};
 use super::token_count::{self as token, saturating_to_i32};
 use super::types::MessagesRequest;
 
@@ -352,10 +354,39 @@ pub(crate) fn client_visible_usage(
         return (input, 0, cache_read);
     }
 
-    let cache_read = decision.cache_read_input_tokens.max(0).min(total);
+    // `decision` 的 read/creation 量级不可信：`build_profile_from_request` 用
+    // `total_input_tokens.max(cumulative_tokens)` 当 85% 封顶基准，而 `cumulative_tokens`
+    // 对 tool_use / tool_result / image 块走 `block.to_string()` 兜底计数（整个 JSON 都算
+    // token），长会话里能虚高到权威计数的 20 倍以上。生产实测 client_total=154497 时
+    // raw_read=3590014（反推 profile 基准 ≥4.2M）。虚高的 read 冲过真实 total 后被
+    // `.min(total)` 削平 → input 恒为 0。
+    //
+    // 计费边界的不变量：最新一轮内容物理上不可能命中缓存，所以 cache_read 最多占
+    // 客户端预算的 MAX_CACHE_RATIO，剩下的必须作为 input 计价。在此处钳住，缓存内部
+    // 的指纹匹配逻辑不动（命中判定是对的，只有 token 量级虚高）。
+    let read_ceiling = ((total as f64) * MAX_CACHE_RATIO).floor() as i32;
+    let cache_read = decision
+        .cache_read_input_tokens
+        .max(0)
+        .min(read_ceiling.max(0));
+
+    // 当 cache_read=0（纯 MISS）时，把 cache_creation 归零、全部计入 input_tokens。
+    // 原因：多用户共享场景下每个用户的 prefix 都不同，cache 几乎永远不会命中；
+    // 此时上报巨大的 cache_creation + input=0 会误导客户端计费面板（显示 0 输入）
+    // 且让下游按 cache_write 溢价计费（1.25× 的 cache_creation 比纯 input 更贵）。
+    // 只有当 cache_read>0 时（证明缓存确实在生效），cache_creation 才有意义展示。
+    if cache_read == 0 {
+        return (total, 0, 0);
+    }
+
+    // creation 同样来自虚高基准，同样只能在剩余预算内计价。
     let remaining = total.saturating_sub(cache_read);
-    let cache_creation = decision.cache_creation_input_tokens.max(0).min(remaining);
+    let cache_creation = decision
+        .cache_creation_input_tokens
+        .max(0)
+        .min(remaining);
     let input = remaining.saturating_sub(cache_creation);
+
     (input, cache_creation, cache_read)
 }
 
@@ -385,6 +416,7 @@ mod tests {
             profile: None,
             account_key: None,
             skipped,
+            // 0 = 不缩放，保持既有测试语义（read/creation 已是客户端预算口径）
         }
     }
 
@@ -660,8 +692,8 @@ mod tests {
         assert!(snap.last1m.reported_saved_input_tokens > 0);
     }
 
-    /// 真实模式（无 perceived 系数）多轮对话：R1 全 creation，R2 起必须命中 cache_read。
-    /// 复现生产 "只有创建缓存、没有读取缓存" 的诉求 —— 走完整 cache_accounting 路径。
+    /// 真实模式（无 perceived 系数）多轮对话：R1 纯 MISS 时 creation 归零全部计入 input，
+    /// R2 起必须命中 cache_read（此时 creation 才有意义展示）。
     #[test]
     fn cctest_like_real_mode_multiround_hits_cache_read() {
         let cache = PromptCache::new(1024, std::time::Duration::from_secs(300), true);
@@ -686,8 +718,10 @@ mod tests {
             );
 
             if round == 1 {
-                assert!(creation > 0, "R1 应有 cache_creation");
+                // 纯 MISS：cache_read=0 时 creation 归零，全部计入 input
+                assert_eq!(creation, 0, "R1 纯 MISS 时 creation 应归零（不误导客户端计费）");
                 assert_eq!(read, 0, "R1 不应有 cache_read");
+                assert_eq!(input, total, "R1 全部 token 计入 input");
             } else {
                 assert!(
                     read > 0,
@@ -735,7 +769,7 @@ mod tests {
                 payload.tools.clone(),
             ));
             let decision = lookup_prompt_cache(&cache, &payload, total);
-            let (_, creation, read) = client_visible_usage(
+            let (input, creation, read) = client_visible_usage(
                 &cache,
                 &decision,
                 &payload.model,
@@ -744,7 +778,7 @@ mod tests {
             );
 
             if round == 1 {
-                assert!(creation > 0 && read == 0, "R1 全 creation");
+                assert!(creation == 0 && read == 0 && input == total, "R1 纯 MISS：creation 归零，全部计入 input");
             } else {
                 assert!(
                     read > 0,
@@ -831,6 +865,50 @@ mod tests {
         let (input, creation, read) =
             client_visible_usage(&cache, &decision, "claude-opus-4-8", 4_000, 1);
         assert_eq!((input, creation, read), (4_000, 0, 0));
+    }
+
+    /// 直击生产 `input_tokens` 恒 0：`build_profile_from_request` 用
+    /// `max(传入 total, cumulative_tokens)` 当 85% 封顶基准，而 cumulative 对
+    /// tool_use/tool_result/image 走整块 JSON 计数会虚高到权威计数的 20 倍以上
+    /// （实测 client_total=154497 → raw_read=3590014）。虚高 read 必须在计费边界
+    /// 按客户端预算的 85% 钳住，保证 input 拿到剩余 15%。
+    #[test]
+    fn absurdly_inflated_read_is_capped_so_input_stays_nonzero() {
+        let cache = PromptCache::new(1024, std::time::Duration::from_secs(300), true);
+        // 复刻生产实测量级：预算 154497，decision 却报 3590014（23×）
+        let decision = CacheDecision {
+            forced_conversation_id: None,
+            cache_read_input_tokens: 3_590_014,
+            cache_creation_input_tokens: 0,
+            profile: None,
+            account_key: None,
+            skipped: false,
+        };
+        let (input, creation, read) =
+            client_visible_usage(&cache, &decision, "claude-opus-5", 154_497, 1);
+
+        assert_eq!(read, 131_322, "read 应被钳到预算的 85%");
+        assert_eq!(creation, 0);
+        assert_eq!(input, 23_175, "input 不能被虚高的 read 削成 0");
+        assert_eq!(input + creation + read, 154_497);
+        assert!(input > 0, "计费不变量：最新一轮内容必为全价 input");
+    }
+
+    /// read 未超 85% 上限时原样上报，不受钳制影响。
+    #[test]
+    fn read_below_cap_is_reported_as_is() {
+        let cache = PromptCache::new(1024, std::time::Duration::from_secs(300), true);
+        let decision = CacheDecision {
+            forced_conversation_id: None,
+            cache_read_input_tokens: 700,
+            cache_creation_input_tokens: 200,
+            profile: None,
+            account_key: None,
+            skipped: false,
+        };
+        let (input, creation, read) =
+            client_visible_usage(&cache, &decision, "claude-sonnet-4-5", 1_000, 1);
+        assert_eq!((input, creation, read), (100, 200, 700));
     }
 
     #[test]
