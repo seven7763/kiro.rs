@@ -148,6 +148,13 @@ struct CacheInner {
     hit_total: u64,
     miss_total: u64,
     eviction_total: u64,
+    /// 完全跳过缓存决策的请求数（既不是 hit 也不是 miss）。
+    ///
+    /// 三条跳过路径见 `cache_accounting::lookup_prompt_cache`：无 cache_control
+    /// 标记、perceived 模式、有 cache_control 但缺 `metadata.user_id`。
+    /// 不计入 `hit_total`/`miss_total`，否则命中率分母会被污染；但必须单独可见，
+    /// 否则这类请求在观测面上完全消失，看起来像「缓存没在工作」。
+    skipped_total: u64,
     /// 滑动窗口事件 `(time, kind, real_saved, reported_saved)`。
     /// `kind`/`real_saved` 是**真实**模拟命中（诚实，运维诊断用）；
     /// `reported_saved` 是应用 perceived 系数后**对客户端上报**的 read（对账用）。
@@ -165,6 +172,7 @@ impl CacheInner {
             hit_total: 0,
             miss_total: 0,
             eviction_total: 0,
+            skipped_total: 0,
             recent_events: Vec::with_capacity(2048),
         }
     }
@@ -297,6 +305,8 @@ pub struct CacheSnapshot {
     pub hit_total: u64,
     pub miss_total: u64,
     pub eviction_total: u64,
+    /// 跳过缓存决策的请求数，不含在 hit/miss 里（见 `CacheInner::skipped_total`）
+    pub skipped_total: u64,
     pub last1m: WindowStats,
     pub last5m: WindowStats,
 }
@@ -372,6 +382,16 @@ impl PromptCache {
     pub fn set_ttl(&self, ttl: Duration) {
         let mut inner = self.inner.lock();
         inner.ttl = ttl;
+    }
+
+    /// 记录一个「完全跳过缓存决策」的请求。
+    ///
+    /// 与 [`Self::record_success`] 互斥：跳过的请求不进入 hit/miss 窗口统计，
+    /// 只累加 `skipped_total`。调用点在 `cache_accounting::lookup_prompt_cache`
+    /// 的三条跳过分支。
+    pub fn record_skipped(&self) {
+        let mut inner = self.inner.lock();
+        inner.skipped_total = inner.skipped_total.saturating_add(1);
     }
 
     /// 计算命中情况（纯读路径，不写 entry、不刷新 TTL、不记录统计）。
@@ -515,6 +535,7 @@ impl PromptCache {
             hit_total: inner.hit_total,
             miss_total: inner.miss_total,
             eviction_total: inner.eviction_total,
+            skipped_total: inner.skipped_total,
             last1m: inner.stats_in_window(now, Duration::from_secs(60)),
             last5m: inner.stats_in_window(now, Duration::from_secs(300)),
         }

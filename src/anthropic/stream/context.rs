@@ -318,7 +318,9 @@ impl StreamContext {
                 // - 若 raw_pct≈3% 而真实上下文≈1.1%×window → 上游 pct 语义/口径问题
                 // - 若 reasoning_window 与上游真实窗口不符 → window 常数错
                 // 只读，不改计量行为。
-                tracing::warn!(
+                // 定位任务已完成（根因是 prompt_cache 的 max(total, cumulative)
+                // 基准虚高），降为 debug；需要复查时用 RUST_LOG=debug 打开。
+                tracing::debug!(
                     target: "kiro::probe::context_usage",
                     model = %self.model,
                     raw_pct = context_usage.context_usage_percentage,

@@ -199,6 +199,7 @@ pub(crate) fn lookup_prompt_cache(
     // 没有任何 cache_control 标记 → 跳过，行为与"无 cache"基线一致
     let Some(profile) = build_profile_from_request(payload, total_input_tokens) else {
         tracing::trace!("prompt_cache: skipped (no cache_control marker on client request)");
+        cache.record_skipped();
         return CacheDecision::skipped();
     };
 
@@ -207,6 +208,7 @@ pub(crate) fn lookup_prompt_cache(
         tracing::debug!(
             "prompt_cache: perceived/fake cache enabled; skip real cache lookup and conversation reuse"
         );
+        cache.record_skipped();
         return CacheDecision {
             forced_conversation_id: None,
             cache_read_input_tokens: 0,
@@ -226,6 +228,7 @@ pub(crate) fn lookup_prompt_cache(
             tracing::debug!(
                 "prompt_cache: request has cache_control but no metadata.user_id; skip shared cache reuse for multi-user safety"
             );
+            cache.record_skipped();
             (Default::default(), None)
         }
     };
@@ -413,6 +416,53 @@ mod tests {
             skipped,
             // 0 = 不缩放，保持既有测试语义（read/creation 已是客户端预算口径）
         }
+    }
+
+    /// 跳过缓存决策的请求必须单独计数。
+    ///
+    /// `lookup_prompt_cache` 有三条跳过路径（无 cache_control 标记、
+    /// perceived 模式、有 cache_control 但无 metadata.user_id），
+    /// 它们既不算 hit 也不算 miss —— 命中率分母因此偏小，而这个盲区
+    /// 正是「看起来缓存没在工作」的来源之一。
+    #[test]
+    fn skipped_requests_are_counted_separately() {
+        let cache = PromptCache::new(64, std::time::Duration::from_secs(300), true);
+
+        // 无 cache_control 标记 → 跳过
+        let payload = make_req("claude-sonnet-4-5", None);
+        let decision = lookup_prompt_cache(&cache, &payload, 5000);
+        assert!(decision.skipped, "无 cache_control 应判为 skipped");
+
+        let snap = cache.snapshot();
+        assert_eq!(snap.skipped_total, 1, "跳过的请求应计入 skipped_total");
+        assert_eq!(snap.hit_total, 0, "跳过不应算 hit");
+        assert_eq!(snap.miss_total, 0, "跳过不应算 miss");
+
+        // 再来一次，计数递增
+        let _ = lookup_prompt_cache(&cache, &payload, 5000);
+        assert_eq!(cache.snapshot().skipped_total, 2);
+    }
+
+    /// 有 cache_control 但缺 metadata.user_id：为多用户安全跳过共享缓存，
+    /// 同样要计数（否则这类请求完全不可见）。
+    #[test]
+    fn missing_user_id_counts_as_skipped() {
+        let cache = PromptCache::new(64, std::time::Duration::from_secs(300), true);
+        let system_text = "cacheable context. ".repeat(5000);
+        let payload: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 100,
+            "system": [{"text": system_text, "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("构造 MessagesRequest 应成功");
+
+        let _ = lookup_prompt_cache(&cache, &payload, 30000);
+        assert_eq!(
+            cache.snapshot().skipped_total,
+            1,
+            "缺 user_id 的跳过也要计数"
+        );
     }
 
     fn cctest_like_payload(session_id: &str, messages: serde_json::Value) -> MessagesRequest {

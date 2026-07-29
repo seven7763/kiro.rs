@@ -55,6 +55,8 @@ pub struct PromptCacheStats {
     pub hit_total: u64,
     pub miss_total: u64,
     pub eviction_total: u64,
+    /// 跳过缓存决策的请求数（不在 hit/miss 分母内）
+    pub skipped_total: u64,
     pub hit_rate_1m: f64,
     pub hit_rate_5m: f64,
     pub saved_input_tokens_5m: i64,
@@ -557,6 +559,11 @@ pub fn render_prometheus(resp: &AdminMetricsResponse) -> String {
             s,
             "kiro_prompt_cache_total{{event=\"eviction\"}} {}",
             pc.eviction_total
+        );
+        let _ = writeln!(
+            s,
+            "kiro_prompt_cache_total{{event=\"skipped\"}} {}",
+            pc.skipped_total
         );
         let _ = writeln!(
             s,

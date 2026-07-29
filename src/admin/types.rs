@@ -268,6 +268,13 @@ pub struct PromptCacheConfigPayload {
     /// 累计淘汰条目数（只读）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eviction_total: Option<u64>,
+    /// 累计跳过缓存决策的请求数（只读）。
+    ///
+    /// 不含在 `hit_total`/`miss_total` 里。命中率算的是
+    /// `hit / (hit + miss)`，跳过的请求不在分母中——所以看命中率时要一起看
+    /// 这个数，否则会把「大量请求根本没走缓存」误读成「缓存命中率很高」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_total: Option<u64>,
     /// 1 分钟窗口命中率（百分比，只读）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hit_rate_1m: Option<f64>,

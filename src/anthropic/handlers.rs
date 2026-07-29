@@ -665,8 +665,10 @@ async fn handle_non_stream_request(
                             if pct >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
-                            // 探针：token 双计根因定位（非流式路径），与流式同口径
-                            tracing::warn!(
+                            // 探针：token 双计根因定位（非流式路径），与流式同口径。
+                            // 定位任务已完成（根因是 prompt_cache 的 max(total, cumulative)
+                            // 基准虚高），降为 debug；需要复查时用 RUST_LOG=debug 打开。
+                            tracing::debug!(
                                 target: "kiro::probe::context_usage",
                                 model = %model,
                                 raw_pct = context_usage.context_usage_percentage,
