@@ -45,8 +45,8 @@ pub(crate) fn models_from_upstream(
         let max_tokens = m.max_output_tokens.unwrap_or(64000);
         let is_claude = m.model_id.starts_with("claude");
         let client_id = client_facing_model_id(&m.model_id);
-        out.push(Model {
-            id: client_id.clone(),
+        let base = Model {
+            id: client_id,
             object: "model".to_string(),
             created: CREATED,
             owned_by: if is_claude {
@@ -57,171 +57,105 @@ pub(crate) fn models_from_upstream(
             display_name: m.model_name.clone(),
             model_type: "chat".to_string(),
             max_tokens,
-        });
-        // Claude 系支持 thinking：追加 -thinking 变体
+        };
+        // 只有 Claude 系有 thinking 概念；具体是否派生变体由
+        // `thinking_variant_is_meaningful` 决定（强制 adaptive 的型号不派生）。
         if is_claude {
-            out.push(Model {
-                id: format!("{client_id}-thinking"),
-                object: "model".to_string(),
-                created: CREATED,
-                owned_by: "anthropic".to_string(),
-                display_name: format!("{} (Thinking)", m.model_name),
-                model_type: "chat".to_string(),
-                max_tokens,
-            });
+            push_with_thinking_variant(&mut out, base);
+        } else {
+            out.push(base);
         }
     }
     if out.is_empty() { static_models() } else { out }
 }
 
+/// 静态回退表的一行：`(客户端 ID, 显示名, created, max_tokens)`。
+///
+/// thinking 变体不在这里列——由 [`push_with_thinking_variant`] 自动派生，
+/// 与 [`models_from_upstream`] 走同一套规则（对标 Kiro-Go 的
+/// `buildAnthropicModelsResponse`：上游列表 + 自动追加后缀）。
+type StaticModelRow = (&'static str, &'static str, i64, i32);
+
+/// 上游 `ListAvailableModels` 实测在售型号（2026-07 生产快照，28 条中的 Claude 系）。
+/// 只在上游拉取失败时使用。
+const STATIC_MODEL_ROWS: &[StaticModelRow] = &[
+    ("claude-opus-5", "Claude Opus 5", 1785000000, 128000),
+    ("claude-sonnet-5", "Claude Sonnet 5", 1785000000, 128000),
+    ("claude-fable-5", "Claude Fable 5", 1785000000, 128000),
+    ("claude-opus-4-8", "Claude Opus 4.8", 1781000000, 128000),
+    ("claude-opus-4-7", "Claude Opus 4.7", 1778400000, 64000),
+    ("claude-opus-4-6", "Claude Opus 4.6", 1770163200, 64000),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6", 1771286400, 64000),
+    (
+        "claude-opus-4-5-20251101",
+        "Claude Opus 4.5",
+        1763942400,
+        64000,
+    ),
+    (
+        "claude-sonnet-4-5-20250929",
+        "Claude Sonnet 4.5",
+        1759104000,
+        64000,
+    ),
+    (
+        "claude-haiku-4-5-20251001",
+        "Claude Haiku 4.5",
+        1760486400,
+        64000,
+    ),
+];
+
+/// 这些型号的 `-thinking` 变体是空壳，不对外列出。
+///
+/// `preprocess.rs` 对 Opus 4.7+ / Opus 5 / Fable 5 **强制** adaptive thinking，
+/// 不论请求里带不带 `-thinking` 后缀（见 `preprocess.rs` 的 Case 1）。也就是说
+/// `claude-opus-4-7` 与 `claude-opus-4-7-thinking` 行为完全一致。同时列出两个
+/// 会让人以为能关掉思考，实际关不掉。
+///
+/// 其他型号（4.6 / 4.5 / sonnet-4 / haiku）的后缀是真实开关，照常派生。
+fn thinking_variant_is_meaningful(client_id: &str) -> bool {
+    let lower = client_id.to_lowercase();
+    let forced_adaptive = lower.contains("fable")
+        || lower.contains("opus-5")
+        || (lower.contains("opus")
+            && (lower.contains("4-7")
+                || lower.contains("4.7")
+                || lower.contains("4-8")
+                || lower.contains("4.8")));
+    !forced_adaptive
+}
+
+/// push 基础型号，并在 thinking 后缀有实际作用时追加变体。
+fn push_with_thinking_variant(out: &mut Vec<Model>, base: Model) {
+    if thinking_variant_is_meaningful(&base.id) {
+        out.push(Model {
+            id: format!("{}-thinking", base.id),
+            display_name: format!("{} (Thinking)", base.display_name),
+            ..base.clone()
+        });
+    }
+    out.push(base);
+}
+
 /// 内置静态模型列表（上游获取失败时的回退，也是过滤的元数据来源）。
 pub(crate) fn static_models() -> Vec<Model> {
-    vec![
-        Model {
-            id: "claude-opus-5".to_string(),
-            object: "model".to_string(),
-            created: 1785000000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 128000,
-        },
-        Model {
-            id: "claude-opus-5-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1785000000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 128000,
-        },
-        Model {
-            id: "claude-fable-5".to_string(),
-            object: "model".to_string(),
-            created: 1785000000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Fable 5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 128000,
-        },
-        Model {
-            id: "claude-fable-5-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1785000000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Fable 5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 128000,
-        },
-        Model {
-            id: "claude-opus-4-7".to_string(),
-            object: "model".to_string(),
-            created: 1778400000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1778400000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-    ]
+    let mut out = Vec::with_capacity(STATIC_MODEL_ROWS.len() * 2);
+    for (id, display_name, created, max_tokens) in STATIC_MODEL_ROWS {
+        push_with_thinking_variant(
+            &mut out,
+            Model {
+                id: (*id).to_string(),
+                object: "model".to_string(),
+                created: *created,
+                owned_by: "anthropic".to_string(),
+                display_name: (*display_name).to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: *max_tokens,
+            },
+        );
+    }
+    out
 }
 
 #[cfg(test)]
@@ -239,6 +173,7 @@ mod tests {
         let upstream = vec![
             mk("auto", "Auto", Some(64000)),
             mk("claude-opus-4.7", "Claude Opus 4.7", Some(128000)),
+            mk("claude-opus-4.6", "Claude Opus 4.6", Some(64000)),
             mk("deepseek-3.2", "Deepseek v3.2", Some(64000)),
         ];
         let models = models_from_upstream(&upstream);
@@ -255,8 +190,8 @@ mod tests {
             "对客户端暴露的 Claude ID 不得含点号"
         );
         assert!(
-            models.iter().any(|m| m.id == "claude-opus-4-7-thinking"),
-            "claude 应有 thinking 变体（同样是连字符形式）"
+            models.iter().any(|m| m.id == "claude-opus-4-6-thinking"),
+            "thinking 后缀有实际作用的 claude 型号应有变体（连字符形式）"
         );
         // 非 Claude 不属于 Anthropic 命名空间，原样保留
         let ds = models.iter().find(|m| m.id == "deepseek-3.2").unwrap();
@@ -264,6 +199,58 @@ mod tests {
         assert!(
             !models.iter().any(|m| m.id == "deepseek-3.2-thinking"),
             "非 claude 不应有 thinking 变体"
+        );
+    }
+
+    /// 强制 adaptive 的型号不列 `-thinking` 空壳。
+    ///
+    /// `preprocess.rs` 对 Opus 4.7 / 4.8 / Opus 5 / Fable 5 无条件强制 adaptive，
+    /// 带不带后缀行为一致。列出两个等价 ID 会让客户端以为能关掉思考。
+    #[test]
+    fn forced_adaptive_models_have_no_thinking_shell() {
+        use crate::kiro::provider::UpstreamModel;
+        let mk = |id: &str| UpstreamModel {
+            model_id: id.to_string(),
+            model_name: id.to_string(),
+            max_output_tokens: Some(128000),
+        };
+        let upstream: Vec<_> = [
+            "claude-opus-5",
+            "claude-fable-5",
+            "claude-opus-4.7",
+            "claude-opus-4.8",
+        ]
+        .iter()
+        .map(|id| mk(id))
+        .collect();
+        let models = models_from_upstream(&upstream);
+        for id in [
+            "claude-opus-5-thinking",
+            "claude-fable-5-thinking",
+            "claude-opus-4-7-thinking",
+            "claude-opus-4-8-thinking",
+        ] {
+            assert!(
+                !models.iter().any(|m| m.id == id),
+                "{id} 是空壳变体，不应对外列出"
+            );
+        }
+        // 基础型号本身必须在
+        assert!(models.iter().any(|m| m.id == "claude-opus-5"));
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-7"));
+
+        // 静态回退表同样不含空壳
+        for id in ["claude-opus-5-thinking", "claude-opus-4-7-thinking"] {
+            assert!(
+                !static_models().iter().any(|m| m.id == id),
+                "静态表里的 {id} 也应移除"
+            );
+        }
+        // sonnet-5 不在强制列表里（preprocess 只强制 opus-5 / fable），保留变体
+        assert!(
+            static_models()
+                .iter()
+                .any(|m| m.id == "claude-sonnet-4-6-thinking")
         );
     }
 

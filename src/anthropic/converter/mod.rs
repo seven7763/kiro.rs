@@ -279,10 +279,15 @@ mod tests {
             map_model("claude-opus-4-5"),
             Some("claude-opus-4.5".to_string())
         );
-        // 无版本号兜底仍是 4.6
+        // 无法识别版本号的名字直通，交给上游拒绝。
+        //
+        // 旧行为是静默兜底到 claude-opus-4.6：客户端点了一个不存在的型号，
+        // 却拿到 4.6 的输出且毫无提示。claude-opus-5 上线时就是这样被降级成
+        // 4.6 的（日志里 model 字段记的是客户端请求名，所以看起来一切正常）。
+        // 宁可让上游报错，也不要悄悄换模型。
         assert_eq!(
             map_model("claude-opus-foo"),
-            Some("claude-opus-4.6".to_string())
+            Some("claude-opus-foo".to_string())
         );
     }
 
@@ -314,9 +319,22 @@ mod tests {
         );
     }
 
+    /// `map_model` 不再充当上游型号白名单。
+    ///
+    /// OpenAI 的历史别名走别名表指到在售 Claude（与 Kiro-Go 一致），
+    /// 空白输入才是唯一的拒绝条件。真正不存在的型号由上游拒绝——
+    /// 本地白名单只会在上游上架新型号时造成「模型不支持」误报。
     #[test]
-    fn test_map_model_unsupported() {
-        assert!(map_model("gpt-4").is_none());
+    fn test_map_model_legacy_openai_aliases_and_blank() {
+        assert_eq!(
+            map_model("gpt-4"),
+            Some("claude-sonnet-4.5".to_string()),
+            "OpenAI 历史别名应指到在售 Claude"
+        );
+        assert_eq!(map_model("gpt-4o"), Some("claude-sonnet-4.5".to_string()));
+        // 上游真实存在的 gpt-5.6-* 系列不能被 gpt-4 别名截获
+        assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
+        assert!(map_model("").is_none());
     }
 
     #[test]
