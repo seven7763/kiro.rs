@@ -16,9 +16,11 @@ set -euo pipefail
 
 CONTAINER_NAME="${CONTAINER_NAME:-kiro-rs}"
 IMAGE="${IMAGE:-kiro-rs-custom:latest}"
-HOST_PORT="${HOST_PORT:-8990}"
+# 默认值 = 生产真值（152.53.242.23）。改动前先确认生产拓扑，
+# 用错端口会让 new2api 侧 502，用错网络名会让容器名互访 connection refused。
+HOST_PORT="${HOST_PORT:-38990}"
 CONFIG_DIR="${CONFIG_DIR:-/opt/kiro-rs/config}"
-SUB2API_NETWORK="${SUB2API_NETWORK:-sub2api-deploy_sub2api-network}"
+SUB2API_NETWORK="${SUB2API_NETWORK:-new2api-net}"
 
 # 可选 build：bash redeploy.sh --build <src_dir>
 if [[ "${1:-}" == "--build" ]]; then
