@@ -40,7 +40,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// 默认 LRU 容量（按 account 桶内 fingerprint 总数粗略控制）
-pub const DEFAULT_CAPACITY: usize = 1024;
+/// 默认缓存条目上限。
+///
+/// 4096 而非 1024：生产 config.json 早已手动覆盖成 4096，说明 1024 不够用
+/// （多用户共享 + 多断点前缀，每个会话会占多条）。默认值留在 1024 会让新部署
+/// 或漏配的实例因 LRU 提前驱逐而掉命中率。
+///
+/// 与 [`DEFAULT_MIN_CACHEABLE_TOKENS`] 无关，那个也恰好是 1024，不要一起改。
+pub const DEFAULT_CAPACITY: usize = 4096;
 /// 默认 TTL：5 分钟（对齐 Anthropic ephemeral 规范）
 pub const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
 /// 1 小时 TTL
@@ -489,6 +496,15 @@ impl PromptCache {
         let mut inner = self.inner.lock();
 
         // accounting 断点写入全局内容寻址桶（不再按 account 分桶）。
+        //
+        // 条目 TTL = max(断点 TTL, 配置 TTL)：
+        // - 断点 TTL 来自 `cache_control.ttl`（5m 默认 / 1h 显式）
+        // - 配置 TTL 是 `promptCacheTtlSecs`，作为**地板**
+        //
+        // 取 max 而非直接用配置值：配大了能整体延长存活以提升命中率，
+        // 但客户端显式要求的 1h 不会被 5m 的全局配置压短（那会破坏 1h 分桶语义）。
+        // 此前这里只用 `bp.ttl`，`promptCacheTtlSecs` 是个从未生效的死配置。
+        let configured_ttl = inner.ttl;
         for bp in &profile.breakpoints {
             if bp.cumulative_tokens < min_tokens {
                 continue;
@@ -496,7 +512,7 @@ impl PromptCache {
             inner.entries.insert(
                 bp.fingerprint.clone(),
                 CacheEntry {
-                    expires_at: now + bp.ttl,
+                    expires_at: now + bp.ttl.max(configured_ttl),
                 },
             );
         }
@@ -1016,6 +1032,155 @@ pub fn normalize_system_text(text: &str) -> String {
 mod tests {
     use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
     use super::*;
+
+    /// 默认容量必须对齐实际负载。
+    ///
+    /// 生产 config.json 手动把 promptCacheCapacity 覆盖成 4096 —— 说明 1024
+    /// 这个默认值不够用。新部署或漏配的实例会因 LRU 提前驱逐而掉命中率。
+    #[test]
+    fn default_capacity_matches_production_baseline() {
+        assert_eq!(DEFAULT_CAPACITY, 4096, "默认容量应对齐生产实际配置（4096）");
+        // 最小可缓存 token 阈值也是 1024，不能被连带改动
+        assert_eq!(
+            DEFAULT_MIN_CACHEABLE_TOKENS, 1024,
+            "最小可缓存阈值与容量无关，不应被一起改"
+        );
+    }
+
+    /// `promptCacheTtlSecs` 必须真正生效。
+    ///
+    /// 此前 `set_ttl()` 只写 `inner.ttl`，而 `update()` 用的是 `now + bp.ttl`
+    /// （断点自带 TTL，来自 `cache_control.ttl`，5m 或 1h）—— 配置项从来没影响过
+    /// 任何条目的过期时间，是个死配置。
+    ///
+    /// 语义定为**地板**：条目实际 TTL = `max(断点 TTL, 配置 TTL)`。
+    /// 配大了能整体延长存活（提升命中率），但不会把客户端要求的 1h 压短成 5m。
+    #[test]
+    fn configured_ttl_acts_as_floor_for_entries() {
+        let long_text = "cacheable context line. ".repeat(3000);
+        let req = mk_request(
+            Some(vec![SystemMessage {
+                text: long_text,
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None, // → 断点走 5m 默认
+                }),
+            }]),
+            vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+        );
+        let profile = build_profile_from_request(&req, 40_000).expect("应有 cache_control 断点");
+        assert!(
+            !profile.breakpoints.is_empty(),
+            "测试前提：至少一个断点超过最小阈值"
+        );
+
+        // 配置 TTL 1 小时，远大于断点的 5 分钟默认
+        let cache = PromptCache::new(64, DEFAULT_TTL, true);
+        cache.set_ttl(Duration::from_secs(3600));
+        cache.update("acct", &profile, "conv-1");
+
+        let now = Instant::now();
+        let inner = cache.inner.lock();
+        let entry = inner
+            .entries
+            .get(&profile.breakpoints.last().unwrap().fingerprint)
+            .expect("断点应已写入");
+        let remaining = entry.expires_at.saturating_duration_since(now);
+        assert!(
+            remaining > Duration::from_secs(1800),
+            "配置 3600s 应生效，实际剩余仅 {:?}（说明还在用断点的 300s）",
+            remaining
+        );
+    }
+
+    /// 配置 TTL 比断点短时不得压短断点。
+    ///
+    /// 客户端显式要求 `cache_control.ttl = "1h"` 时，5 分钟的全局配置
+    /// 不能把它削成 5 分钟 —— 那会破坏 1h 分桶语义。
+    #[test]
+    fn configured_ttl_never_shortens_one_hour_breakpoints() {
+        let long_text = "cacheable context line. ".repeat(3000);
+        let req = mk_request(
+            Some(vec![SystemMessage {
+                text: long_text,
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: Some("1h".to_string()),
+                }),
+            }]),
+            vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+        );
+        let profile = build_profile_from_request(&req, 40_000).expect("应有断点");
+
+        let cache = PromptCache::new(64, DEFAULT_TTL, true);
+        cache.set_ttl(Duration::from_secs(300)); // 配置只有 5 分钟
+        cache.update("acct", &profile, "conv-1");
+
+        let now = Instant::now();
+        let inner = cache.inner.lock();
+        let entry = inner
+            .entries
+            .get(&profile.breakpoints.last().unwrap().fingerprint)
+            .expect("断点应已写入");
+        let remaining = entry.expires_at.saturating_duration_since(now);
+        assert!(
+            remaining > Duration::from_secs(1800),
+            "1h 断点不应被 5m 配置压短，实际剩余 {:?}",
+            remaining
+        );
+    }
+
+    /// 成功请求会顺延断点过期时间（滑动过期）。
+    ///
+    /// `update()` 对本次请求的每个断点都重新 `insert`，因此活跃会话的条目
+    /// 每轮都被刷新，不会在 5 分钟后无理由过期。这条测试把该行为钉住 ——
+    /// 如果哪天把 `update()` 改成「已存在就跳过」，热会话就会开始周期性掉命中。
+    #[test]
+    fn successful_update_slides_expiry_forward() {
+        let long_text = "cacheable context line. ".repeat(3000);
+        let req = mk_request(
+            Some(vec![SystemMessage {
+                text: long_text,
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+        );
+        let profile = build_profile_from_request(&req, 40_000).expect("应有断点");
+        let fp = profile.breakpoints.last().unwrap().fingerprint.clone();
+
+        let cache = PromptCache::new(64, DEFAULT_TTL, true);
+        cache.update("acct", &profile, "conv-1");
+        let first_expiry = cache.inner.lock().entries.get(&fp).unwrap().expires_at;
+
+        // 人为把过期时间拨到接近失效，模拟「条目快过期了」
+        {
+            let mut inner = cache.inner.lock();
+            let e = inner.entries.get_mut(&fp).unwrap();
+            e.expires_at = Instant::now() + Duration::from_secs(1);
+        }
+
+        // 再来一轮成功请求 → 过期时间应重新推远
+        cache.update("acct", &profile, "conv-1");
+        let refreshed = cache.inner.lock().entries.get(&fp).unwrap().expires_at;
+        assert!(
+            refreshed > Instant::now() + Duration::from_secs(60),
+            "成功请求应把过期时间顺延，而不是让条目在 1 秒后失效"
+        );
+        // 首次写入与刷新后都应是完整 TTL 量级
+        assert!(first_expiry > Instant::now() + Duration::from_secs(60));
+    }
 
     fn mk_request(system: Option<Vec<SystemMessage>>, messages: Vec<Message>) -> MessagesRequest {
         MessagesRequest {
