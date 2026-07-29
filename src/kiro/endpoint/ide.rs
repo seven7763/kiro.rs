@@ -302,6 +302,10 @@ mod tests {
                 .get("userInputMessageContext")
                 .is_some()
         );
-        assert!(json["conversationState"].get("agentContinuationId").is_none());
+        assert!(
+            json["conversationState"]
+                .get("agentContinuationId")
+                .is_none()
+        );
     }
 }

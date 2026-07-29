@@ -1046,7 +1046,8 @@ mod tests {
     fn token_usage_zero_cache_read_does_not_clobber_local_perceived_cache() {
         use crate::kiro::model::events::TokenUsageEvent;
 
-        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 12, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 12, false, HashMap::new());
         // 模拟本地 perceived 假缓存账：input=12、cache_read=4800、creation=0
         ctx.cache_read_input_tokens = 4800;
         ctx.cache_creation_input_tokens = 0;
@@ -1065,9 +1066,15 @@ mod tests {
         let events = ctx.generate_final_events();
         let (input, output, creation, read) = final_usage(&events);
 
-        assert_eq!(read, 4800, "本地 perceived cache_read 必须保留，不被上游 0 顶掉");
+        assert_eq!(
+            read, 4800,
+            "本地 perceived cache_read 必须保留，不被上游 0 顶掉"
+        );
         assert_eq!(creation, 0, "cache_creation 仍走本地账");
-        assert_eq!(input, 12, "input 用本地纯客户端口径，不用上游含 agent prompt 的 6500");
+        assert_eq!(
+            input, 12,
+            "input 用本地纯客户端口径，不用上游含 agent prompt 的 6500"
+        );
         assert_eq!(output, 678, "output 采用上游真值(含 thinking)");
     }
 
@@ -1077,7 +1084,8 @@ mod tests {
     fn token_usage_does_not_override_input_side_even_with_upstream_cache_write() {
         use crate::kiro::model::events::TokenUsageEvent;
 
-        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 20, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 20, false, HashMap::new());
         ctx.cache_read_input_tokens = 9000;
         ctx.cache_creation_input_tokens = 0;
 
@@ -1103,7 +1111,8 @@ mod tests {
     fn token_usage_zero_output_falls_back_to_local_estimate() {
         use crate::kiro::model::events::TokenUsageEvent;
 
-        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 10, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 10, false, HashMap::new());
         ctx.output_tokens = 42; // 本地累计估算
         ctx.cache_read_input_tokens = 1000;
 

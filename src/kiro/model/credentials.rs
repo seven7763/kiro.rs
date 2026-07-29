@@ -145,7 +145,8 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
         "idc"
     } else if value.eq_ignore_ascii_case("api_key") || value.eq_ignore_ascii_case("apikey") {
         "api_key"
-    } else if value.eq_ignore_ascii_case("external_idp") || value.eq_ignore_ascii_case("externalidp")
+    } else if value.eq_ignore_ascii_case("external_idp")
+        || value.eq_ignore_ascii_case("externalidp")
     {
         "external_idp"
     } else if value.eq_ignore_ascii_case("idc") {
@@ -395,7 +396,9 @@ impl KiroCredentials {
     pub fn is_external_idp_credential(&self) -> bool {
         self.auth_method
             .as_deref()
-            .map(|m| m.eq_ignore_ascii_case("external_idp") || m.eq_ignore_ascii_case("externalidp"))
+            .map(|m| {
+                m.eq_ignore_ascii_case("external_idp") || m.eq_ignore_ascii_case("externalidp")
+            })
             .unwrap_or(false)
     }
 
@@ -509,7 +512,7 @@ mod tests {
             expires_at: None,
             auth_method: Some("social".to_string()),
             client_id: None,
-                        client_secret: None,
+            client_secret: None,
             token_endpoint: None,
             issuer_url: None,
             scopes: None,
@@ -633,7 +636,7 @@ mod tests {
             expires_at: None,
             auth_method: None,
             client_id: None,
-                        client_secret: None,
+            client_secret: None,
             token_endpoint: None,
             issuer_url: None,
             scopes: None,
@@ -670,7 +673,7 @@ mod tests {
             expires_at: None,
             auth_method: None,
             client_id: None,
-                        client_secret: None,
+            client_secret: None,
             token_endpoint: None,
             issuer_url: None,
             scopes: None,
@@ -790,7 +793,7 @@ mod tests {
             expires_at: None,
             auth_method: Some("social".to_string()),
             client_id: None,
-                        client_secret: None,
+            client_secret: None,
             token_endpoint: None,
             issuer_url: None,
             scopes: None,

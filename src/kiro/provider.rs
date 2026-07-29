@@ -1251,7 +1251,10 @@ mod classify_failure_tests {
         let body = r#"{"message":"Your User ID (f42834b8-c091-7003-507a-5cae3da2b4ea) temporarily is suspended. We've locked your account as a security precaution.","reason":null}"#;
         assert_eq!(act(403, body), FailureAction::AccountSuspended);
         // 大小写不敏感
-        assert_eq!(act(403, "ACCOUNT HAS BEEN SUSPENDED"), FailureAction::AccountSuspended);
+        assert_eq!(
+            act(403, "ACCOUNT HAS BEEN SUSPENDED"),
+            FailureAction::AccountSuspended
+        );
         // 401 + 同文案不归此类（401 永远走 AuthError force-refresh）
         assert_eq!(act(401, "is suspended"), FailureAction::AuthError);
         // 普通 403 仍是 AuthError

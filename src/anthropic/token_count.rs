@@ -48,7 +48,9 @@ pub fn init_western_char_weight(weight: f64) {
 
 /// 取当前西文权重，未初始化时回退默认。
 fn western_char_weight() -> f64 {
-    *WESTERN_CHAR_WEIGHT.get().unwrap_or(&DEFAULT_WESTERN_CHAR_WEIGHT)
+    *WESTERN_CHAR_WEIGHT
+        .get()
+        .unwrap_or(&DEFAULT_WESTERN_CHAR_WEIGHT)
 }
 
 /// 初始化 count_tokens 配置
@@ -111,7 +113,13 @@ pub fn count_tokens(text: &str) -> u64 {
     let western_weight = western_char_weight();
     let char_units: f64 = text
         .chars()
-        .map(|c| if is_non_western_char(c) { 4.0 } else { western_weight })
+        .map(|c| {
+            if is_non_western_char(c) {
+                4.0
+            } else {
+                western_weight
+            }
+        })
         .sum();
 
     let tokens = char_units / 4.0;

@@ -493,7 +493,12 @@ impl AdminService {
 
         // external_idp 导入校验：refreshToken + clientId + (tokenEndpoint|issuerUrl)
         if auth_method.eq_ignore_ascii_case("external_idp") {
-            if req.client_id.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            if req
+                .client_id
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
                 return Err(AdminServiceError::InvalidCredential(
                     "external_idp 凭据需要 clientId".to_string(),
                 ));
@@ -517,7 +522,11 @@ impl AdminService {
 
         // IdC 需要 clientId + clientSecret（Enterprise 导出若只有 clientIdHash 无法在服务端还原）
         if auth_method.eq_ignore_ascii_case("idc") {
-            let missing_id = req.client_id.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true);
+            let missing_id = req
+                .client_id
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true);
             let missing_secret = req
                 .client_secret
                 .as_ref()

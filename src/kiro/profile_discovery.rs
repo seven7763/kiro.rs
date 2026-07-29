@@ -3,10 +3,10 @@
 //! 当凭据缺少 `profileArn` 时，遍历常见 region 调用
 //! `POST /ListAvailableProfiles`，取第一个可用 profile。
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use serde::Deserialize;
 
-use crate::http_client::{build_client, ProxyConfig};
+use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
@@ -148,7 +148,10 @@ async fn list_available_profiles_in_region(
         request = request.header("TokenType", "EXTERNAL_IDP");
     }
 
-    let response = request.send().await.context("ListAvailableProfiles 请求失败")?;
+    let response = request
+        .send()
+        .await
+        .context("ListAvailableProfiles 请求失败")?;
     let status = response.status();
     let body_text = response.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -156,8 +159,8 @@ async fn list_available_profiles_in_region(
         bail!("ListAvailableProfiles {}: {}", status, redacted);
     }
 
-    let data: ListAvailableProfilesResponse = serde_json::from_str(&body_text)
-        .with_context(|| "解析 ListAvailableProfiles 响应失败")?;
+    let data: ListAvailableProfilesResponse =
+        serde_json::from_str(&body_text).with_context(|| "解析 ListAvailableProfiles 响应失败")?;
 
     if let Some(p) = data.first_profile() {
         let arn = p.arn.clone().unwrap();
@@ -193,15 +196,7 @@ pub async fn ensure_profile_arn(
         }
     };
 
-    match discover_profile_arn(
-        &credentials,
-        config,
-        &token,
-        proxy,
-        DEFAULT_PROFILE_REGIONS,
-    )
-    .await
-    {
+    match discover_profile_arn(&credentials, config, &token, proxy, DEFAULT_PROFILE_REGIONS).await {
         Ok(found) => {
             credentials.profile_arn = Some(found.profile_arn);
             if credentials.api_region.is_none() {
@@ -225,10 +220,14 @@ mod tests {
 
     #[test]
     fn parse_profiles_response() {
-        let json = r#"{"profiles":[{"arn":"arn:aws:codewhisperer:us-east-1:1:profile/ABC","name":"p1"}]}"#;
+        let json =
+            r#"{"profiles":[{"arn":"arn:aws:codewhisperer:us-east-1:1:profile/ABC","name":"p1"}]}"#;
         let data: ListAvailableProfilesResponse = serde_json::from_str(json).unwrap();
         let p = data.first_profile().unwrap();
-        assert_eq!(p.arn.as_deref(), Some("arn:aws:codewhisperer:us-east-1:1:profile/ABC"));
+        assert_eq!(
+            p.arn.as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:1:profile/ABC")
+        );
     }
 
     #[test]

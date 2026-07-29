@@ -12,9 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::converter::extract_session_id;
-use super::prompt_cache::{
-    CacheProfile, MAX_CACHE_RATIO, PromptCache, build_profile_from_request,
-};
+use super::prompt_cache::{CacheProfile, MAX_CACHE_RATIO, PromptCache, build_profile_from_request};
 use super::token_count::{self as token, saturating_to_i32};
 use super::types::MessagesRequest;
 
@@ -381,10 +379,7 @@ pub(crate) fn client_visible_usage(
 
     // creation 同样来自虚高基准，同样只能在剩余预算内计价。
     let remaining = total.saturating_sub(cache_read);
-    let cache_creation = decision
-        .cache_creation_input_tokens
-        .max(0)
-        .min(remaining);
+    let cache_creation = decision.cache_creation_input_tokens.max(0).min(remaining);
     let input = remaining.saturating_sub(cache_creation);
 
     (input, cache_creation, cache_read)
@@ -719,7 +714,10 @@ mod tests {
 
             if round == 1 {
                 // 纯 MISS：cache_read=0 时 creation 归零，全部计入 input
-                assert_eq!(creation, 0, "R1 纯 MISS 时 creation 应归零（不误导客户端计费）");
+                assert_eq!(
+                    creation, 0,
+                    "R1 纯 MISS 时 creation 应归零（不误导客户端计费）"
+                );
                 assert_eq!(read, 0, "R1 不应有 cache_read");
                 assert_eq!(input, total, "R1 全部 token 计入 input");
             } else {
@@ -778,7 +776,10 @@ mod tests {
             );
 
             if round == 1 {
-                assert!(creation == 0 && read == 0 && input == total, "R1 纯 MISS：creation 归零，全部计入 input");
+                assert!(
+                    creation == 0 && read == 0 && input == total,
+                    "R1 纯 MISS：creation 归零，全部计入 input"
+                );
             } else {
                 assert!(
                     read > 0,
