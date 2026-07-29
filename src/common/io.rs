@@ -137,13 +137,30 @@ mod tests {
     use super::*;
 
     fn tmp_target() -> PathBuf {
+        // 进程内单调序号：pid + 纳秒不足以去重（同一 tick 内的并行调用会撞车），
+        // 必须再叠一个原子计数器。
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
         let dir = std::env::temp_dir();
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .subsec_nanos();
-        dir.join(format!("atomic-write-test-{}-{}.json", pid, nanos))
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        dir.join(format!("atomic-write-test-{}-{}-{}.json", pid, nanos, seq))
+    }
+
+    /// `tmp_target()` 必须在同进程内绝对唯一。
+    ///
+    /// 只靠 `pid + subsec_nanos()` 时，同一纳秒 tick 内的两次调用会拼出同一路径，
+    /// 并行测试互删对方的文件 → `atomic_write_handles_empty_content` /
+    /// `secure_write_creates_file_with_content` 间歇性 fail（`--test-threads=1` 才稳）。
+    #[test]
+    fn tmp_target_is_unique_across_calls() {
+        const N: usize = 100_000;
+        let paths: std::collections::HashSet<PathBuf> = (0..N).map(|_| tmp_target()).collect();
+        assert_eq!(paths.len(), N, "tmp_target() 在同进程内产生了重复路径");
     }
 
     #[test]
