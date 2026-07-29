@@ -78,13 +78,17 @@ pub(crate) fn inject_system_prompt(payload: &mut MessagesRequest, shared: &Share
 pub(crate) fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
     let is_opus = model_lower.contains("opus");
+    // 精确匹配 "opus-5"：宽松的 contains("5") 会误伤带日期的 model ID
+    // （如 claude-opus-4-6-2025xx15，日期含 5 却不含 4-5）
+    let is_opus_5 = model_lower.contains("opus-5");
+    let is_fable_5 = model_lower.contains("fable");
     let is_opus_4_7 = is_opus && (model_lower.contains("4-7") || model_lower.contains("4.7"));
     let is_opus_4_6 = is_opus && (model_lower.contains("4-6") || model_lower.contains("4.6"));
-    let is_opus_4_6_or_newer = is_opus_4_6 || is_opus_4_7;
+    let is_opus_4_6_or_newer = is_opus_4_6 || is_opus_4_7 || is_opus_5 || is_fable_5;
     let has_thinking_suffix = model_lower.contains("thinking");
 
-    // Case 1: Opus 4.7 强制 adaptive — 不论是否带 thinking 后缀
-    if is_opus_4_7 {
+    // Case 1: Opus 4.7+ / Opus 5 / Fable 5 强制 adaptive — 不论是否带 thinking 后缀
+    if is_opus_4_7 || is_opus_5 || is_fable_5 {
         if let Some(ref mut t) = payload.thinking {
             if t.thinking_type == "enabled" {
                 tracing::info!(
