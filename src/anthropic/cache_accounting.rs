@@ -204,20 +204,8 @@ pub(crate) fn lookup_prompt_cache(
     };
 
     let account_key = prompt_cache_account(payload);
-    if cache.perceived_ratio().is_some() {
-        tracing::debug!(
-            "prompt_cache: perceived/fake cache enabled; skip real cache lookup and conversation reuse"
-        );
-        cache.record_skipped();
-        return CacheDecision {
-            forced_conversation_id: None,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            profile: Some(profile),
-            account_key,
-            skipped: false,
-        };
-    }
+    // perceived_ratio 不再短路真实缓存查询——真实命中信息用于 conversation_id 复用
+    // 和诊断探针，perceived 仅在 client_visible_usage 层改写上报比例。
 
     let (usage, forced_conversation_id) = match account_key.as_deref() {
         Some(account) => (
@@ -276,8 +264,8 @@ pub(crate) fn lookup_prompt_cache(
     }
 }
 
-/// 请求成功后记录 cache 统计；真实 cache 模式会同时写入断点 fingerprint +
-/// conversation_id 复用映射。perceived/fake 模式只记录 reported 统计，不维护真实缓存。
+/// 请求成功后记录 cache 统计并写入断点 fingerprint + conversation_id 复用映射。
+/// perceived 模式也执行 update（维护真实缓存状态，perceived 只改上报口径）。
 pub(crate) fn record_cache_outcome(
     cache: &PromptCache,
     decision: &CacheDecision,
@@ -292,9 +280,6 @@ pub(crate) fn record_cache_outcome(
             decision.cache_read_input_tokens,
             reported_cache_read_input_tokens,
         );
-        if cache.perceived_ratio().is_some() {
-            return;
-        }
         if let Some(account) = decision.account_key.as_deref() {
             cache.update(account, profile, actual_conversation_id);
         }
@@ -598,27 +583,24 @@ mod tests {
             );
 
             let decision = lookup_prompt_cache(&cache, &payload, total);
-            assert!(
-                decision.forced_conversation_id.is_none(),
-                "fake cache 模式不应依赖真实 conversation cache，第 {round} 轮也不能强制复用"
-            );
 
             let incremental = estimate_incremental_input_tokens(&payload, total);
             let (input, creation, read) =
                 client_visible_usage(&cache, &decision, &payload.model, total, incremental);
 
             assert_eq!(input, 1, "第 {round} 轮 input 不应回到 1459/1460");
-            assert_eq!(creation, 0, "fake cache 模式不应产生 cache_creation 溢价");
+            assert_eq!(creation, 0, "perceived 模式不应产生 cache_creation 溢价");
             assert_eq!(read, total - input, "cache_read 应吸收除新增输入外的上下文");
 
             record_cache_outcome(&cache, &decision, "conv-shared", read);
             history.push(serde_json::json!({"role": "assistant", "content": "ok"}));
         }
 
+        // perceived 解耦后，真实缓存正常运作（维护 fingerprint），只是上报口径走 perceived ratio
         let snap = cache.snapshot();
-        assert_eq!(
-            snap.entries, 0,
-            "fake cache 不应写入真实 prompt cache entry"
+        assert!(
+            snap.entries > 0,
+            "perceived 解耦后真实 cache 应正常写入 entry"
         );
     }
 
@@ -653,9 +635,11 @@ mod tests {
             decision_b.forced_conversation_id.is_none(),
             "不同用户/session 不能复用 user A 的 conversation_id"
         );
-        assert_eq!(
-            decision_b.cache_read_input_tokens, 0,
-            "不同用户/session 不能命中 user A 的真实 prompt cache 桶"
+        // cache 指纹是全局内容寻址——相同 prefix 跨 account 可以命中（提升命中率）；
+        // 隔离仅在 conversation_id 复用层（上面的 assert）。
+        assert!(
+            decision_b.cache_read_input_tokens > 0,
+            "全局内容寻址：相同 prefix 跨 account 应命中"
         );
     }
 

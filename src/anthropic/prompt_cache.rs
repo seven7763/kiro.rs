@@ -756,10 +756,13 @@ pub fn build_profile_from_request(
     // 再叠加内容块。否则同一段 system+history 在不同 model / tool_choice 下会共用
     // 同一指纹，导致跨模型误命中（cache_read 虚高）并可能复用错误的 conversation_id。
     // 不计入断点（无 cumulative_tokens / ttl），只影响后续所有断点的指纹值。
+    // 必须走 canonical_json：serde_json 开了 preserve_order，`to_string()` 的对象
+    // 键序跟随插入顺序，同一语义的 tool_choice 在不同请求里键序可能不同 → 指纹漂移。
+    // 与不变量 1（canonical_json 修 cache_read 恒 0）同源，当时漏了这一处。
     let tool_choice_repr = payload
         .tool_choice
         .as_ref()
-        .map(|v| v.to_string())
+        .map(canonical_json)
         .unwrap_or_default();
     hash_chunk(&mut hasher, &format!("prelude\0model={}", payload.model));
     hash_chunk(&mut hasher, &format!("tool_choice={tool_choice_repr}"));
@@ -806,6 +809,17 @@ pub fn build_profile_from_request(
 
     if breakpoints.is_empty() {
         return None;
+    }
+
+    // 统一标尺：本地估算（尤其 tool JSON 整块计数）可能远超真实 total_input_tokens。
+    // 若 cumulative 膨胀了，按比例缩放所有断点 token 到真实预算内，避免 cache_read
+    // 在 client_visible_usage 层被削平到 0（因为 read > total 的 85%）。
+    if cumulative_tokens > total_input_tokens && total_input_tokens > 0 {
+        let ratio = total_input_tokens as f64 / cumulative_tokens as f64;
+        for bp in &mut breakpoints {
+            bp.cumulative_tokens = (bp.cumulative_tokens as f64 * ratio).round() as i32;
+        }
+        cumulative_tokens = total_input_tokens;
     }
 
     Some(CacheProfile {
@@ -877,12 +891,16 @@ fn flatten_cache_blocks(payload: &super::types::MessagesRequest) -> Vec<Cacheabl
 fn flatten_message_blocks(
     blocks: &mut Vec<CacheableBlock>,
     msg: &super::types::Message,
-    msg_index: usize,
+    _msg_index: usize,
     _model: &str,
 ) {
     match &msg.content {
         serde_json::Value::String(text) => {
-            let value = format!("msg\0{}\0{}\0{}", msg.role, msg_index, text);
+            // 指纹值只含 role + 内容，**不含位置索引**。顺序由滚动前缀哈希天然承载
+            // （前缀哈希本身有序）；把 msg_index / 块下标编进来会让任何改变块切分的
+            // 前置处理（system 注入、预设合并、相邻 text 块合并）令历史 prefix 指纹全变
+            // → 命中率归零。
+            let value = format!("msg\0{}\0{}", msg.role, text);
             let tokens = super::token_count::count_tokens(text) as i32;
             blocks.push(CacheableBlock {
                 value,
@@ -893,30 +911,82 @@ fn flatten_message_blocks(
             });
         }
         serde_json::Value::Array(arr) => {
+            // 合并连续纯 text 块（无 cache_control）为一个逻辑块再 hash。
+            // 这样同一段文本不管被 SDK 切成几块，指纹都一致。
             let last_idx = arr.len().saturating_sub(1);
+            let mut pending_text = String::new();
+            let mut pending_tokens: i32 = 0;
+
+            let flush_pending =
+                |blocks: &mut Vec<CacheableBlock>,
+                 text: &mut String,
+                 tokens: &mut i32,
+                 is_message_end: bool,
+                 role: &str| {
+                    if text.is_empty() {
+                        return;
+                    }
+                    let value = format!("msg\0{}\0{}", role, text);
+                    blocks.push(CacheableBlock {
+                        value,
+                        tokens: *tokens,
+                        ttl: None,
+                        is_message_end,
+                        is_system: false,
+                    });
+                    text.clear();
+                    *tokens = 0;
+                };
+
             for (i, block) in arr.iter().enumerate() {
-                let text = block
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| block.get("thinking").and_then(|v| v.as_str()))
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| block.to_string());
-                // fingerprint 只对“内容”敏感：剔除 cache_control 字段再序列化。
-                // cache_control 是缓存指令而非内容，且多轮对话中它会“滑动”到最后一条
-                // message —— 同一条历史 message 在不同轮里 cache_control 有无不同，
-                // 若把它 hash 进 fingerprint，相同内容的 prefix 在不同轮 fingerprint 就不同，
-                // 导致 cache_read 永远为 0（无法命中之前轮缓存的 prefix）。
-                let fp_value = strip_cache_control(block);
-                let value = format!("msg\0{}\0{}\0{}\0{}", msg.role, msg_index, i, fp_value);
-                let tokens = super::token_count::count_tokens(&text) as i32;
-                let ttl = extract_block_ttl(block);
-                blocks.push(CacheableBlock {
-                    value,
-                    tokens,
-                    ttl,
-                    is_message_end: i == last_idx,
-                    is_system: false,
-                });
+                let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let has_cc = block.as_object().map_or(false, |o| o.contains_key("cache_control"));
+                let is_text_type = block_type == "text";
+                let is_last = i == last_idx;
+
+                if is_text_type {
+                    // text 块统一走 text 合并路径（指纹 = raw text，切分无关）。
+                    // 有 cache_control 时立即 flush 并带 TTL 生成断点。
+                    let t = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    pending_text.push_str(t);
+                    pending_tokens =
+                        pending_tokens.saturating_add(super::token_count::count_tokens(t) as i32);
+
+                    if has_cc || is_last {
+                        let ttl = if has_cc { extract_block_ttl(block) } else { None };
+                        let value = format!("msg\0{}\0{}", msg.role, pending_text);
+                        blocks.push(CacheableBlock {
+                            value,
+                            tokens: pending_tokens,
+                            ttl,
+                            is_message_end: is_last,
+                            is_system: false,
+                        });
+                        pending_text.clear();
+                        pending_tokens = 0;
+                    }
+                } else {
+                    // 非 text 块（tool_use / image / thinking 等）打断合并
+                    flush_pending(blocks, &mut pending_text, &mut pending_tokens, false, &msg.role);
+
+                    let text = block
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| block.get("thinking").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| block.to_string());
+                    let fp_value = strip_cache_control(block);
+                    let value = format!("msg\0{}\0{}", msg.role, fp_value);
+                    let tokens = super::token_count::count_tokens(&text) as i32;
+                    let ttl = extract_block_ttl(block);
+                    blocks.push(CacheableBlock {
+                        value,
+                        tokens,
+                        ttl,
+                        is_message_end: is_last,
+                        is_system: false,
+                    });
+                }
             }
         }
         _ => {}
@@ -1180,6 +1250,162 @@ mod tests {
         );
         // 首次写入与刷新后都应是完整 TTL 量级
         assert!(first_expiry > Instant::now() + Duration::from_secs(60));
+    }
+
+    /// 统一标尺：当本地估算 cumulative_tokens 膨胀超过真实 total_input_tokens 时，
+    /// 所有断点按比例缩放到真实预算内。防止 cache_read 虚高→被 client_visible_usage 削平。
+    #[test]
+    fn token_normalization_scales_inflated_cumulative() {
+        let long_tool_json = serde_json::json!({
+            "type": "tool_use",
+            "id": "tool_1",
+            "name": "big_tool",
+            "input": { "data": "x".repeat(50000) }
+        });
+        let req = mk_request(
+            Some(vec![SystemMessage {
+                text: "system context. ".repeat(500),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([long_tool_json]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("next question"),
+                },
+            ],
+        );
+
+        // 模拟真实 total=20000 但本地估算可能远超
+        let profile = build_profile_from_request(&req, 20_000).unwrap();
+        // 所有断点的 cumulative_tokens 必须 <= total_input_tokens
+        for bp in &profile.breakpoints {
+            assert!(
+                bp.cumulative_tokens <= profile.total_input_tokens,
+                "缩放后断点 cumulative({}) 不应超过 total({})",
+                bp.cumulative_tokens,
+                profile.total_input_tokens
+            );
+        }
+        assert_eq!(profile.total_input_tokens, 20_000);
+    }
+
+    /// 指纹不得与「块在数组里的下标」耦合。
+    ///
+    /// 原来的指纹值是 `msg\0{role}\0{msg_index}\0{i}\0{content}`，把消息序号和
+    /// 块下标都编了进去。任何改变块切分方式的前置处理（system 注入、预设合并、
+    /// 未来的相邻 text 块合并优化）都会让历史 prefix 的指纹全变 → 命中率归零。
+    ///
+    /// 顺序信息由滚动前缀哈希天然承载（前缀哈希本身有序），位置不需要再编一遍。
+    /// 这条测试构造两个**语义完全相同、块切分不同**的请求：一个 message 里放
+    /// 1 个 text 块，另一个把同样的文本拆成 2 个 text 块。拼接后内容一致，
+    /// 公共前缀的指纹就该一致。
+    #[test]
+    fn fingerprint_survives_block_resplit() {
+        let part_a = "cacheable project context. ".repeat(2000);
+        let part_b = "more shared context here. ".repeat(2000);
+        let joined = format!("{part_a}{part_b}");
+
+        let mk = |content: serde_json::Value| -> MessagesRequest {
+            mk_request(
+                Some(vec![SystemMessage {
+                    text: "shared system preamble. ".repeat(500),
+                    cache_control: Some(CacheControl {
+                        cache_type: "ephemeral".to_string(),
+                        ttl: None,
+                    }),
+                }]),
+                vec![Message {
+                    role: "user".to_string(),
+                    content,
+                }],
+            )
+        };
+
+        // 形态 1：一个 text 块装完整文本
+        let one_block = mk(serde_json::json!([{"type": "text", "text": joined}]));
+        // 形态 2：同样的文本拆成两个 text 块
+        let two_blocks = mk(serde_json::json!([
+            {"type": "text", "text": part_a},
+            {"type": "text", "text": part_b},
+        ]));
+
+        let p1 = build_profile_from_request(&one_block, 80_000).expect("形态1 应有断点");
+        let p2 = build_profile_from_request(&two_blocks, 80_000).expect("形态2 应有断点");
+
+        // 直接比**最末**断点（message 边界）的指纹。
+        // 不能只看 compute() 的 cache_read —— 两个请求共享同一段 system，
+        // system 断点本来就会命中，那样测不到 message 层的位置耦合。
+        assert_eq!(
+            p1.breakpoints.last().unwrap().fingerprint,
+            p2.breakpoints.last().unwrap().fingerprint,
+            "同一 message 拼接后内容相同，块切分方式不应改变 message 断点指纹"
+        );
+
+        // 端到端也应命中，且命中量覆盖到 message 断点而非只有 system
+        let cache = PromptCache::new(256, DEFAULT_TTL, true);
+        cache.update("acct", &p1, "conv-1");
+        let usage = cache.compute("acct", &p2);
+        assert!(
+            usage.cache_read > 0,
+            "块切分方式变了但内容相同，应仍命中；实际 read={}",
+            usage.cache_read
+        );
+    }
+
+    /// `tool_choice` 进指纹必须走 canonical_json。
+    ///
+    /// 原来用 `Value::to_string()`。serde_json 开了 `preserve_order`，
+    /// 对象键序跟随插入顺序 —— 同一个语义的 tool_choice 在不同请求里键序可能不同，
+    /// 指纹随之漂移。这与 canonical_json 修的是同一类问题（不变量 1），
+    /// 当时漏了这一处。
+    #[test]
+    fn tool_choice_fingerprint_is_key_order_stable() {
+        let long_text = "cacheable context. ".repeat(3000);
+        let mk = |tc: serde_json::Value| -> MessagesRequest {
+            let mut req = mk_request(
+                Some(vec![SystemMessage {
+                    text: long_text.clone(),
+                    cache_control: Some(CacheControl {
+                        cache_type: "ephemeral".to_string(),
+                        ttl: None,
+                    }),
+                }]),
+                vec![Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("hi"),
+                }],
+            );
+            req.tool_choice = Some(tc);
+            req
+        };
+
+        // 同一语义、键序相反
+        let a = mk(serde_json::json!({"type": "tool", "name": "read_file"}));
+        let b = mk(serde_json::json!({"name": "read_file", "type": "tool"}));
+
+        let pa = build_profile_from_request(&a, 40_000).expect("应有断点");
+        let pb = build_profile_from_request(&b, 40_000).expect("应有断点");
+        assert_eq!(
+            pa.breakpoints.last().unwrap().fingerprint,
+            pb.breakpoints.last().unwrap().fingerprint,
+            "tool_choice 键序不同不应改变指纹"
+        );
+
+        // 语义不同仍须区分（防止过度归一化把不同决策混为一谈）
+        let c = mk(serde_json::json!({"type": "auto"}));
+        let pc = build_profile_from_request(&c, 40_000).expect("应有断点");
+        assert_ne!(
+            pa.breakpoints.last().unwrap().fingerprint,
+            pc.breakpoints.last().unwrap().fingerprint,
+            "不同 tool_choice 语义必须区分"
+        );
     }
 
     fn mk_request(system: Option<Vec<SystemMessage>>, messages: Vec<Message>) -> MessagesRequest {
@@ -1663,7 +1889,7 @@ mod tests {
         assert_eq!(fa, fb, "归一化后两个客户端应得到相同 fingerprint");
     }
 
-    /// 回归：多轮对话中 cache_control 在 message 之间“滑动”，相同历史 message 的
+    /// 回归：多轮对话中 cache_control 在 message 之间"滑动"，相同历史 message 的
     /// fingerprint 必须稳定（不含 cache_control），否则 R2 无法命中 R1 缓存的 prefix，
     /// 表现为 cache_read 恒为 0。
     #[test]
@@ -1689,7 +1915,7 @@ mod tests {
             "R1 首次全 creation"
         );
 
-        // R2: 历史 message 内容完全相同，但 cache_control 已“滑”到新的 user message。
+        // R2: 历史 message 内容完全相同，但 cache_control 已"滑"到新的 user message。
         // 第一条 user message 现在**不带** cache_control。
         let r2 = mk_request(
             None,
